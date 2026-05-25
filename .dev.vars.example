@@ -1,0 +1,4 @@
+# Copy this to .dev.vars (gitignored) and fill in real values for local dev.
+# In production these are pushed with: npx wrangler secret put BOT_TOKEN
+BOT_TOKEN=123456:replace-with-real-token-from-BotFather
+WEBHOOK_SECRET=replace-with-a-random-32-char-hex-string

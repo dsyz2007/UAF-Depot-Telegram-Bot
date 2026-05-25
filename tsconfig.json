@@ -41,6 +41,6 @@
 			"node"
 		]
 	},
-	"exclude": ["test"],
-	"include": ["worker-configuration.d.ts", "src/**/*.ts"]
+	"exclude": ["test", "frontend"],
+	"include": ["worker-configuration.d.ts", "worker/src/**/*.ts"]
 }
