@@ -32,25 +32,26 @@ export default function App() {
 		);
 	}
 
+	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
-		{ key: 'off', label: 'Off', show: true },
-		{ key: 'sick', label: 'Sick', show: true },
-		{ key: 'parade', label: 'Parade', show: true },
-		{ key: 'admin', label: 'Admin', show: me.user_role === 'admin' },
+		{ key: 'off', label: '📅 Off', show: true },
+		{ key: 'sick', label: '🤒 Sick', show: true },
+		{ key: 'parade', label: '🪖 Parade', show: true },
+		{ key: 'admin', label: '⚙ Admin', show: isAdminish },
 	];
 
 	return (
 		<div className="app">
 			<header className="appbar">
 				<span className="brand">Depot</span>
-				<span className="username">{me.full_name}</span>
+				<span className="username">{me.full_name} · {roleLabel(me.user_role)}</span>
 			</header>
 
 			<main className="content">
 				{tab === 'off' && <OffTab me={me} />}
 				{tab === 'sick' && <SickTab me={me} />}
 				{tab === 'parade' && <ParadeTab me={me} />}
-				{tab === 'admin' && me.user_role === 'admin' && <AdminTab />}
+				{tab === 'admin' && isAdminish && <AdminTab me={me} />}
 			</main>
 
 			<nav className="tabbar">
@@ -64,6 +65,17 @@ export default function App() {
 			</nav>
 		</div>
 	);
+}
+
+function roleLabel(r: Me['user_role']): string {
+	switch (r) {
+		case 'user':
+			return 'User';
+		case 'admin':
+			return 'Admin';
+		case 'superadmin':
+			return 'Superadmin';
+	}
 }
 
 function Centered({ children }: { children: React.ReactNode }) {

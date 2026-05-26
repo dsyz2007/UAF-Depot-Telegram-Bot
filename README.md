@@ -41,6 +41,11 @@ Get your Telegram numeric ID (DM `@userinfobot` to find it), then:
 ```bash
 npx wrangler d1 execute depot_db --remote --command \
   "INSERT INTO users (telegram_id, full_name, user_role) VALUES ('<YOUR_TG_ID>', 'Your Name', 'admin');"
+
+
+npx wrangler d1 execute depot_db --remote --command \
+  "INSERT INTO users (telegram_id, full_name, user_role) VALUES ('1087104442', 'SEE YUZHI, DYLAN', 'superadmin');"
+
 ```
 
 ### 4. Build & deploy
@@ -67,6 +72,14 @@ curl "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   -d "url=${PUBLIC_URL}/webhook" \
   -d "secret_token=${WEBHOOK_SECRET}" \
   -d 'allowed_updates=["message","callback_query"]'
+
+
+
+
+curl "https://api.telegram.org/bot${8861637074:AAGlEe9rVxeAynlf-nkPxSb1TnVe8tugCcc}/setWebhook" \
+  -d "url=${https://depot-bot.uaf-bot.workers.dev}/webhook" \
+  -d "secret_token=${WEBHOOK_SECRET}" \
+  -d 'allowed_updates=["message","callback_query"]'
 ```
 
 ### 6. Tell @BotFather about the WebApp
@@ -76,7 +89,7 @@ In Telegram, DM `@BotFather`:
 ```
 /setdomain
 → pick your bot
-→ enter:  depot-bot.<subdomain>.workers.dev
+→ enter:  depot-bot.uaf-bot.workers.dev
 
 /setmenubutton
 → pick your bot

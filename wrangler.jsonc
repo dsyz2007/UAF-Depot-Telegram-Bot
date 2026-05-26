@@ -27,7 +27,7 @@
 		"not_found_handling": "single-page-application"
 	},
 	"vars": {
-		"WEBAPP_URL": "https://depot-bot.example.workers.dev",
+		"WEBAPP_URL": "https://depot-bot.uaf-bot.workers.dev",
 		"TZ_OFFSET_HOURS": "8"
 	},
 	"triggers": {
@@ -35,7 +35,8 @@
 			"*/5 * * * *",
 			"0 13 * * *",
 			"30 21 * * *",
-			"30 23 * * *"
+			"0 4 * * *",
+			"0 0 * * *"
 		]
 	}
 }

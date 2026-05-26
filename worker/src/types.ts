@@ -12,7 +12,7 @@ declare global {
 	}
 }
 
-export type UserRole = 'user' | 'superior' | 'admin';
+export type UserRole = 'user' | 'admin' | 'superadmin';
 
 export interface DbUser {
 	id: number;
@@ -20,6 +20,7 @@ export interface DbUser {
 	full_name: string;
 	user_role: UserRole;
 	superior_telegram_id: string | null;
+	ord_date: string | null;
 	created_at: string;
 }
 
@@ -30,3 +31,22 @@ export interface TgWebAppUser {
 	username?: string;
 	language_code?: string;
 }
+
+export type ParadeStatus =
+	| 'Present'
+	| 'Off'
+	| 'Leave'
+	| 'Overseas Leave'
+	| 'MC'
+	| 'Attached-Out'
+	| 'Others';
+
+export const PARADE_STATUSES: readonly ParadeStatus[] = [
+	'Present',
+	'Off',
+	'Leave',
+	'Overseas Leave',
+	'MC',
+	'Attached-Out',
+	'Others',
+];

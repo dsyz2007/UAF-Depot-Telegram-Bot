@@ -1,30 +1,21 @@
 import { json, type AuthedContext } from './router';
+import { PARADE_STATUSES, type ParadeStatus } from '../types';
 
 interface MonthRow {
 	user_id: number;
 	full_name: string;
 	parade_state_date: string;
+	period: 'AM' | 'PM';
 	parade_status: string;
 	reason: string | null;
 }
 
-const ALLOWED_STATUS = new Set([
-	'Present',
-	'Off',
-	'Leave',
-	'MC',
-	'Course',
-	'Duty',
-	'Detached',
-	'AWOL',
-	'Others',
-]);
+const ALLOWED_STATUS = new Set<string>(PARADE_STATUSES as readonly string[]);
 
 function isValidDate(s: unknown): s is string {
 	return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-// Expand inclusive date range into ISO date strings. Caps at 95 to avoid abuse.
 function expandRange(start: string, end: string): string[] {
 	const out: string[] = [];
 	const cur = new Date(`${start}T00:00:00Z`);
@@ -36,6 +27,10 @@ function expandRange(start: string, end: string): string[] {
 	return out;
 }
 
+function isAdminish(role: string): boolean {
+	return role === 'admin' || role === 'superadmin';
+}
+
 export async function handleParade(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/parade'.length);
@@ -44,14 +39,13 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const ym = url.searchParams.get('ym') ?? '';
 		if (!/^\d{4}-\d{2}$/.test(ym)) return json({ error: 'bad_ym' }, { status: 400 });
 		const start = `${ym}-01`;
-		// Use SQLite date arithmetic to compute month end (1st of next month, then minus 1 day, then format)
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT p.user_id, u.full_name, p.parade_state_date, p.parade_status, p.reason
+				`SELECT p.user_id, u.full_name, p.parade_state_date, p.period, p.parade_status, p.reason
 				 FROM parade_state_entries p JOIN users u ON u.id = p.user_id
 				 WHERE p.parade_state_date >= ?
 				   AND p.parade_state_date < date(?, '+1 month')
-				 ORDER BY p.parade_state_date, u.full_name`,
+				 ORDER BY p.parade_state_date, u.full_name, p.period`,
 			)
 			.bind(start, start)
 			.all<MonthRow>();
@@ -59,7 +53,13 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'POST' && sub === '/submit') {
-		const body = (await request.json()) as { startdate?: string; enddate?: string; status?: string; reason?: string };
+		const body = (await request.json()) as {
+			startdate?: string;
+			enddate?: string;
+			status?: string;
+			reason?: string | null;
+			periods?: ('AM' | 'PM')[];
+		};
 		if (!isValidDate(body.startdate) || !isValidDate(body.enddate)) {
 			return json({ error: 'bad_dates' }, { status: 400 });
 		}
@@ -67,63 +67,55 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		if (typeof body.status !== 'string' || !ALLOWED_STATUS.has(body.status)) {
 			return json({ error: 'bad_status' }, { status: 400 });
 		}
+		const reason = body.reason?.trim() || null;
+		if ((body.status as ParadeStatus) === 'Others' && !reason) {
+			return json({ error: 'reason_required_for_others' }, { status: 400 });
+		}
+		const periods = (body.periods && body.periods.length > 0 ? body.periods : ['AM', 'PM']) as ('AM' | 'PM')[];
+		for (const p of periods) {
+			if (p !== 'AM' && p !== 'PM') return json({ error: 'bad_period' }, { status: 400 });
+		}
+
 		const dates = expandRange(body.startdate, body.enddate);
 		const stmt = env.depot_db.prepare(
-			`INSERT INTO parade_state_entries (user_id, parade_state_date, parade_status, reason)
-			 VALUES (?, ?, ?, ?)
-			 ON CONFLICT(user_id, parade_state_date)
+			`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(user_id, parade_state_date, period)
 			 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 		);
-		await env.depot_db.batch(dates.map((d) => stmt.bind(user.id, d, body.status, body.reason ?? null)));
-		return json({ ok: true, count: dates.length });
+		const ops = [];
+		for (const d of dates) {
+			for (const p of periods) {
+				ops.push(stmt.bind(user.id, d, p, body.status, reason));
+			}
+		}
+		await env.depot_db.batch(ops);
+		return json({ ok: true, count: ops.length });
 	}
 
 	if (request.method === 'GET' && sub === '/export') {
-		if (user.user_role !== 'admin') return json({ error: 'forbidden' }, { status: 403 });
+		// CSV export — superadmin only (was admin pre-rename)
+		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
 		const from = url.searchParams.get('from') ?? '';
 		const to = url.searchParams.get('to') ?? '';
 		if (!isValidDate(from) || !isValidDate(to)) return json({ error: 'bad_dates' }, { status: 400 });
 
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT u.full_name, p.parade_state_date, p.parade_status, p.reason
+				`SELECT u.full_name, p.parade_state_date, p.period, p.parade_status, p.reason
 				 FROM parade_state_entries p JOIN users u ON u.id = p.user_id
 				 WHERE p.parade_state_date BETWEEN ? AND ?
-				 ORDER BY u.full_name, p.parade_state_date`,
+				 ORDER BY u.full_name, p.parade_state_date, p.period`,
 			)
 			.bind(from, to)
-			.all<{ full_name: string; parade_state_date: string; parade_status: string; reason: string | null }>();
+			.all<{ full_name: string; parade_state_date: string; period: string; parade_status: string; reason: string | null }>();
 		const rows = results ?? [];
 
-		// Group consecutive same-status dates per user back into ranges.
-		interface Out { name: string; start: string; end: string; status: string; reason: string }
-		const out: Out[] = [];
-		let cur: Out | null = null;
-		const nextDay = (d: string) => {
-			const dt = new Date(`${d}T00:00:00Z`);
-			dt.setUTCDate(dt.getUTCDate() + 1);
-			return dt.toISOString().slice(0, 10);
-		};
-		for (const r of rows) {
-			const reason = r.reason ?? '';
-			if (
-				cur &&
-				cur.name === r.full_name &&
-				cur.status === r.parade_status &&
-				cur.reason === reason &&
-				nextDay(cur.end) === r.parade_state_date
-			) {
-				cur.end = r.parade_state_date;
-			} else {
-				if (cur) out.push(cur);
-				cur = { name: r.full_name, start: r.parade_state_date, end: r.parade_state_date, status: r.parade_status, reason };
-			}
-		}
-		if (cur) out.push(cur);
-
 		const csvEscape = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-		const header = 'name,start_date,end_date,status,reason\n';
-		const body = out.map((r) => [r.name, r.start, r.end, r.status, r.reason].map(csvEscape).join(',')).join('\n');
+		const header = 'name,date,period,status,reason\n';
+		const body = rows
+			.map((r) => [r.full_name, r.parade_state_date, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
+			.join('\n');
 		return new Response(header + body + '\n', {
 			headers: {
 				'content-type': 'text/csv; charset=utf-8',

@@ -1,35 +1,14 @@
 // Cron dispatcher. Wired via wrangler.jsonc triggers.crons.
 //
-// All four crons land here; we switch on event.cron.
-//
-// Why use a reminders TABLE instead of waiting in-memory?
-// Workers are stateless — there is no "wait 3 hours". We persist the future
-// fire time and let the */5min cron sweep it up.
+// Crons (UTC → SGT):
+//   */5 * * * *  → every 5 min    drain reminders queue
+//   0 13 * * *   → 21:00 prev day AM-empty nudge for tomorrow (if working day)
+//   30 21 * * *  → 05:30 same day AM update nudge (everyone, with reassurance)
+//   0 4 * * *    → 12:00 same day PM update nudge + holiday refresh
+//   0 0 * * *    → 08:00 SGT      ORD scan + parade pruning
 
 import { tgSendMessage } from './tg';
-
-export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
-	switch (event.cron) {
-		case '*/5 * * * *':
-			await drainReminders(env);
-			return;
-		case '0 13 * * *': // 21:00 SGT — tomorrow nudge
-			await nudgeParadeMissing(env, '+1 day', 'evening_prev');
-			return;
-		case '30 21 * * *': // 05:30 SGT — same-day nudge
-			await nudgeParadeMissing(env, '+0 day', 'morning_same');
-			return;
-		case '30 23 * * *': // 07:30 SGT — escalate to superior
-			await escalateParadeMissing(env);
-			return;
-		default:
-			console.warn('unknown cron', event.cron);
-	}
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// 1. Drain due reminders (every 5 minutes).
-// ───────────────────────────────────────────────────────────────────────────
+import { isWorkingDay, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
 
 interface DueRow {
 	id: number;
@@ -43,6 +22,39 @@ interface DueRow {
 	case_type: string | null;
 }
 
+interface UserRow {
+	id: number;
+	telegram_id: string;
+	full_name: string;
+	superior_telegram_id: string | null;
+}
+
+export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
+	switch (event.cron) {
+		case '*/5 * * * *':
+			await drainReminders(env);
+			return;
+		case '0 13 * * *':
+			await paradeNudge(env, 'evening_prev_am');
+			return;
+		case '30 21 * * *':
+			await paradeNudge(env, 'morning_am');
+			return;
+		case '0 4 * * *':
+			await paradeNudge(env, 'noon_pm');
+			await runHolidayRefresh(env);
+			return;
+		case '0 0 * * *':
+			await Promise.allSettled([runOrdReminders(env), runParadePrune(env)]);
+			return;
+		default:
+			console.warn('unknown cron', event.cron);
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 1. Reminders queue drain (every 5 min)
+// ──────────────────────────────────────────────────────────────────────────
 async function drainReminders(env: Env): Promise<void> {
 	const { results } = await env.depot_db
 		.prepare(
@@ -58,28 +70,23 @@ async function drainReminders(env: Env): Promise<void> {
 		.all<DueRow>();
 	if (!results?.length) return;
 
-	const sends: Promise<unknown>[] = [];
-	for (const r of results) {
+	const sends: Promise<unknown>[] = results.map((r) => {
 		const text = renderReminder(r);
 		const targetTid =
 			r.reminder_type === 'sick_update_superior_flag' && r.superior_telegram_id
 				? r.superior_telegram_id
 				: r.telegram_id;
-		sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text }));
-	}
+		return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text });
+	});
 	const settled = await Promise.allSettled(sends);
 
-	// Mark sent (only those we attempted; even failures get marked to avoid
-	// runaway resends — log failures for inspection).
 	const stmt = env.depot_db.prepare(`UPDATE reminders SET sent_at = datetime('now') WHERE id = ?`);
-	const updates = results.map((r) => stmt.bind(r.id));
-	await env.depot_db.batch(updates);
+	await env.depot_db.batch(results.map((r) => stmt.bind(r.id)));
 
 	settled.forEach((s, i) => {
 		if (s.status === 'rejected') console.error('reminder send failed', results[i].id, s.reason);
 	});
 
-	// If we sent the 8h flag, also mark the sick case as flagged.
 	const flagIds = results
 		.filter((r) => r.related_type === 'sick_case' && r.reminder_type === 'sick_update_superior_flag')
 		.map((r) => r.related_id);
@@ -105,63 +112,141 @@ function renderReminder(r: DueRow): string {
 	}
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// 2. Parade-state nudges.
-// ───────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────
+// 2. Parade nudges
+// ──────────────────────────────────────────────────────────────────────────
+type NudgeKind = 'evening_prev_am' | 'morning_am' | 'noon_pm';
 
-interface MissingRow {
-	telegram_id: string;
-	full_name: string;
-	superior_telegram_id: string | null;
-}
+async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
+	// targetDate: which SGT date the nudge refers to
+	const today = sgtToday();
+	const targetDate = kind === 'evening_prev_am' ? sgtDateAddDays(today, 1) : today;
 
-async function fetchMissingParade(env: Env, dayOffset: string): Promise<MissingRow[]> {
-	// dayOffset like '+1 day' or '+0 day'. We compute "today in SGT" by adding
-	// 8 hours to UTC `now`, then optionally adding +1 day for "tomorrow".
-	const { results } = await env.depot_db
-		.prepare(
-			`SELECT u.telegram_id, u.full_name, u.superior_telegram_id
-			 FROM users u
-			 WHERE u.full_name NOT LIKE 'PENDING:%'
-			   AND NOT EXISTS (
-			     SELECT 1 FROM parade_state_entries p
-			      WHERE p.user_id = u.id
-			        AND p.parade_state_date = date('now', '+8 hours', ?)
-			   )`,
-		)
-		.bind(dayOffset)
-		.all<MissingRow>();
-	return results ?? [];
-}
+	// Skip entirely if target date is non-working (weekend, confirmed PH, override)
+	if (!(await isWorkingDay(env, targetDate))) return;
 
-async function nudgeParadeMissing(env: Env, dayOffset: string, when: 'evening_prev' | 'morning_same'): Promise<void> {
-	const rows = await fetchMissingParade(env, dayOffset);
-	if (!rows.length) return;
-	const text =
-		when === 'evening_prev'
-			? '🌙 Please submit tomorrow\'s parade state in the depot app. You can edit anytime before 7am.'
-			: '☀ Reminder: please submit today\'s parade state in the depot app before 7am.';
-	await Promise.allSettled(
-		rows.map((r) => tgSendMessage(env.BOT_TOKEN, { chat_id: r.telegram_id, text })),
-	);
-}
+	const period: 'AM' | 'PM' = kind === 'noon_pm' ? 'PM' : 'AM';
 
-async function escalateParadeMissing(env: Env): Promise<void> {
-	const rows = await fetchMissingParade(env, '+0 day');
-	if (!rows.length) return;
-	const groups = new Map<string, string[]>();
-	for (const r of rows) {
-		if (!r.superior_telegram_id) continue;
-		const arr = groups.get(r.superior_telegram_id) ?? [];
-		arr.push(r.full_name);
-		groups.set(r.superior_telegram_id, arr);
+	// Who should we nudge?
+	//   evening_prev_am  → only users with NO entry for tomorrow AM
+	//   morning_am       → all users (reassure if already filled)
+	//   noon_pm          → all users (reassure if already filled)
+	let rows: { user: UserRow; hasEntry: boolean }[] = [];
+	if (kind === 'evening_prev_am') {
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id
+				 FROM users u
+				 WHERE u.full_name NOT LIKE 'PENDING:%'
+				   AND NOT EXISTS (
+				     SELECT 1 FROM parade_state_entries p
+				     WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = ?
+				   )`,
+			)
+			.bind(targetDate, period)
+			.all<UserRow>();
+		rows = (results ?? []).map((u) => ({ user: u, hasEntry: false }));
+	} else {
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
+				        (SELECT 1 FROM parade_state_entries p
+				          WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = ?) AS has_entry
+				 FROM users u
+				 WHERE u.full_name NOT LIKE 'PENDING:%'`,
+			)
+			.bind(targetDate, period)
+			.all<UserRow & { has_entry: number | null }>();
+		rows = (results ?? []).map((u) => ({
+			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
+			hasEntry: u.has_entry === 1,
+		}));
 	}
-	await Promise.allSettled(
-		[...groups.entries()].map(([tid, names]) =>
-			tgSendMessage(env.BOT_TOKEN, {
-				chat_id: tid,
-				text: `🚩 Parade state not submitted by 07:30:\n• ${names.join('\n• ')}`,
-			}),
-		),
+
+	if (!rows.length) return;
+
+	const sends = rows.map(({ user, hasEntry }) =>
+		tgSendMessage(env.BOT_TOKEN, {
+			chat_id: user.telegram_id,
+			text: nudgeText(kind, targetDate, hasEntry),
+		}),
 	);
+	await Promise.allSettled(sends);
+}
+
+function nudgeText(kind: NudgeKind, targetDate: string, hasEntry: boolean): string {
+	switch (kind) {
+		case 'evening_prev_am':
+			return `📋 Please submit tomorrow's AM parade state (${targetDate}). You can edit anytime before 7am.`;
+		case 'morning_am':
+			return hasEntry
+				? `☀ Today's (${targetDate}) AM parade state is already submitted — no action needed unless there are changes.`
+				: `☀ Please submit today's (${targetDate}) AM parade state.`;
+		case 'noon_pm':
+			return hasEntry
+				? `🕛 Today's (${targetDate}) PM parade state is already submitted — no action needed unless there are changes.`
+				: `🕛 Please submit today's (${targetDate}) PM parade state.`;
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 3. Daily maintenance pieces (08:00 SGT for ORD + prune; 12:00 SGT for holidays)
+// ──────────────────────────────────────────────────────────────────────────
+async function runOrdReminders(env: Env): Promise<void> {
+	const today = sgtToday();
+	const in30 = sgtDateAddDays(today, 30);
+
+	const { results: superadmins } = await env.depot_db
+		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin'`)
+		.all<{ telegram_id: string }>();
+	if (!superadmins?.length) return;
+
+	const { results: thirty } = await env.depot_db
+		.prepare(`SELECT id, full_name, ord_date FROM users WHERE ord_date = ?`)
+		.bind(in30)
+		.all<{ id: number; full_name: string; ord_date: string }>();
+	const { results: today_ord } = await env.depot_db
+		.prepare(`SELECT id, full_name, ord_date FROM users WHERE ord_date = ?`)
+		.bind(today)
+		.all<{ id: number; full_name: string; ord_date: string }>();
+
+	const sends: Promise<unknown>[] = [];
+	for (const sa of superadmins) {
+		for (const u of thirty ?? []) {
+			sends.push(
+				tgSendMessage(env.BOT_TOKEN, {
+					chat_id: sa.telegram_id,
+					text: `⏳ ORD heads-up (30 days): ${u.full_name} ORDs on ${u.ord_date}.`,
+				}),
+			);
+		}
+		for (const u of today_ord ?? []) {
+			sends.push(
+				tgSendMessage(env.BOT_TOKEN, {
+					chat_id: sa.telegram_id,
+					text: `🎉 ORD today: ${u.full_name}. Use the button below to remove from the depot bot.`,
+					reply_markup: {
+						inline_keyboard: [[{ text: '🗑 Delete user', callback_data: `user:delete:${u.id}` }]],
+					},
+				}),
+			);
+		}
+	}
+	await Promise.allSettled(sends);
+}
+
+async function runParadePrune(env: Env): Promise<void> {
+	const cutoff = sgtDateAddDays(sgtToday(), -5);
+	await env.depot_db
+		.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < ?`)
+		.bind(cutoff)
+		.run();
+}
+
+async function runHolidayRefresh(env: Env): Promise<void> {
+	try {
+		await refreshHolidays(env);
+	} catch (e) {
+		console.error('holiday refresh failed', e);
+	}
 }

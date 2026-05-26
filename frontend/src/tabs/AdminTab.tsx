@@ -1,37 +1,97 @@
 import { useEffect, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
-import { api } from '../lib/api';
+import { api, apiDelete, type Me } from '../lib/api';
 
 interface AdminUser {
 	id: number;
 	telegram_id: string;
 	full_name: string;
-	user_role: 'user' | 'superior' | 'admin';
+	user_role: 'user' | 'admin' | 'superadmin';
 	superior_telegram_id: string | null;
+	ord_date: string | null;
 	created_at: string;
 }
 
-export function AdminTab() {
+interface Override {
+	override_date: string;
+	is_working_day: number;
+	reason: string | null;
+	set_at: string;
+	set_by_name: string | null;
+}
+
+interface Holiday {
+	holiday_date: string;
+	name: string;
+	confirmed: number;
+	refreshed_at: string;
+}
+
+type Section = 'users' | 'overrides' | 'holidays';
+
+export function AdminTab({ me }: { me: Me }) {
+	const [section, setSection] = useState<Section>('users');
+	return (
+		<div>
+			<div className="seg" style={{ marginBottom: 12 }}>
+				<button className={section === 'users' ? 'active' : ''} onClick={() => setSection('users')}>👥 Users</button>
+				<button className={section === 'overrides' ? 'active' : ''} onClick={() => setSection('overrides')}>📆 Overrides</button>
+				<button className={section === 'holidays' ? 'active' : ''} onClick={() => setSection('holidays')}>🇸🇬 Holidays</button>
+			</div>
+			{section === 'users' && <UsersSection me={me} />}
+			{section === 'overrides' && <OverridesSection me={me} />}
+			{section === 'holidays' && <HolidaysSection me={me} />}
+		</div>
+	);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Users section
+// ─────────────────────────────────────────────────────────────────────────
+function UsersSection({ me }: { me: Me }) {
 	const [users, setUsers] = useState<AdminUser[]>([]);
 	const [editing, setEditing] = useState<AdminUser | null>(null);
 
 	function refresh() {
-		api.get<AdminUser[]>('/api/admin/users').then(setUsers).catch(console.error);
+		return api.get<AdminUser[]>('/api/admin/users').then(setUsers);
 	}
-	useEffect(refresh, []);
+	useEffect(() => {
+		refresh().catch(console.error);
+	}, []);
 
 	const pending = users.filter((u) => u.full_name.startsWith('PENDING:'));
 	const active = users.filter((u) => !u.full_name.startsWith('PENDING:'));
+	const today = new Date().toISOString().slice(0, 10);
+	const ordingSoon = active.filter((u) => u.ord_date && u.ord_date >= today)
+		.sort((a, b) => (a.ord_date! < b.ord_date! ? -1 : 1))
+		.slice(0, 10);
 
 	return (
 		<div>
-			<h3>Pending ({pending.length})</h3>
-			{pending.map((u) => (
-				<div key={u.id} className="row" onClick={() => setEditing(u)}>
-					<span>{u.full_name.slice('PENDING:'.length)}</span>
-					<span className="muted">{u.telegram_id}</span>
-				</div>
-			))}
+			{pending.length > 0 && (
+				<>
+					<h3>Pending ({pending.length})</h3>
+					{pending.map((u) => (
+						<div key={u.id} className="row" onClick={() => setEditing(u)}>
+							<span>{u.full_name.slice('PENDING:'.length)}</span>
+							<span className="muted">{u.telegram_id}</span>
+						</div>
+					))}
+				</>
+			)}
+
+			{ordingSoon.length > 0 && (
+				<>
+					<h3 style={{ marginTop: 24 }}>Upcoming ORD</h3>
+					{ordingSoon.map((u) => (
+						<div key={u.id} className="row" onClick={() => setEditing(u)}>
+							<span>{u.full_name}</span>
+							<span className="muted">{u.ord_date}</span>
+						</div>
+					))}
+				</>
+			)}
+
 			<h3 style={{ marginTop: 24 }}>Active ({active.length})</h3>
 			{active.map((u) => (
 				<div key={u.id} className="row" onClick={() => setEditing(u)}>
@@ -39,34 +99,80 @@ export function AdminTab() {
 					<span className="muted">{u.user_role}</span>
 				</div>
 			))}
-			{editing && <EditModal user={editing} onClose={() => setEditing(null)} onDone={refresh} />}
+
+			{editing && (
+				<EditUserModal
+					user={editing}
+					me={me}
+					onClose={() => setEditing(null)}
+					onSaved={(updated) => {
+						// Update local state immediately so screen reflects new value.
+						setUsers((prev) => prev.map((u) => (u.id === updated.id ? updated : u)));
+						setEditing(null);
+					}}
+					onDeleted={(id) => {
+						setUsers((prev) => prev.filter((u) => u.id !== id));
+						setEditing(null);
+					}}
+				/>
+			)}
 		</div>
 	);
 }
 
-function EditModal({ user, onClose, onDone }: { user: AdminUser; onClose: () => void; onDone: () => void }) {
+function EditUserModal({
+	user,
+	me,
+	onClose,
+	onSaved,
+	onDeleted,
+}: {
+	user: AdminUser;
+	me: Me;
+	onClose: () => void;
+	onSaved: (u: AdminUser) => void;
+	onDeleted: (id: number) => void;
+}) {
 	const stripped = user.full_name.startsWith('PENDING:') ? user.full_name.slice('PENDING:'.length) : user.full_name;
 	const [name, setName] = useState(stripped);
 	const [role, setRole] = useState<AdminUser['user_role']>(user.user_role);
 	const [supTid, setSupTid] = useState(user.superior_telegram_id ?? '');
+	const [ordDate, setOrdDate] = useState(user.ord_date ?? '');
 	const [busy, setBusy] = useState(false);
+
+	const canGrantSuperadmin = me.user_role === 'superadmin';
 
 	async function save() {
 		setBusy(true);
 		try {
-			await api.post('/api/admin/users', {
+			const res = await api.post<{ ok: boolean; user: AdminUser }>('/api/admin/users', {
 				id: user.id,
 				full_name: name,
 				user_role: role,
 				superior_telegram_id: supTid || null,
+				ord_date: ordDate || null,
 			});
+			onSaved(res.user);
 			WebApp.showAlert('Saved.');
-			onDone();
-			onClose();
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
-		} finally {
 			setBusy(false);
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	async function del() {
+		const ok = await new Promise<boolean>((resolve) =>
+			WebApp.showConfirm(`Delete ${stripped}? This cannot be undone.`, resolve),
+		);
+		if (!ok) return;
+		setBusy(true);
+		try {
+			await api.post('/api/admin/users/delete', { id: user.id });
+			onDeleted(user.id);
+			WebApp.showAlert('Deleted.');
+		} catch (e) {
+			setBusy(false);
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
@@ -79,17 +185,192 @@ function EditModal({ user, onClose, onDone }: { user: AdminUser; onClose: () => 
 				<label>Role
 					<select value={role} onChange={(e) => setRole(e.target.value as AdminUser['user_role'])}>
 						<option value="user">user</option>
-						<option value="superior">superior</option>
 						<option value="admin">admin</option>
+						{(canGrantSuperadmin || role === 'superadmin') && <option value="superadmin">superadmin</option>}
 					</select>
 				</label>
 				<label>Superior's Telegram ID (optional)
 					<input value={supTid} onChange={(e) => setSupTid(e.target.value)} placeholder="e.g. 123456789" />
 				</label>
+				<label>ORD date (optional)
+					<input type="date" value={ordDate} onChange={(e) => setOrdDate(e.target.value)} />
+				</label>
 				<button className="btn" disabled={busy || !name.trim()} onClick={save}>
 					{busy ? 'Saving…' : 'Save'}
 				</button>
+				{me.user_role === 'superadmin' && user.id !== me.id && (
+					<button className="btn btn-danger" style={{ marginTop: 8 }} disabled={busy} onClick={del}>
+						🗑 Delete user
+					</button>
+				)}
 			</div>
+		</div>
+	);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Working-day overrides
+// ─────────────────────────────────────────────────────────────────────────
+function OverridesSection({ me }: { me: Me }) {
+	const [overrides, setOverrides] = useState<Override[]>([]);
+	const [showAdd, setShowAdd] = useState(false);
+
+	function refresh() {
+		return api.get<Override[]>('/api/admin/overrides').then(setOverrides);
+	}
+	useEffect(() => {
+		refresh().catch(console.error);
+	}, []);
+
+	async function remove(date: string) {
+		const ok = await new Promise<boolean>((resolve) =>
+			WebApp.showConfirm(`Remove override for ${date}?`, resolve),
+		);
+		if (!ok) return;
+		try {
+			await apiDelete(`/api/admin/overrides?date=${date}`);
+			await refresh();
+			WebApp.showAlert('Removed.');
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	return (
+		<div>
+			<p className="muted">Override the working-day rule for specific dates (e.g. weekend exercise → working).</p>
+			{me.user_role === 'superadmin' && (
+				<button className="btn" onClick={() => setShowAdd(true)}>+ Add override</button>
+			)}
+
+			{overrides.length === 0 ? (
+				<p className="muted" style={{ marginTop: 12 }}>No overrides set.</p>
+			) : (
+				overrides.map((o) => (
+					<div key={o.override_date} className="card">
+						<div className="card-row">
+							<span>
+								<b>{o.override_date}</b> — {o.is_working_day === 1 ? '✅ Working' : '🚫 Non-working'}
+							</span>
+							{me.user_role === 'superadmin' && (
+								<button className="btn-link danger" onClick={() => remove(o.override_date)}>Remove</button>
+							)}
+						</div>
+						{o.reason && <div className="muted">{o.reason}</div>}
+						<div className="muted">Set by {o.set_by_name ?? '?'} at {o.set_at}</div>
+					</div>
+				))
+			)}
+
+			{showAdd && <AddOverrideModal onClose={() => setShowAdd(false)} onDone={refresh} />}
+		</div>
+	);
+}
+
+function AddOverrideModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+	const [date, setDate] = useState('');
+	const [isWorking, setIsWorking] = useState(true);
+	const [reason, setReason] = useState('');
+	const [busy, setBusy] = useState(false);
+
+	// Default to "force working" if the picked date is a weekend; else "force non-working"
+	useEffect(() => {
+		if (!date) return;
+		const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
+		setIsWorking(dow === 0 || dow === 6); // weekend → default to "force working"
+	}, [date]);
+
+	async function save() {
+		setBusy(true);
+		try {
+			await api.post('/api/admin/overrides', {
+				override_date: date,
+				is_working_day: isWorking,
+				reason: reason.trim() || null,
+			});
+			await onDone();
+			onClose();
+			WebApp.showAlert('Saved.');
+		} catch (e) {
+			setBusy(false);
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	return (
+		<div className="modal-backdrop" onClick={onClose}>
+			<div className="modal" onClick={(e) => e.stopPropagation()}>
+				<h3>Add working-day override</h3>
+				<label>Date<input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label>
+				<label>
+					<div className="seg">
+						<button className={isWorking ? 'active' : ''} onClick={() => setIsWorking(true)}>✅ Force working</button>
+						<button className={!isWorking ? 'active' : ''} onClick={() => setIsWorking(false)}>🚫 Force non-working</button>
+					</div>
+				</label>
+				<label>Reason
+					<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Field exercise" />
+				</label>
+				<button className="btn" disabled={busy || !date} onClick={save}>
+					{busy ? 'Saving…' : 'Save'}
+				</button>
+			</div>
+		</div>
+	);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Public holidays
+// ─────────────────────────────────────────────────────────────────────────
+function HolidaysSection({ me }: { me: Me }) {
+	const [holidays, setHolidays] = useState<Holiday[]>([]);
+	const [busy, setBusy] = useState(false);
+
+	function refresh() {
+		return api.get<Holiday[]>('/api/admin/holidays').then(setHolidays);
+	}
+	useEffect(() => {
+		refresh().catch(console.error);
+	}, []);
+
+	async function forceRefresh() {
+		setBusy(true);
+		try {
+			const res = await api.post<{ ok: boolean; deltas: number }>('/api/admin/refresh-holidays');
+			await refresh();
+			WebApp.showAlert(`Refreshed. ${res.deltas} change(s) detected — confirm via DM.`);
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	return (
+		<div>
+			<p className="muted">Cached SG public holidays. Auto-refresh runs daily at 08:00 SGT; deltas are DM'd to all superadmins for confirm.</p>
+			{me.user_role === 'superadmin' && (
+				<button className="btn" disabled={busy} onClick={forceRefresh}>
+					{busy ? 'Refreshing…' : '🔄 Force refresh now'}
+				</button>
+			)}
+
+			{holidays.length === 0 ? (
+				<p className="muted" style={{ marginTop: 12 }}>No holidays cached yet.</p>
+			) : (
+				<table style={{ marginTop: 12 }}>
+					<thead><tr><th>Date</th><th>Name</th><th>Confirmed</th></tr></thead>
+					<tbody>
+						{holidays.map((h) => (
+							<tr key={h.holiday_date}>
+								<td>{h.holiday_date}</td>
+								<td>{h.name}</td>
+								<td>{h.confirmed === 1 ? '✅' : '⏳'}</td>
+							</tr>
+						))}
+					</tbody>
+				</table>
+			)}
 		</div>
 	);
 }
