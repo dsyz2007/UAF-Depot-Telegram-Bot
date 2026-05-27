@@ -1,11 +1,15 @@
-// Singapore public holidays via data.gov.sg + working-day classification.
+// Singapore public holidays via nager.date + working-day classification.
 //
-// We use data.gov.sg's CKAN datastore_search endpoint. Dataset name per year:
-// "Public Holidays for YYYY". The dataset publishes resource IDs we have to
-// look up via package_search.
+// We switched away from data.gov.sg's CKAN API because it has shifted
+// endpoints multiple times and was returning empty results. nager.date
+// publishes Singapore's MOM-confirmed holidays once they're released and
+// is a stable JSON endpoint.
 //
-// Cache table: public_holidays(holiday_date PK, name, confirmed, refreshed_at)
-// Override table: working_day_overrides(override_date PK, is_working_day, reason, ...)
+//   GET https://date.nager.at/api/v3/PublicHolidays/{year}/SG
+//
+// Tables (created by migration 002):
+//   public_holidays(holiday_date PK, name, confirmed, refreshed_at)
+//   working_day_overrides(override_date PK, is_working_day, reason, ...)
 
 import { tgSendMessage } from './tg';
 
@@ -14,7 +18,6 @@ interface HolidayRecord {
 	name: string;
 }
 
-// Convert a UTC `now` into SGT date string (YYYY-MM-DD).
 export function sgtToday(): string {
 	const now = new Date();
 	const sgt = new Date(now.getTime() + 8 * 3600 * 1000);
@@ -28,15 +31,14 @@ export function sgtDateAddDays(sgtDate: string, deltaDays: number): string {
 }
 
 export function dayOfWeekSgt(sgtDate: string): number {
-	// 0 = Sunday, 6 = Saturday
 	return new Date(`${sgtDate}T00:00:00Z`).getUTCDay();
 }
 
 // Precedence:
-// 1. working_day_overrides row → use is_working_day
-// 2. public_holidays row with confirmed=1 → non-working
-// 3. Saturday/Sunday → non-working
-// 4. Otherwise → working
+// 1. working_day_overrides → use its value
+// 2. confirmed public_holidays → non-working
+// 3. Sat/Sun → non-working
+// 4. otherwise working
 export async function isWorkingDay(env: Env, sgtDate: string): Promise<boolean> {
 	const override = await env.depot_db
 		.prepare('SELECT is_working_day FROM working_day_overrides WHERE override_date = ?')
@@ -52,59 +54,38 @@ export async function isWorkingDay(env: Env, sgtDate: string): Promise<boolean> 
 
 	const dow = dayOfWeekSgt(sgtDate);
 	if (dow === 0 || dow === 6) return false;
-
 	return true;
 }
 
 // --------------------------------------------------------------------------
-// data.gov.sg fetch
+// Fetch from nager.date
 // --------------------------------------------------------------------------
-// CKAN package_search to find resource IDs, then datastore_search to read.
-// data.gov.sg dataset slug pattern: "public-holidays-for-YYYY".
 async function fetchHolidaysForYear(year: number): Promise<HolidayRecord[]> {
-	const pkgUrl = `https://data.gov.sg/api/action/package_show?id=public-holidays-for-${year}`;
-	const pkgRes = await fetch(pkgUrl, { headers: { accept: 'application/json' } });
-	if (!pkgRes.ok) {
-		console.warn(`holidays: package_show ${year} → ${pkgRes.status}`);
+	const url = `https://date.nager.at/api/v3/PublicHolidays/${year}/SG`;
+	let res: Response;
+	try {
+		res = await fetch(url, { headers: { accept: 'application/json' } });
+	} catch (e) {
+		console.warn(`nager.date ${year} fetch threw`, e);
 		return [];
 	}
-	const pkgJson = (await pkgRes.json()) as {
-		result?: { resources?: { id: string; format?: string }[] };
-	};
-	const resource = pkgJson.result?.resources?.find((r) => /csv/i.test(r.format ?? ''));
-	if (!resource) {
-		console.warn(`holidays: no CSV resource for ${year}`);
+	if (!res.ok) {
+		console.warn(`nager.date ${year} → ${res.status}`);
 		return [];
 	}
-	const dsUrl = `https://data.gov.sg/api/action/datastore_search?resource_id=${resource.id}&limit=100`;
-	const dsRes = await fetch(dsUrl);
-	if (!dsRes.ok) {
-		console.warn(`holidays: datastore_search ${year} → ${dsRes.status}`);
+	const json = (await res.json()) as
+		| { date: string; localName?: string; name?: string }[]
+		| null;
+	if (!Array.isArray(json)) {
+		console.warn(`nager.date ${year} returned non-array`);
 		return [];
 	}
-	const dsJson = (await dsRes.json()) as {
-		result?: { records?: Record<string, string>[] };
-	};
-	const records = dsJson.result?.records ?? [];
-
 	const out: HolidayRecord[] = [];
-	for (const r of records) {
-		// Field names vary per year ("Date" / "date") and ("Holiday" / "Name" / "holiday")
-		const rawDate = r.Date ?? r.date ?? r['Holiday Date'] ?? '';
-		const name = r.Holiday ?? r.holiday ?? r.Name ?? r.name ?? '';
-		const iso = normaliseDate(rawDate);
-		if (iso && name) out.push({ holiday_date: iso, name });
+	for (const r of json) {
+		if (!r?.date || !/^\d{4}-\d{2}-\d{2}$/.test(r.date)) continue;
+		out.push({ holiday_date: r.date, name: r.localName ?? r.name ?? 'Holiday' });
 	}
 	return out;
-}
-
-// data.gov.sg ships dates as "YYYY-MM-DD" usually but sometimes "D Mmm YYYY".
-function normaliseDate(raw: string): string | null {
-	if (!raw) return null;
-	if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-	const parsed = new Date(raw);
-	if (Number.isNaN(parsed.getTime())) return null;
-	return parsed.toISOString().slice(0, 10);
 }
 
 interface HolidayDelta {
@@ -114,16 +95,28 @@ interface HolidayDelta {
 	previous_name?: string;
 }
 
-// Fetch current + next year, diff against cache, DM superadmins with each delta.
-// Returns the number of deltas detected (0 when no DMs sent).
-export async function refreshHolidays(env: Env): Promise<number> {
+export interface RefreshReport {
+	fetched: number;
+	deltas: number;
+	bootstrap: boolean;
+	cached_total: number;
+}
+
+// Returns a summary report (always — even when nothing changed).
+export async function refreshHolidays(env: Env): Promise<RefreshReport> {
 	const todayYear = Number(sgtToday().slice(0, 4));
-	const fetched = [...(await fetchHolidaysForYear(todayYear)), ...(await fetchHolidaysForYear(todayYear + 1))];
+	const fetched = [
+		...(await fetchHolidaysForYear(todayYear)),
+		...(await fetchHolidaysForYear(todayYear + 1)),
+	];
+
 	if (fetched.length === 0) {
-		console.warn('holidays: no records fetched, retaining cache');
-		return 0;
+		console.warn('holidays: no records fetched from nager.date');
+		const cnt = await countCached(env);
+		return { fetched: 0, deltas: 0, bootstrap: false, cached_total: cnt };
 	}
 
+	// Detect bootstrap: do we already have ANY rows in this year/next-year window?
 	const { results: existingRows } = await env.depot_db
 		.prepare(
 			`SELECT holiday_date, name, confirmed FROM public_holidays
@@ -132,10 +125,23 @@ export async function refreshHolidays(env: Env): Promise<number> {
 		.bind(String(todayYear), String(todayYear + 1))
 		.all<{ holiday_date: string; name: string; confirmed: number }>();
 	const existing = new Map((existingRows ?? []).map((r) => [r.holiday_date, r]));
+	const isBootstrap = existing.size === 0;
 
+	if (isBootstrap) {
+		// Bootstrap: trust nager.date for the initial load (auto-confirm).
+		const stmt = env.depot_db.prepare(
+			`INSERT INTO public_holidays (holiday_date, name, confirmed) VALUES (?, ?, 1)
+			 ON CONFLICT(holiday_date) DO UPDATE SET name = excluded.name, confirmed = 1,
+			   refreshed_at = datetime('now')`,
+		);
+		await env.depot_db.batch(fetched.map((h) => stmt.bind(h.holiday_date, h.name)));
+		const cnt = await countCached(env);
+		return { fetched: fetched.length, deltas: fetched.length, bootstrap: true, cached_total: cnt };
+	}
+
+	// Diff against cache, stage deltas as confirmed=0 + DM superadmins to confirm.
 	const deltas: HolidayDelta[] = [];
 	const seen = new Set<string>();
-
 	for (const h of fetched) {
 		seen.add(h.holiday_date);
 		const prev = existing.get(h.holiday_date);
@@ -151,80 +157,81 @@ export async function refreshHolidays(env: Env): Promise<number> {
 		}
 	}
 
+	// Always touch refreshed_at so we know the fetch succeeded.
+	await env.depot_db
+		.prepare(`UPDATE public_holidays SET refreshed_at = datetime('now') WHERE confirmed = 1`)
+		.run();
+
 	if (deltas.length === 0) {
-		// Touch refreshed_at so we can see in DB when last successfully refreshed.
-		await env.depot_db
-			.prepare(`UPDATE public_holidays SET refreshed_at = datetime('now') WHERE confirmed = 1`)
-			.run();
-		return 0;
+		const cnt = await countCached(env);
+		return { fetched: fetched.length, deltas: 0, bootstrap: false, cached_total: cnt };
 	}
 
-	// Stage all deltas as confirmed=0 rows / pending deletions.
-	// NEW + CHANGED: upsert with confirmed=0.
-	// REMOVED: we mark by setting confirmed=0 to flag pending review (delete on confirm).
 	const upsert = env.depot_db.prepare(
 		`INSERT INTO public_holidays (holiday_date, name, confirmed) VALUES (?, ?, 0)
 		 ON CONFLICT(holiday_date) DO UPDATE SET name = excluded.name, confirmed = 0,
 		   refreshed_at = datetime('now')`,
 	);
 	const stageRemoval = env.depot_db.prepare(
-		`UPDATE public_holidays SET confirmed = 0, name = name || ' [REMOVED]'
+		`UPDATE public_holidays SET confirmed = 0,
+		   name = CASE WHEN name LIKE '%[REMOVED]' THEN name ELSE name || ' [REMOVED]' END
 		 WHERE holiday_date = ?`,
 	);
-	const batchOps = deltas.map((d) =>
+	const ops = deltas.map((d) =>
 		d.kind === 'removed' ? stageRemoval.bind(d.holiday_date) : upsert.bind(d.holiday_date, d.name),
 	);
-	if (batchOps.length) await env.depot_db.batch(batchOps);
+	if (ops.length) await env.depot_db.batch(ops);
 
-	// DM all superadmins.
-	const { results: admins } = await env.depot_db
+	const { results: superadmins } = await env.depot_db
 		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin'`)
 		.all<{ telegram_id: string }>();
-	if (!admins?.length) return deltas.length;
-
-	const summary = deltas
-		.map((d) => {
-			if (d.kind === 'new') return `🆕 ${d.holiday_date} — ${d.name}`;
-			if (d.kind === 'changed') return `✏ ${d.holiday_date} — ${d.previous_name} → ${d.name}`;
-			return `❌ ${d.holiday_date} — ${d.name} (no longer listed)`;
-		})
-		.join('\n');
-
-	for (const a of admins) {
-		await tgSendMessage(env.BOT_TOKEN, {
-			chat_id: a.telegram_id,
-			text: `🇸🇬 <b>Public holiday changes from data.gov.sg</b>\n\n${summary}\n\nReview each change individually below:`,
-			parse_mode: 'HTML',
-		});
-		// Then one message per delta with inline buttons.
-		for (const d of deltas) {
-			const label = d.kind === 'removed' ? `${d.holiday_date} (${d.name})` : `${d.holiday_date} — ${d.name}`;
+	if (superadmins?.length) {
+		const summary = deltas
+			.map((d) => {
+				if (d.kind === 'new') return `🆕 ${d.holiday_date} — ${d.name}`;
+				if (d.kind === 'changed') return `✏ ${d.holiday_date} — ${d.previous_name} → ${d.name}`;
+				return `❌ ${d.holiday_date} — ${d.name} (removed)`;
+			})
+			.join('\n');
+		for (const sa of superadmins) {
 			await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: a.telegram_id,
-				text: `<b>${holidayKindLabel(d.kind)}</b>\n${label}`,
+				chat_id: sa.telegram_id,
+				text: `🇸🇬 <b>Public-holiday updates (nager.date)</b>\n\n${summary}\n\nReview each change individually below:`,
 				parse_mode: 'HTML',
-				reply_markup: {
-					inline_keyboard: [
-						[
-							{ text: '✅ Confirm', callback_data: `hol:confirm:${d.holiday_date}` },
-							{ text: '❌ Reject', callback_data: `hol:reject:${d.holiday_date}` },
-						],
-						[{ text: '🛠 Treat as working day', callback_data: `hol:overrideworking:${d.holiday_date}` }],
-					],
-				},
 			});
+			for (const d of deltas) {
+				const label = d.kind === 'removed' ? `${d.holiday_date} (${d.name})` : `${d.holiday_date} — ${d.name}`;
+				await tgSendMessage(env.BOT_TOKEN, {
+					chat_id: sa.telegram_id,
+					text: `<b>${kindLabel(d.kind)}</b>\n${label}`,
+					parse_mode: 'HTML',
+					reply_markup: {
+						inline_keyboard: [
+							[
+								{ text: '✅ Confirm', callback_data: `hol:confirm:${d.holiday_date}` },
+								{ text: '❌ Reject', callback_data: `hol:reject:${d.holiday_date}` },
+							],
+							[{ text: '🛠 Treat as working day', callback_data: `hol:overrideworking:${d.holiday_date}` }],
+						],
+					},
+				});
+			}
 		}
 	}
-	return deltas.length;
+
+	const cnt = await countCached(env);
+	return { fetched: fetched.length, deltas: deltas.length, bootstrap: false, cached_total: cnt };
 }
 
-function holidayKindLabel(k: HolidayDelta['kind']): string {
-	switch (k) {
-		case 'new':
-			return '🆕 NEW holiday';
-		case 'changed':
-			return '✏ CHANGED holiday';
-		case 'removed':
-			return '❌ REMOVED holiday';
-	}
+async function countCached(env: Env): Promise<number> {
+	const r = await env.depot_db
+		.prepare(`SELECT COUNT(*) AS n FROM public_holidays`)
+		.first<{ n: number }>();
+	return r?.n ?? 0;
+}
+
+function kindLabel(k: HolidayDelta['kind']): string {
+	if (k === 'new') return '🆕 NEW holiday';
+	if (k === 'changed') return '✏ CHANGED';
+	return '❌ REMOVED';
 }

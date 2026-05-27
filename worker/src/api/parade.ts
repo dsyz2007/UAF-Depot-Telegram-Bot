@@ -94,32 +94,33 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'GET' && sub === '/export') {
-		// CSV export — superadmin only (was admin pre-rename)
-		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
-		const from = url.searchParams.get('from') ?? '';
-		const to = url.searchParams.get('to') ?? '';
-		if (!isValidDate(from) || !isValidDate(to)) return json({ error: 'bad_dates' }, { status: 400 });
+		// CSV export — single date, admin or superadmin.
+		if (!isAdminish(user.user_role)) return json({ error: 'forbidden' }, { status: 403 });
+		const date = url.searchParams.get('date') ?? '';
+		if (!isValidDate(date)) return json({ error: 'bad_date' }, { status: 400 });
 
+		// Department grouping so the CSV is also useful as a paste-able roll-call.
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT u.full_name, p.parade_state_date, p.period, p.parade_status, p.reason
-				 FROM parade_state_entries p JOIN users u ON u.id = p.user_id
-				 WHERE p.parade_state_date BETWEEN ? AND ?
-				 ORDER BY u.full_name, p.parade_state_date, p.period`,
+				`SELECT u.full_name, u.department, p.period, p.parade_status, p.reason
+				 FROM parade_state_entries p
+				 JOIN users u ON u.id = p.user_id
+				 WHERE p.parade_state_date = ?
+				 ORDER BY u.department, u.full_name, p.period`,
 			)
-			.bind(from, to)
-			.all<{ full_name: string; parade_state_date: string; period: string; parade_status: string; reason: string | null }>();
+			.bind(date)
+			.all<{ full_name: string; department: string | null; period: string; parade_status: string; reason: string | null }>();
 		const rows = results ?? [];
 
 		const csvEscape = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-		const header = 'name,date,period,status,reason\n';
+		const header = 'department,name,period,status,reason\n';
 		const body = rows
-			.map((r) => [r.full_name, r.parade_state_date, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
+			.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
 			.join('\n');
 		return new Response(header + body + '\n', {
 			headers: {
 				'content-type': 'text/csv; charset=utf-8',
-				'content-disposition': `attachment; filename="parade-state_${from}_to_${to}.csv"`,
+				'content-disposition': `attachment; filename="parade-state_${date}.csv"`,
 			},
 		});
 	}

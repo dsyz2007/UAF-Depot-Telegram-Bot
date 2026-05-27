@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { DayPicker, type DateRange } from 'react-day-picker';
+import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
 import WebApp from '@twa-dev/sdk';
 import { api, type Me } from '../lib/api';
@@ -26,14 +26,22 @@ const COLORS: Record<string, string> = {
 	Others: '#ff9800',
 };
 
-function ymKey(d: Date) {
+// IMPORTANT: use local-time components, NOT toISOString — DayPicker gives us
+// local-time Date objects; toISOString shifts by the timezone offset and
+// (in SGT) makes us read/write the wrong calendar date.
+function ymdKey(d: Date): string {
+	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function ymKey(d: Date): string {
 	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
-function ymdKey(d: Date) {
-	return d.toISOString().slice(0, 10);
+
+function todayLocal(): Date {
+	const now = new Date();
+	return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
-function isAdminish(role: Me['user_role']) {
+function isAdminish(role: Me['user_role']): boolean {
 	return role === 'admin' || role === 'superadmin';
 }
 
@@ -67,20 +75,25 @@ function buildCopyText(date: string, rows: Entry[]): string {
 }
 
 export function ParadeTab({ me }: { me: Me }) {
-	const [month, setMonth] = useState(new Date());
+	const [month, setMonth] = useState<Date>(todayLocal());
 	const [entries, setEntries] = useState<Entry[]>([]);
-	const [selectedDate, setSelectedDate] = useState<Date | null>(new Date());
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [selectedDate, setSelectedDate] = useState<Date>(todayLocal());
 	const [showSubmit, setShowSubmit] = useState(false);
 	const [copyModalText, setCopyModalText] = useState<string | null>(null);
 
 	function refresh() {
-		return api.get<Entry[]>(`/api/parade/month?ym=${ymKey(month)}`).then(setEntries);
+		setLoadError(null);
+		return api
+			.get<Entry[]>(`/api/parade/month?ym=${ymKey(month)}`)
+			.then(setEntries)
+			.catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
 	}
 	useEffect(() => {
-		refresh().catch(console.error);
+		refresh();
 	}, [month]);
 
-	// Map (date → {AM?, PM?}) for me
+	// Map (date → {AM?, PM?}) for me, recomputed when entries change.
 	const myByDate = useMemo(() => {
 		const map = new Map<string, { AM?: Entry; PM?: Entry }>();
 		entries
@@ -93,7 +106,6 @@ export function ParadeTab({ me }: { me: Me }) {
 		return map;
 	}, [entries, me.id]);
 
-	// All entries grouped by date (for the day-details panel)
 	const allByDate = useMemo(() => {
 		const map = new Map<string, Entry[]>();
 		entries.forEach((e) => {
@@ -104,24 +116,41 @@ export function ParadeTab({ me }: { me: Me }) {
 		return map;
 	}, [entries]);
 
-	// Custom DayContent renderer — colored chips for AM and PM
-	const dayDetails = selectedDate ? allByDate.get(ymdKey(selectedDate)) ?? [] : [];
+	const dayDetails = allByDate.get(ymdKey(selectedDate)) ?? [];
+	const myToday = myByDate.get(ymdKey(selectedDate));
+
+	if (loadError) {
+		return (
+			<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
+				<h3>⚠ Couldn't load parade state</h3>
+				<p className="muted">{loadError}</p>
+				<p className="muted">If you just changed the schema, re-apply migration 002:</p>
+				<pre style={{ background: 'var(--tg-theme-secondary-bg-color, #eee)', padding: 10, borderRadius: 8, fontSize: 12, overflow: 'auto' }}>
+{`npx wrangler d1 execute depot_db --remote \\
+  --file worker/src/db/migrations/002_round2.sql`}
+				</pre>
+				<button className="btn" onClick={() => refresh()}>Retry</button>
+			</div>
+		);
+	}
 
 	return (
 		<div>
+			{/* Key forces DayPicker to fully re-render whenever entries change. */}
 			<DayPicker
+				key={`cal-${entries.length}-${ymKey(month)}`}
 				mode="single"
 				month={month}
 				onMonthChange={setMonth}
-				selected={selectedDate ?? undefined}
-				onSelect={(d) => setSelectedDate(d ?? null)}
+				selected={selectedDate}
+				onSelect={(d) => d && setSelectedDate(d)}
 				components={{
 					DayButton: (props) => {
-						// react-day-picker passes day info via props.day.date
 						const dateKey = ymdKey(props.day.date);
 						const my = myByDate.get(dateKey);
 						const { day: _day, modifiers: _modifiers, ...buttonProps } = props;
-						void _day; void _modifiers;
+						void _day;
+						void _modifiers;
 						return (
 							<button {...buttonProps} className={`${buttonProps.className ?? ''} day-cell`}>
 								<div className="day-num">{props.day.date.getDate()}</div>
@@ -129,12 +158,10 @@ export function ParadeTab({ me }: { me: Me }) {
 									<span
 										className="chip-half am"
 										style={{ background: my?.AM ? COLORS[my.AM.parade_status] : 'transparent' }}
-										title={my?.AM ? `AM: ${my.AM.parade_status}` : 'AM: —'}
 									/>
 									<span
 										className="chip-half pm"
 										style={{ background: my?.PM ? COLORS[my.PM.parade_status] : 'transparent' }}
-										title={my?.PM ? `PM: ${my.PM.parade_status}` : 'PM: —'}
 									/>
 								</div>
 							</button>
@@ -143,13 +170,31 @@ export function ParadeTab({ me }: { me: Me }) {
 				}}
 			/>
 
-			<button className="btn" style={{ width: '100%', marginTop: 12 }} onClick={() => setShowSubmit(true)}>
-				+ Submit Status
-			</button>
+			<div className="card" style={{ marginTop: 10 }}>
+				<div className="card-row">
+					<div>
+						<b>{ymdKey(selectedDate)}</b>
+						<div className="muted" style={{ marginTop: 2 }}>
+							{myToday ? (
+								<>
+									My AM: <b>{myToday.AM?.parade_status ?? '—'}</b>
+									{' · '}
+									My PM: <b>{myToday.PM?.parade_status ?? '—'}</b>
+								</>
+							) : (
+								<span>You have not submitted for this date.</span>
+							)}
+						</div>
+					</div>
+					<button className="btn" onClick={() => setShowSubmit(true)}>
+						+ Submit / Edit
+					</button>
+				</div>
+			</div>
 
-			{me.user_role === 'superadmin' && <ExportButton />}
+			{isAdminish(me.user_role) && <ExportButton selectedDate={ymdKey(selectedDate)} />}
 
-			<div style={{ marginTop: 16 }}>
+			<div style={{ marginTop: 14 }}>
 				<h4 style={{ marginBottom: 8 }}>Legend</h4>
 				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
 					{STATUSES.map((s) => (
@@ -161,63 +206,212 @@ export function ParadeTab({ me }: { me: Me }) {
 				</div>
 			</div>
 
-			{selectedDate && (
-				<div style={{ marginTop: 16 }}>
-					<div className="card-row">
-						<h4 style={{ margin: 0 }}>{ymdKey(selectedDate)}</h4>
-						{isAdminish(me.user_role) && dayDetails.length > 0 && (
-							<button
-								className="btn-link"
-								onClick={async () => {
-									const text = buildCopyText(ymdKey(selectedDate), dayDetails);
-									try {
-										await navigator.clipboard.writeText(text);
-										WebApp.showAlert('Parade state copied to clipboard.');
-									} catch {
-										// Telegram WebView often blocks clipboard.writeText → show modal
-										setCopyModalText(text);
-									}
-								}}
-							>
-								📋 Copy state
-							</button>
-						)}
-					</div>
-					{dayDetails.length === 0 ? (
-						<p className="muted">No submissions yet.</p>
-					) : (
-						<table>
-							<thead>
-								<tr><th>Name</th><th>Period</th><th>Status</th><th>Reason</th></tr>
-							</thead>
-							<tbody>
-								{dayDetails.map((e) => (
-									<tr key={`${e.user_id}-${e.period}`}>
-										<td>{e.full_name}</td>
-										<td>{e.period}</td>
-										<td>
-											<span className="badge" style={{ background: COLORS[e.parade_status] }}>
-												{e.parade_status}
-											</span>
-										</td>
-										<td>{e.reason ?? '—'}</td>
-									</tr>
-								))}
-							</tbody>
-						</table>
+			<div style={{ marginTop: 16 }}>
+				<div className="card-row">
+					<h4 style={{ margin: 0 }}>Everyone — {ymdKey(selectedDate)}</h4>
+					{isAdminish(me.user_role) && dayDetails.length > 0 && (
+						<button
+							className="btn-link"
+							onClick={async () => {
+								const text = buildCopyText(ymdKey(selectedDate), dayDetails);
+								try {
+									await navigator.clipboard.writeText(text);
+									WebApp.showAlert('Parade state copied to clipboard.');
+								} catch {
+									setCopyModalText(text);
+								}
+							}}
+						>
+							📋 Copy state
+						</button>
 					)}
 				</div>
-			)}
+				{dayDetails.length === 0 ? (
+					<p className="muted">No submissions yet.</p>
+				) : (
+					<table>
+						<thead>
+							<tr><th>Name</th><th>Period</th><th>Status</th><th>Reason</th></tr>
+						</thead>
+						<tbody>
+							{dayDetails.map((e) => (
+								<tr key={`${e.user_id}-${e.period}`}>
+									<td>{e.full_name}</td>
+									<td>{e.period}</td>
+									<td>
+										<span className="badge" style={{ background: COLORS[e.parade_status] }}>
+											{e.parade_status}
+										</span>
+									</td>
+									<td>{e.reason ?? '—'}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				)}
+			</div>
 
 			{showSubmit && (
 				<SubmitModal
-					initialDate={selectedDate ?? new Date()}
+					initialDate={ymdKey(selectedDate)}
 					onClose={() => setShowSubmit(false)}
 					onDone={refresh}
 				/>
 			)}
 
 			{copyModalText && <CopyTextModal text={copyModalText} onClose={() => setCopyModalText(null)} />}
+		</div>
+	);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Redesigned submit modal — simple date inputs + 3-way period segmented
+// control + always-on preview + explicit "why disabled" hint.
+// ──────────────────────────────────────────────────────────────────────────
+type PeriodChoice = 'AM' | 'PM' | 'BOTH';
+
+function SubmitModal({
+	initialDate,
+	onClose,
+	onDone,
+}: {
+	initialDate: string;
+	onClose: () => void;
+	onDone: () => Promise<void>;
+}) {
+	const [startdate, setStartdate] = useState(initialDate);
+	const [enddate, setEnddate] = useState(initialDate);
+	const [periodChoice, setPeriodChoice] = useState<PeriodChoice>('BOTH');
+	const [status, setStatus] = useState<Status>('Present');
+	const [reason, setReason] = useState('');
+	const [busy, setBusy] = useState(false);
+
+	const reasonRequired = status === 'Others';
+	const datesValid = !!startdate && !!enddate && startdate <= enddate;
+	const reasonOk = !reasonRequired || reason.trim().length > 0;
+	const canSave = datesValid && reasonOk;
+
+	let disabledHint: string | null = null;
+	if (!startdate || !enddate) disabledHint = 'Pick start and end dates.';
+	else if (startdate > enddate) disabledHint = 'End date must be on or after start date.';
+	else if (reasonRequired && !reason.trim()) disabledHint = 'Reason is required when status = Others.';
+
+	// Day count
+	const dayCount = (() => {
+		if (!datesValid) return 0;
+		const a = new Date(`${startdate}T00:00:00`);
+		const b = new Date(`${enddate}T00:00:00`);
+		return Math.floor((b.getTime() - a.getTime()) / 86_400_000) + 1;
+	})();
+	const periods: ('AM' | 'PM')[] = periodChoice === 'BOTH' ? ['AM', 'PM'] : [periodChoice];
+	const periodLabel = periodChoice === 'BOTH' ? 'AM and PM' : `${periodChoice} only`;
+
+	async function submit() {
+		if (!canSave) return;
+		setBusy(true);
+		try {
+			await api.post('/api/parade/submit', {
+				startdate,
+				enddate,
+				status,
+				reason: reason.trim() || null,
+				periods,
+			});
+			await onDone();
+			onClose();
+			const summary =
+				startdate === enddate
+					? `${startdate} (${periodLabel})`
+					: `${startdate} → ${enddate} (${periodLabel}, ${dayCount} day${dayCount === 1 ? '' : 's'})`;
+			WebApp.showAlert(`✅ Saved\n${status} for ${summary}`);
+		} catch (e) {
+			setBusy(false);
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	return (
+		<div className="modal-backdrop" onClick={onClose}>
+			<div className="modal" onClick={(e) => e.stopPropagation()}>
+				<h3>Submit / Edit Parade Status</h3>
+
+				<label>Start date<input type="date" value={startdate} onChange={(e) => setStartdate(e.target.value)} /></label>
+				<label>End date<input type="date" value={enddate} onChange={(e) => setEnddate(e.target.value)} /></label>
+
+				<label>
+					Period
+					<div className="seg">
+						<button className={periodChoice === 'AM' ? 'active' : ''} onClick={() => setPeriodChoice('AM')}>AM only</button>
+						<button className={periodChoice === 'PM' ? 'active' : ''} onClick={() => setPeriodChoice('PM')}>PM only</button>
+						<button className={periodChoice === 'BOTH' ? 'active' : ''} onClick={() => setPeriodChoice('BOTH')}>Both</button>
+					</div>
+				</label>
+
+				<label>Status
+					<select value={status} onChange={(e) => setStatus(e.target.value as Status)}>
+						{STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+					</select>
+				</label>
+
+				<label>
+					Reason {reasonRequired ? <span className="danger">*required for Others</span> : <span className="muted">(optional)</span>}
+					<input
+						value={reason}
+						onChange={(e) => setReason(e.target.value)}
+						placeholder={reasonRequired ? 'Specify the reason' : 'Optional context'}
+					/>
+				</label>
+
+				<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
+					<b>Preview</b>
+					<div className="muted" style={{ marginTop: 4 }}>
+						{datesValid
+							? `${status} · ${startdate === enddate ? startdate : `${startdate} → ${enddate}`} · ${periodLabel}${dayCount > 1 ? ` · ${dayCount} days` : ''}`
+							: 'Fill in the dates above.'}
+					</div>
+				</div>
+
+				{disabledHint && (
+					<div className="muted danger" style={{ marginBottom: 8 }}>{disabledHint}</div>
+				)}
+
+				<button className="btn" disabled={busy || !canSave} onClick={submit}>
+					{busy ? 'Saving…' : 'Save'}
+				</button>
+			</div>
+		</div>
+	);
+}
+
+function ExportButton({ selectedDate }: { selectedDate: string }) {
+	const [date, setDate] = useState(selectedDate);
+
+	// Keep the export date in sync with the calendar's selected date so the
+	// CSV button reflects what the user is currently viewing.
+	useEffect(() => {
+		setDate(selectedDate);
+	}, [selectedDate]);
+
+	async function download() {
+		try {
+			const blob = await api.getBlob(`/api/parade/export?date=${date}`);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `parade-state_${date}.csv`;
+			a.click();
+			URL.revokeObjectURL(url);
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	return (
+		<div className="card" style={{ marginTop: 12 }}>
+			<h4 style={{ marginTop: 0 }}>Export CSV (Admin/Superadmin)</h4>
+			<p className="muted" style={{ marginTop: 0 }}>Single-date export — grouped by department.</p>
+			<input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+			<button className="btn" onClick={download}>📥 Download {date}</button>
 		</div>
 	);
 }
@@ -237,127 +431,6 @@ function CopyTextModal({ text, onClose }: { text: string; onClose: () => void })
 				/>
 				<button className="btn" onClick={onClose}>Done</button>
 			</div>
-		</div>
-	);
-}
-
-function SubmitModal({
-	initialDate,
-	onClose,
-	onDone,
-}: {
-	initialDate: Date;
-	onClose: () => void;
-	onDone: () => Promise<void>;
-}) {
-	const [mode, setMode] = useState<'single' | 'range'>('single');
-	const [single, setSingle] = useState<Date | undefined>(initialDate);
-	const [range, setRange] = useState<DateRange | undefined>({ from: initialDate, to: initialDate });
-	const [periods, setPeriods] = useState<('AM' | 'PM')[]>(['AM', 'PM']);
-	const [status, setStatus] = useState<Status>('Present');
-	const [reason, setReason] = useState('');
-	const [busy, setBusy] = useState(false);
-
-	const startdate = mode === 'single' ? (single ? ymdKey(single) : '') : range?.from ? ymdKey(range.from) : '';
-	const enddate = mode === 'single'
-		? (single ? ymdKey(single) : '')
-		: range?.to ? ymdKey(range.to) : (range?.from ? ymdKey(range.from) : '');
-	const reasonRequired = status === 'Others';
-	const canSave = !!startdate && !!enddate && periods.length > 0 && (!reasonRequired || reason.trim().length > 0);
-
-	function togglePeriod(p: 'AM' | 'PM') {
-		setPeriods((prev) => (prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]));
-	}
-
-	async function submit() {
-		if (!canSave) return;
-		setBusy(true);
-		try {
-			await api.post('/api/parade/submit', { startdate, enddate, status, reason: reason.trim() || null, periods });
-			await onDone();
-			onClose();
-			WebApp.showAlert('Saved.');
-		} catch (e) {
-			setBusy(false);
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
-		}
-	}
-
-	return (
-		<div className="modal-backdrop" onClick={onClose}>
-			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3>Submit Parade Status</h3>
-
-				<div className="seg" style={{ marginBottom: 10 }}>
-					<button className={mode === 'single' ? 'active' : ''} onClick={() => setMode('single')}>Single day</button>
-					<button className={mode === 'range' ? 'active' : ''} onClick={() => setMode('range')}>Range</button>
-				</div>
-
-				{mode === 'single' ? (
-					<DayPicker mode="single" selected={single} onSelect={setSingle} />
-				) : (
-					<DayPicker mode="range" selected={range} onSelect={setRange} />
-				)}
-
-				<div style={{ marginTop: 6, marginBottom: 12 }} className="muted">
-					{startdate ? (startdate === enddate ? startdate : `${startdate} → ${enddate}`) : 'Pick a date'}
-				</div>
-
-				<label>
-					Period
-					<div className="seg">
-						<button className={periods.includes('AM') ? 'active' : ''} onClick={() => togglePeriod('AM')}>AM</button>
-						<button className={periods.includes('PM') ? 'active' : ''} onClick={() => togglePeriod('PM')}>PM</button>
-					</div>
-				</label>
-
-				<label>Status
-					<select value={status} onChange={(e) => setStatus(e.target.value as Status)}>
-						{STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
-					</select>
-				</label>
-
-				<label>
-					Reason {reasonRequired && <span className="danger">*required for Others</span>}
-					<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder={reasonRequired ? 'Specify…' : '(optional)'} />
-				</label>
-
-				<button className="btn" disabled={busy || !canSave} onClick={submit}>
-					{busy ? 'Saving…' : 'Save'}
-				</button>
-			</div>
-		</div>
-	);
-}
-
-function ExportButton() {
-	const today = new Date();
-	const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-	const [from, setFrom] = useState(ymdKey(firstOfMonth));
-	const [to, setTo] = useState(ymdKey(today));
-
-	async function download() {
-		try {
-			const blob = await api.getBlob(`/api/parade/export?from=${from}&to=${to}`);
-			const url = URL.createObjectURL(blob);
-			const a = document.createElement('a');
-			a.href = url;
-			a.download = `parade-state_${from}_to_${to}.csv`;
-			a.click();
-			URL.revokeObjectURL(url);
-		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
-		}
-	}
-
-	return (
-		<div className="card" style={{ marginTop: 12 }}>
-			<h4 style={{ marginTop: 0 }}>Export CSV (Superadmin)</h4>
-			<div style={{ display: 'flex', gap: 8 }}>
-				<input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-				<input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-			</div>
-			<button className="btn" onClick={download}>📥 Download</button>
 		</div>
 	);
 }

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
-import { api, apiDelete, type Me } from '../lib/api';
+import { api, apiDelete, DEPARTMENTS, type Department, type Me } from '../lib/api';
 
 interface AdminUser {
 	id: number;
@@ -9,6 +9,8 @@ interface AdminUser {
 	user_role: 'user' | 'admin' | 'superadmin';
 	superior_telegram_id: string | null;
 	ord_date: string | null;
+	department: Department | null;
+	off_credits: number;
 	created_at: string;
 }
 
@@ -46,7 +48,7 @@ export function AdminTab({ me }: { me: Me }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Users section
+// Users section — grouped by department
 // ─────────────────────────────────────────────────────────────────────────
 function UsersSection({ me }: { me: Me }) {
 	const [users, setUsers] = useState<AdminUser[]>([]);
@@ -61,10 +63,27 @@ function UsersSection({ me }: { me: Me }) {
 
 	const pending = users.filter((u) => u.full_name.startsWith('PENDING:'));
 	const active = users.filter((u) => !u.full_name.startsWith('PENDING:'));
-	const today = new Date().toISOString().slice(0, 10);
-	const ordingSoon = active.filter((u) => u.ord_date && u.ord_date >= today)
+	const today = (() => {
+		const d = new Date();
+		return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+	})();
+	const ordingSoon = active
+		.filter((u) => u.ord_date && u.ord_date >= today)
 		.sort((a, b) => (a.ord_date! < b.ord_date! ? -1 : 1))
 		.slice(0, 10);
+
+	const byDept = useMemo(() => {
+		const m = new Map<string, AdminUser[]>();
+		for (const u of active) {
+			const key = u.department ?? 'Unassigned';
+			const arr = m.get(key) ?? [];
+			arr.push(u);
+			m.set(key, arr);
+		}
+		return m;
+	}, [active]);
+	// Stable department order: DHQ, DMSP, DCS, DSP, Others, Unassigned
+	const deptOrder = [...DEPARTMENTS, 'Unassigned' as const];
 
 	return (
 		<div>
@@ -93,12 +112,23 @@ function UsersSection({ me }: { me: Me }) {
 			)}
 
 			<h3 style={{ marginTop: 24 }}>Active ({active.length})</h3>
-			{active.map((u) => (
-				<div key={u.id} className="row" onClick={() => setEditing(u)}>
-					<span>{u.full_name}</span>
-					<span className="muted">{u.user_role}</span>
-				</div>
-			))}
+			{deptOrder.map((d) => {
+				const list = byDept.get(d);
+				if (!list || list.length === 0) return null;
+				return (
+					<div key={d} style={{ marginTop: 12 }}>
+						<h4 className="section-title">{d} ({list.length})</h4>
+						{list.map((u) => (
+							<div key={u.id} className="row" onClick={() => setEditing(u)}>
+								<span>{u.full_name}</span>
+								<span className="muted">
+									{u.user_role} · 🪙 {u.off_credits}
+								</span>
+							</div>
+						))}
+					</div>
+				);
+			})}
 
 			{editing && (
 				<EditUserModal
@@ -106,7 +136,6 @@ function UsersSection({ me }: { me: Me }) {
 					me={me}
 					onClose={() => setEditing(null)}
 					onSaved={(updated) => {
-						// Update local state immediately so screen reflects new value.
 						setUsers((prev) => prev.map((u) => (u.id === updated.id ? updated : u)));
 						setEditing(null);
 					}}
@@ -138,6 +167,7 @@ function EditUserModal({
 	const [role, setRole] = useState<AdminUser['user_role']>(user.user_role);
 	const [supTid, setSupTid] = useState(user.superior_telegram_id ?? '');
 	const [ordDate, setOrdDate] = useState(user.ord_date ?? '');
+	const [department, setDepartment] = useState<string>(user.department ?? '');
 	const [busy, setBusy] = useState(false);
 
 	const canGrantSuperadmin = me.user_role === 'superadmin';
@@ -151,6 +181,7 @@ function EditUserModal({
 				user_role: role,
 				superior_telegram_id: supTid || null,
 				ord_date: ordDate || null,
+				department: department || null,
 			});
 			onSaved(res.user);
 			WebApp.showAlert('Saved.');
@@ -180,8 +211,14 @@ function EditUserModal({
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Edit user</h3>
-				<div className="muted">Telegram ID: {user.telegram_id}</div>
+				<div className="muted">Telegram ID: {user.telegram_id} · 🪙 {user.off_credits} off credits</div>
 				<label>Full name<input value={name} onChange={(e) => setName(e.target.value)} /></label>
+				<label>Department
+					<select value={department} onChange={(e) => setDepartment(e.target.value)}>
+						<option value="">— unassigned —</option>
+						{DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
+					</select>
+				</label>
 				<label>Role
 					<select value={role} onChange={(e) => setRole(e.target.value as AdminUser['user_role'])}>
 						<option value="user">user</option>
@@ -273,11 +310,10 @@ function AddOverrideModal({ onClose, onDone }: { onClose: () => void; onDone: ()
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
-	// Default to "force working" if the picked date is a weekend; else "force non-working"
 	useEffect(() => {
 		if (!date) return;
 		const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
-		setIsWorking(dow === 0 || dow === 6); // weekend → default to "force working"
+		setIsWorking(dow === 0 || dow === 6);
 	}, [date]);
 
 	async function save() {
@@ -320,11 +356,12 @@ function AddOverrideModal({ onClose, onDone }: { onClose: () => void; onDone: ()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Public holidays
+// Public holidays — fetches from nager.date, confirm/reject inline
 // ─────────────────────────────────────────────────────────────────────────
 function HolidaysSection({ me }: { me: Me }) {
 	const [holidays, setHolidays] = useState<Holiday[]>([]);
 	const [busy, setBusy] = useState(false);
+	const [lastReport, setLastReport] = useState<string | null>(null);
 
 	function refresh() {
 		return api.get<Holiday[]>('/api/admin/holidays').then(setHolidays);
@@ -335,37 +372,75 @@ function HolidaysSection({ me }: { me: Me }) {
 
 	async function forceRefresh() {
 		setBusy(true);
+		setLastReport(null);
 		try {
-			const res = await api.post<{ ok: boolean; deltas: number }>('/api/admin/refresh-holidays');
+			const res = await api.post<{
+				ok: boolean;
+				fetched: number;
+				deltas: number;
+				bootstrap: boolean;
+				cached_total: number;
+			}>('/api/admin/refresh-holidays');
 			await refresh();
-			WebApp.showAlert(`Refreshed. ${res.deltas} change(s) detected — confirm via DM.`);
+			let msg: string;
+			if (res.fetched === 0) {
+				msg = `⚠ Fetched 0 records from nager.date — the cache is unchanged (${res.cached_total} total). Check the worker logs.`;
+			} else if (res.bootstrap) {
+				msg = `✅ Bootstrap complete: cached ${res.fetched} holidays (auto-confirmed since this is the first fetch). Total in cache: ${res.cached_total}.`;
+			} else if (res.deltas === 0) {
+				msg = `✅ Already up to date — ${res.cached_total} confirmed holidays cached, no changes from nager.date.`;
+			} else {
+				msg = `✅ Refreshed. ${res.deltas} change(s) detected — check your Telegram DM to confirm.`;
+			}
+			setLastReport(msg);
+			WebApp.showAlert(msg);
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			const msg = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+			setLastReport(msg);
+			WebApp.showAlert(msg);
 		} finally {
 			setBusy(false);
 		}
 	}
 
+	async function confirmOne(date: string, action: 'confirm' | 'reject') {
+		try {
+			await api.post('/api/admin/holidays/confirm', { date, action });
+			await refresh();
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
 	return (
 		<div>
-			<p className="muted">Cached SG public holidays. Auto-refresh runs daily at 08:00 SGT; deltas are DM'd to all superadmins for confirm.</p>
+			<p className="muted">SG public holidays sourced from <b>nager.date</b>. Auto-refresh runs daily at 12:00 SGT; new/changed entries are DM'd to all superadmins for confirm.</p>
 			{me.user_role === 'superadmin' && (
 				<button className="btn" disabled={busy} onClick={forceRefresh}>
 					{busy ? 'Refreshing…' : '🔄 Force refresh now'}
 				</button>
 			)}
+			{lastReport && <div className="muted" style={{ marginTop: 8 }}>{lastReport}</div>}
 
 			{holidays.length === 0 ? (
-				<p className="muted" style={{ marginTop: 12 }}>No holidays cached yet.</p>
+				<p className="muted" style={{ marginTop: 12 }}>No holidays cached yet. Tap "Force refresh" above.</p>
 			) : (
 				<table style={{ marginTop: 12 }}>
-					<thead><tr><th>Date</th><th>Name</th><th>Confirmed</th></tr></thead>
+					<thead><tr><th>Date</th><th>Name</th><th>Status</th>{me.user_role === 'superadmin' && <th></th>}</tr></thead>
 					<tbody>
 						{holidays.map((h) => (
 							<tr key={h.holiday_date}>
 								<td>{h.holiday_date}</td>
 								<td>{h.name}</td>
-								<td>{h.confirmed === 1 ? '✅' : '⏳'}</td>
+								<td>{h.confirmed === 1 ? '✅' : '⏳ pending'}</td>
+								{me.user_role === 'superadmin' && h.confirmed !== 1 && (
+									<td>
+										<button className="btn-link" onClick={() => confirmOne(h.holiday_date, 'confirm')}>Confirm</button>
+										{' · '}
+										<button className="btn-link danger" onClick={() => confirmOne(h.holiday_date, 'reject')}>Reject</button>
+									</td>
+								)}
+								{me.user_role === 'superadmin' && h.confirmed === 1 && <td></td>}
 							</tr>
 						))}
 					</tbody>

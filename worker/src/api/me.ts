@@ -8,6 +8,9 @@ export async function handleMe({ user }: AuthedContext): Promise<Response> {
 		full_name: isPending ? user.full_name.slice('PENDING:'.length) : user.full_name,
 		user_role: user.user_role,
 		superior_telegram_id: user.superior_telegram_id,
+		ord_date: user.ord_date,
+		department: user.department,
+		off_credits: user.off_credits,
 		pending: isPending,
 	});
 }

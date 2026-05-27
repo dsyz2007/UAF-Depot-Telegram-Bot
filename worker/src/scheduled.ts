@@ -140,22 +140,39 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 				 WHERE u.full_name NOT LIKE 'PENDING:%'
 				   AND NOT EXISTS (
 				     SELECT 1 FROM parade_state_entries p
-				     WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = ?
+				     WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = 'AM'
 				   )`,
 			)
-			.bind(targetDate, period)
+			.bind(targetDate)
 			.all<UserRow>();
 		rows = (results ?? []).map((u) => ({ user: u, hasEntry: false }));
+	} else if (kind === 'morning_am') {
+		// 5:30am: general reminder. Reassure if EITHER AM or PM (or both) is filled.
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
+				        (SELECT COUNT(*) FROM parade_state_entries p
+				          WHERE p.user_id = u.id AND p.parade_state_date = ?) AS filled_periods
+				 FROM users u
+				 WHERE u.full_name NOT LIKE 'PENDING:%'`,
+			)
+			.bind(targetDate)
+			.all<UserRow & { filled_periods: number }>();
+		rows = (results ?? []).map((u) => ({
+			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
+			hasEntry: u.filled_periods > 0,
+		}));
 	} else {
+		// noon_pm: reassure if PM specifically is filled.
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
 				        (SELECT 1 FROM parade_state_entries p
-				          WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = ?) AS has_entry
+				          WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = 'PM') AS has_entry
 				 FROM users u
 				 WHERE u.full_name NOT LIKE 'PENDING:%'`,
 			)
-			.bind(targetDate, period)
+			.bind(targetDate)
 			.all<UserRow & { has_entry: number | null }>();
 		rows = (results ?? []).map((u) => ({
 			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
@@ -180,12 +197,12 @@ function nudgeText(kind: NudgeKind, targetDate: string, hasEntry: boolean): stri
 			return `📋 Please submit tomorrow's AM parade state (${targetDate}). You can edit anytime before 7am.`;
 		case 'morning_am':
 			return hasEntry
-				? `☀ Today's (${targetDate}) AM parade state is already submitted — no action needed unless there are changes.`
-				: `☀ Please submit today's (${targetDate}) AM parade state.`;
+				? `☀ Reminder: please check today's (${targetDate}) parade state in case anything's changed. If already submitted and nothing's new, you can ignore this.`
+				: `☀ Reminder: please update today's (${targetDate}) parade state. Update both AM and PM as needed.`;
 		case 'noon_pm':
 			return hasEntry
-				? `🕛 Today's (${targetDate}) PM parade state is already submitted — no action needed unless there are changes.`
-				: `🕛 Please submit today's (${targetDate}) PM parade state.`;
+				? `🕛 Reminder: please check today's (${targetDate}) PM parade state in case anything's changed. If PM is already submitted and nothing's new, you can ignore this.`
+				: `🕛 Reminder: please update today's (${targetDate}) PM parade state.`;
 	}
 }
 

@@ -53,12 +53,18 @@ export const api = {
 	},
 };
 
+export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'DSP' | 'Others';
+export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others'];
+
 export interface Me {
 	id: number;
 	telegram_id: string;
 	full_name: string;
 	user_role: 'user' | 'admin' | 'superadmin';
 	superior_telegram_id: string | null;
+	ord_date: string | null;
+	department: Department | null;
+	off_credits: number;
 	pending: boolean;
 }
 

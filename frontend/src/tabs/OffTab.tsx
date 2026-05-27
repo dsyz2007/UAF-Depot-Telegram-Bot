@@ -6,6 +6,8 @@ interface SummaryRow {
 	id: number;
 	full_name: string;
 	off_count: number;
+	off_credits: number;
+	department: string | null;
 }
 interface DetailRow {
 	id: number;
@@ -23,6 +25,18 @@ interface MyOffRow extends DetailRow {
 interface StaffRow {
 	id: number;
 	full_name: string;
+	off_credits: number;
+	department: string | null;
+}
+interface GrantRow {
+	id: number;
+	user_id: number;
+	num_days: number;
+	reason: string;
+	status: string;
+	granted_by_name: string | null;
+	created_at: string;
+	approved_at: string | null;
 }
 
 function isAdminish(role: Me['user_role']) {
@@ -33,11 +47,19 @@ function fmtDates(r: { startdate: string; enddate: string }) {
 	return r.startdate === r.enddate ? r.startdate : `${r.startdate} → ${r.enddate}`;
 }
 
+function dayCount(start: string, end: string): number {
+	const a = new Date(`${start}T00:00:00Z`).getTime();
+	const b = new Date(`${end}T00:00:00Z`).getTime();
+	return Math.floor((b - a) / 86_400_000) + 1;
+}
+
 export function OffTab({ me }: { me: Me }) {
 	const [summary, setSummary] = useState<SummaryRow[]>([]);
 	const [detailUser, setDetailUser] = useState<SummaryRow | null>(null);
 	const [details, setDetails] = useState<DetailRow[]>([]);
 	const [mine, setMine] = useState<MyOffRow[]>([]);
+	const [grants, setGrants] = useState<GrantRow[]>([]);
+	const [credits, setCredits] = useState<number>(me.off_credits);
 	const [showRequest, setShowRequest] = useState(false);
 	const [showGive, setShowGive] = useState(false);
 
@@ -47,10 +69,17 @@ export function OffTab({ me }: { me: Me }) {
 	function loadMine() {
 		return api.get<MyOffRow[]>('/api/off/mine').then(setMine);
 	}
+	function loadGrants() {
+		return api.get<GrantRow[]>('/api/off/grants/mine').then(setGrants);
+	}
+	function loadMyCredits() {
+		return api.get<Me>('/api/me').then((m) => setCredits(m.off_credits));
+	}
 
 	useEffect(() => {
 		loadSummary().catch(console.error);
 		loadMine().catch(console.error);
+		loadGrants().catch(console.error);
 	}, []);
 
 	useEffect(() => {
@@ -59,7 +88,7 @@ export function OffTab({ me }: { me: Me }) {
 	}, [detailUser]);
 
 	async function refreshAll() {
-		await Promise.all([loadSummary(), loadMine()]);
+		await Promise.all([loadSummary(), loadMine(), loadGrants(), loadMyCredits()]);
 		if (detailUser) {
 			const fresh = await api.get<DetailRow[]>(`/api/off/user?id=${detailUser.id}`);
 			setDetails(fresh);
@@ -79,13 +108,13 @@ export function OffTab({ me }: { me: Me }) {
 	}
 	async function revertApproval(id: number) {
 		const ok = await new Promise<boolean>((resolve) =>
-			WebApp.showConfirm('Revert this approval? The user and original approver will be notified.', resolve),
+			WebApp.showConfirm('Revert this approval? Credits will be refunded.', resolve),
 		);
 		if (!ok) return;
 		try {
 			await api.post('/api/off/revert', { id });
 			await refreshAll();
-			WebApp.showAlert('Approval reverted.');
+			WebApp.showAlert('Approval reverted, credits refunded.');
 		} catch (e) {
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -98,6 +127,7 @@ export function OffTab({ me }: { me: Me }) {
 				<button className="btn btn-secondary" onClick={() => setDetailUser(null)}>← Back</button>
 				<h3 style={{ marginTop: 12 }}>
 					{detailUser.full_name} — {detailUser.off_count} approved off{detailUser.off_count === 1 ? '' : 's'}
+					<span className="muted" style={{ fontSize: 13, marginLeft: 8 }}>🪙 {detailUser.off_credits}</span>
 				</h3>
 				{details.length === 0 ? (
 					<p className="muted">No approved offs yet.</p>
@@ -138,14 +168,38 @@ export function OffTab({ me }: { me: Me }) {
 	}
 
 	// ----- Summary view ----------------------------------------------------
+	const pendingGrants = grants.filter((g) => g.status === 'pending_superior');
+
 	return (
 		<div>
-			<div className="actions">
+			<div className="card" style={{ background: 'var(--depot-success)', color: '#fff' }}>
+				<div className="card-row">
+					<span>🪙 <b>{credits}</b> off credit{credits === 1 ? '' : 's'}</span>
+					<span style={{ fontSize: 12, opacity: 0.85 }}>Used when superior approves an off</span>
+				</div>
+			</div>
+
+			<div className="actions" style={{ marginTop: 10 }}>
 				<button className="btn" onClick={() => setShowRequest(true)}>+ Request Off</button>
 				{isAdminish(me.user_role) && (
-					<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Give Off (Admins Only)</button>
+					<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Give Off Credits</button>
 				)}
 			</div>
+
+			{pendingGrants.length > 0 && (
+				<>
+					<h4 className="section-title">Pending credit grants ({pendingGrants.length})</h4>
+					{pendingGrants.map((g) => (
+						<div key={g.id} className="card">
+							<div className="card-row">
+								<span><b>+{g.num_days} credit{g.num_days === 1 ? '' : 's'}</b> from {g.granted_by_name ?? '?'}</span>
+								<span className="badge status-pending_superior">pending</span>
+							</div>
+							<div className="muted">{g.reason}</div>
+						</div>
+					))}
+				</>
+			)}
 
 			{mine.length > 0 && (
 				<>
@@ -153,7 +207,10 @@ export function OffTab({ me }: { me: Me }) {
 					{mine.map((m) => (
 						<div key={m.id} className="card">
 							<div className="card-row">
-								<span><b>{fmtDates(m)}</b> · {m.off_status}</span>
+								<span>
+									<b>{fmtDates(m)}</b> · {m.off_status}
+									{' · '}<span className="muted">{dayCount(m.startdate, m.enddate)} day(s)</span>
+								</span>
 								{m.off_status === 'pending' && (
 									<button className="btn-link danger" onClick={() => cancelMine(m.id)}>🗑 Cancel</button>
 								)}
@@ -167,26 +224,48 @@ export function OffTab({ me }: { me: Me }) {
 			<h4 className="section-title">Everyone</h4>
 			{summary.map((row) => (
 				<div key={row.id} className="row" onClick={() => setDetailUser(row)}>
-					<span>{row.full_name}</span>
-					<span className="badge">{row.off_count}</span>
+					<span>
+						{row.full_name}
+						{row.department && <span className="muted" style={{ marginLeft: 6 }}>· {row.department}</span>}
+					</span>
+					<span className="muted" style={{ fontSize: 13 }}>
+						🪙 {row.off_credits} · taken {row.off_count}
+					</span>
 				</div>
 			))}
 
 			{showRequest && (
-				<RequestOffModal onClose={() => setShowRequest(false)} onDone={refreshAll} />
+				<RequestOffModal balance={credits} onClose={() => setShowRequest(false)} onDone={refreshAll} />
 			)}
 			{showGive && (
-				<GiveOffModal onClose={() => setShowGive(false)} onDone={refreshAll} />
+				<GiveCreditModal onClose={() => setShowGive(false)} onDone={refreshAll} />
 			)}
 		</div>
 	);
 }
 
-function RequestOffModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+function RequestOffModal({
+	balance,
+	onClose,
+	onDone,
+}: {
+	balance: number;
+	onClose: () => void;
+	onDone: () => Promise<void>;
+}) {
 	const [startdate, setStart] = useState('');
 	const [enddate, setEnd] = useState('');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
+
+	const days = startdate && enddate && startdate <= enddate ? dayCount(startdate, enddate) : 0;
+	const datesValid = !!startdate && !!enddate && startdate <= enddate;
+	const sufficient = days > 0 && days <= balance;
+	let hint: string | null = null;
+	if (!startdate || !enddate) hint = 'Pick start and end dates.';
+	else if (startdate > enddate) hint = 'End date must be on or after start date.';
+	else if (!sufficient) hint = `Need ${days} credit(s) but only have ${balance}. Ask an admin to grant you more credits first.`;
+	else if (!reason.trim()) hint = 'Reason is required.';
 
 	async function submit() {
 		setBusy(true);
@@ -194,7 +273,7 @@ function RequestOffModal({ onClose, onDone }: { onClose: () => void; onDone: () 
 			await api.post('/api/off/request', { startdate, enddate, reason });
 			await onDone();
 			onClose();
-			WebApp.showAlert('Submitted — awaiting approval.');
+			WebApp.showAlert(`Submitted — awaiting approval (${days} credit${days === 1 ? '' : 's'} will be deducted on approval).`);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -205,10 +284,16 @@ function RequestOffModal({ onClose, onDone }: { onClose: () => void; onDone: () 
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Request Off</h3>
+				<div className="muted">Balance: 🪙 {balance} · This request: {days} day{days === 1 ? '' : 's'}</div>
 				<label>Start date<input type="date" value={startdate} onChange={(e) => setStart(e.target.value)} /></label>
 				<label>End date<input type="date" value={enddate} onChange={(e) => setEnd(e.target.value)} /></label>
 				<label>Reason<textarea value={reason} onChange={(e) => setReason(e.target.value)} /></label>
-				<button className="btn" disabled={busy || !startdate || !enddate || !reason.trim()} onClick={submit}>
+				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
+				<button
+					className="btn"
+					disabled={busy || !datesValid || !sufficient || !reason.trim()}
+					onClick={submit}
+				>
 					{busy ? 'Submitting…' : 'Submit'}
 				</button>
 			</div>
@@ -216,11 +301,10 @@ function RequestOffModal({ onClose, onDone }: { onClose: () => void; onDone: () 
 	);
 }
 
-function GiveOffModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+function GiveCreditModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
 	const [staff, setStaff] = useState<StaffRow[]>([]);
 	const [staffId, setStaffId] = useState<number | ''>('');
-	const [startdate, setStart] = useState('');
-	const [enddate, setEnd] = useState('');
+	const [numDays, setNumDays] = useState<number | ''>('');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
@@ -228,34 +312,61 @@ function GiveOffModal({ onClose, onDone }: { onClose: () => void; onDone: () => 
 		api.get<StaffRow[]>('/api/off/staff').then(setStaff);
 	}, []);
 
+	const selected = staff.find((s) => s.id === staffId);
+
 	async function submit() {
 		setBusy(true);
 		try {
-			await api.post('/api/off/add-approved', { staff_id: staffId, startdate, enddate, reason });
+			await api.post('/api/off/grant', {
+				staff_id: staffId,
+				num_days: Number(numDays),
+				reason,
+			});
 			await onDone();
 			onClose();
-			WebApp.showAlert('Added.');
+			WebApp.showAlert(`Submitted — grant of ${numDays} day(s) is pending superior approval.`);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
+	const ok = !!staffId && typeof numDays === 'number' && numDays > 0 && reason.trim().length > 0;
+
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3>Give Off (Admins Only)</h3>
+				<h3>Give Off Credits (Admins only)</h3>
+				<p className="muted">Grant a number of off days to a staff member. Requires the staff's superior to approve before the credits are added.</p>
 				<label>Staff
 					<select value={staffId} onChange={(e) => setStaffId(Number(e.target.value))}>
 						<option value="">— select —</option>
-						{staff.map((s) => <option key={s.id} value={s.id}>{s.full_name}</option>)}
+						{staff.map((s) => (
+							<option key={s.id} value={s.id}>
+								{s.full_name}{s.department ? ` (${s.department})` : ''} — 🪙 {s.off_credits}
+							</option>
+						))}
 					</select>
 				</label>
-				<label>Start date<input type="date" value={startdate} onChange={(e) => setStart(e.target.value)} /></label>
-				<label>End date<input type="date" value={enddate} onChange={(e) => setEnd(e.target.value)} /></label>
-				<label>Reason<textarea value={reason} onChange={(e) => setReason(e.target.value)} /></label>
-				<button className="btn" disabled={busy || !staffId || !startdate || !enddate || !reason.trim()} onClick={submit}>
-					{busy ? 'Adding…' : 'Add'}
+				{selected && (
+					<div className="muted" style={{ marginBottom: 8 }}>
+						{selected.full_name} currently has 🪙 {selected.off_credits} credit{selected.off_credits === 1 ? '' : 's'}.
+					</div>
+				)}
+				<label>Number of off days
+					<input
+						type="number"
+						min={1}
+						value={numDays}
+						onChange={(e) => setNumDays(e.target.value === '' ? '' : Number(e.target.value))}
+						placeholder="e.g. 3"
+					/>
+				</label>
+				<label>Reason
+					<textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Off in lieu for weekend duty" />
+				</label>
+				<button className="btn" disabled={busy || !ok} onClick={submit}>
+					{busy ? 'Submitting…' : 'Submit for superior approval'}
 				</button>
 			</div>
 		</div>

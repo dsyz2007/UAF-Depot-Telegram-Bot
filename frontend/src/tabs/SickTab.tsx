@@ -18,6 +18,7 @@ interface OpenCase {
 
 export function SickTab(_: { me: Me }) {
 	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
+	const [loadError, setLoadError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [mcDays, setMcDays] = useState<number | ''>('');
 	const [startDate, setStartDate] = useState('');
@@ -25,10 +26,18 @@ export function SickTab(_: { me: Me }) {
 	const [medicine, setMedicine] = useState('');
 
 	function refresh() {
-		return api.get<OpenCase | null>('/api/sick/my-open').then(setOpen);
+		setLoadError(null);
+		return api
+			.get<OpenCase | null>('/api/sick/my-open')
+			.then(setOpen)
+			.catch((e: unknown) => {
+				const msg = e instanceof Error ? e.message : String(e);
+				setLoadError(msg);
+				setOpen(null);
+			});
 	}
 	useEffect(() => {
-		refresh().catch(console.error);
+		refresh();
 	}, []);
 
 	async function report(case_type: 'RSI' | 'RSO') {
@@ -90,6 +99,23 @@ export function SickTab(_: { me: Me }) {
 		} finally {
 			setBusy(false);
 		}
+	}
+
+	if (loadError) {
+		return (
+			<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
+				<h3>⚠ Couldn't load sick page</h3>
+				<p className="muted">{loadError}</p>
+				<p className="muted">
+					This usually means migration 002 wasn't fully applied yet. Run:
+				</p>
+				<pre style={{ background: 'var(--tg-theme-secondary-bg-color, #eee)', padding: 10, borderRadius: 8, fontSize: 12, overflow: 'auto' }}>
+{`npx wrangler d1 execute depot_db --remote \\
+  --file worker/src/db/migrations/002_round2.sql`}
+				</pre>
+				<button className="btn" onClick={() => refresh()}>Retry</button>
+			</div>
+		);
 	}
 
 	if (open === undefined) return <div className="muted">Loading…</div>;

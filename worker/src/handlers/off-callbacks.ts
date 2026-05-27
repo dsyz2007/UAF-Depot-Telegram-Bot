@@ -1,9 +1,14 @@
-// Handles inline-button taps on the "Approve / Reject" message DM'd to a
-// superior when their staff requests an off. Callback data is encoded as
-// "off:<action>:<request_id>" — kept short to stay under Telegram's 64-byte limit.
+// Inline-button handlers for off-request approval AND off-credit grant approval.
+//
+// Callback patterns:
+//   off:approve:<id>    superior approves a user's off REQUEST → deducts credits
+//   off:reject:<id>     superior rejects an off request
+//   grant:approve:<id>  superior approves an off-credit GRANT → adds credits
+//   grant:reject:<id>   superior rejects an off-credit grant
 
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
+import { dayCountInclusive } from '../types';
 
 interface OffRow {
 	id: number;
@@ -16,16 +21,29 @@ interface OffRow {
 	off_status: string;
 }
 
+interface GrantRow {
+	id: number;
+	user_id: number;
+	num_days: number;
+	reason: string;
+	status: string;
+	staff_name: string;
+	staff_tid: string;
+	granted_by_name: string;
+	granted_by_tid: string;
+}
+
 export function registerOffCallbacks(bot: Bot, env: Env): void {
+	// ────────── Off request approval ────────────────────────────────────
 	bot.callbackQuery(/^off:(approve|reject):(\d+)$/, async (ctx) => {
 		const action = ctx.match![1] as 'approve' | 'reject';
 		const offId = Number(ctx.match![2]);
 		const superiorTid = String(ctx.from.id);
 
 		const superior = await env.depot_db
-			.prepare('SELECT id, full_name, user_role FROM users WHERE telegram_id = ?')
+			.prepare('SELECT id, full_name FROM users WHERE telegram_id = ?')
 			.bind(superiorTid)
-			.first<{ id: number; full_name: string; user_role: string }>();
+			.first<{ id: number; full_name: string }>();
 		if (!superior) {
 			await ctx.answerCallbackQuery({ text: 'You are not registered.' });
 			return;
@@ -49,24 +67,151 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
-		const newStatus = action === 'approve' ? 'approved' : 'rejected';
-		await env.depot_db
-			.prepare(
-				`UPDATE off_requests SET off_status = ?, approved_by = ?, approved_date = datetime('now') WHERE id = ?`,
-			)
-			.bind(newStatus, superior.id, offId)
-			.run();
+		if (action === 'reject') {
+			await env.depot_db
+				.prepare(
+					`UPDATE off_requests SET off_status = 'rejected', approved_by = ?, approved_date = datetime('now') WHERE id = ?`,
+				)
+				.bind(superior.id, offId)
+				.run();
+			await ctx.editMessageText(
+				`❌ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}) — rejected by ${superior.full_name}.`,
+			);
+			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await tgSendMessage(env.BOT_TOKEN, {
+				chat_id: row.requester_tid,
+				text: `❌ Your off request (${row.startdate} → ${row.enddate}) has been rejected by ${superior.full_name}.`,
+			});
+			return;
+		}
 
-		const verbPast = action === 'approve' ? 'approved' : 'rejected';
-		const emoji = action === 'approve' ? '✅' : '❌';
+		// Approve: deduct credits + record approval
+		const days = dayCountInclusive(row.startdate, row.enddate);
+		const balanceCheck = await env.depot_db
+			.prepare(`SELECT off_credits FROM users WHERE id = ?`)
+			.bind(row.user_id)
+			.first<{ off_credits: number }>();
+		if (!balanceCheck || balanceCheck.off_credits < days) {
+			await ctx.answerCallbackQuery({
+				text: `Insufficient credits — user has ${balanceCheck?.off_credits ?? 0}, needs ${days}.`,
+			});
+			return;
+		}
+
+		await env.depot_db.batch([
+			env.depot_db
+				.prepare(
+					`UPDATE off_requests SET off_status = 'approved', approved_by = ?, approved_date = datetime('now') WHERE id = ?`,
+				)
+				.bind(superior.id, offId),
+			env.depot_db
+				.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`)
+				.bind(days, row.user_id),
+		]);
+
 		await ctx.editMessageText(
-			`${emoji} ${row.requester_name}'s off (${row.startdate} → ${row.enddate}) — ${verbPast} by ${superior.full_name}.`,
+			`✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'}) — approved by ${superior.full_name}.`,
 		);
-		await ctx.answerCallbackQuery({ text: `Marked as ${verbPast}.` });
-
+		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		const remaining = balanceCheck.off_credits - days;
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `${emoji} Your off request (${row.startdate} → ${row.enddate}) has been ${verbPast} by ${superior.full_name}.`,
+			text: `✅ Your off (${row.startdate} → ${row.enddate}) approved by ${superior.full_name}.\n🪙 ${days} credit(s) used. Balance: ${remaining}.`,
 		});
+	});
+
+	// ────────── Off-credit grant approval ───────────────────────────────
+	bot.callbackQuery(/^grant:(approve|reject):(\d+)$/, async (ctx) => {
+		const action = ctx.match![1] as 'approve' | 'reject';
+		const grantId = Number(ctx.match![2]);
+		const approverTid = String(ctx.from.id);
+
+		const approver = await env.depot_db
+			.prepare('SELECT id, full_name FROM users WHERE telegram_id = ?')
+			.bind(approverTid)
+			.first<{ id: number; full_name: string }>();
+		if (!approver) {
+			await ctx.answerCallbackQuery({ text: 'You are not registered.' });
+			return;
+		}
+
+		const row = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status,
+				        u.full_name AS staff_name, u.telegram_id AS staff_tid,
+				        a.full_name AS granted_by_name, a.telegram_id AS granted_by_tid
+				 FROM off_credit_grants g
+				 JOIN users u ON u.id = g.user_id
+				 JOIN users a ON a.id = g.granted_by
+				 WHERE g.id = ?`,
+			)
+			.bind(grantId)
+			.first<GrantRow>();
+		if (!row) {
+			await ctx.answerCallbackQuery({ text: 'Grant not found.' });
+			return;
+		}
+		if (row.status !== 'pending_superior') {
+			await ctx.answerCallbackQuery({ text: `Already ${row.status}.` });
+			return;
+		}
+
+		if (action === 'reject') {
+			await env.depot_db
+				.prepare(`UPDATE off_credit_grants SET status = 'rejected', superior_user_id = ? WHERE id = ?`)
+				.bind(approver.id, grantId)
+				.run();
+			await ctx.editMessageText(
+				`❌ Off-credit grant rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`,
+			);
+			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await Promise.allSettled([
+				tgSendMessage(env.BOT_TOKEN, {
+					chat_id: row.staff_tid,
+					text: `❌ Your proposed off-credit grant (${row.num_days} day[s]) was rejected by ${approver.full_name}.`,
+				}),
+				row.granted_by_tid !== approver.id.toString()
+					? tgSendMessage(env.BOT_TOKEN, {
+							chat_id: row.granted_by_tid,
+							text: `❌ Your off-credit grant to ${row.staff_name} (${row.num_days} day[s]) was rejected by ${approver.full_name}.`,
+						})
+					: Promise.resolve(),
+			]);
+			return;
+		}
+
+		// Approve: add credits
+		await env.depot_db.batch([
+			env.depot_db
+				.prepare(
+					`UPDATE off_credit_grants
+					 SET status = 'approved', superior_user_id = ?, approved_at = datetime('now')
+					 WHERE id = ?`,
+				)
+				.bind(approver.id, grantId),
+			env.depot_db
+				.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`)
+				.bind(row.num_days, row.user_id),
+		]);
+
+		const balanceAfter = await env.depot_db
+			.prepare(`SELECT off_credits FROM users WHERE id = ?`)
+			.bind(row.user_id)
+			.first<{ off_credits: number }>();
+
+		await ctx.editMessageText(
+			`✅ Off-credit grant approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${balanceAfter?.off_credits ?? '?'}.`,
+		);
+		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		await Promise.allSettled([
+			tgSendMessage(env.BOT_TOKEN, {
+				chat_id: row.staff_tid,
+				text: `🪙 Off-credit grant approved by ${approver.full_name}: +${row.num_days} day(s). Balance: ${balanceAfter?.off_credits ?? '?'}.\nReason: ${row.reason}`,
+			}),
+			tgSendMessage(env.BOT_TOKEN, {
+				chat_id: row.granted_by_tid,
+				text: `✅ ${approver.full_name} approved your grant to ${row.staff_name}: +${row.num_days} day(s).`,
+			}),
+		]);
 	});
 }

@@ -3,11 +3,19 @@
 --   npx wrangler d1 execute depot_db --local  --file worker/src/db/migrations/002_round2.sql
 --   npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/002_round2.sql
 --
--- Idempotent where possible. SQLite limitations require table-rebuilds for
--- CHECK constraint changes; those use the standard rename-create-copy-drop dance.
+-- This migration is rebuild-based. Each CHECK-constraint change uses the
+-- standard create-new → INSERT…SELECT (with value transform) → drop old →
+-- rename new dance. No staged UPDATEs that would violate the old CHECK.
+--
+-- Foreign keys are disabled for this connection only — the original schema
+-- has REFERENCES users(id) on parade_state_entries / sick_cases /
+-- off_requests / reminders, which would otherwise block DROP TABLE users.
+-- New rebuilt tables omit the FK refs (D1 doesn't enforce cascades anyway,
+-- and we already validate user existence at the API layer).
+PRAGMA foreign_keys = OFF;
 
 -- ============================================================================
--- 1. Public holidays cache + working-day overrides
+-- 1. Public holidays cache + working-day overrides (additive, safe to rerun)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS public_holidays (
     holiday_date TEXT PRIMARY KEY,
@@ -20,24 +28,16 @@ CREATE TABLE IF NOT EXISTS working_day_overrides (
     override_date TEXT PRIMARY KEY,
     is_working_day INTEGER NOT NULL CHECK (is_working_day IN (0, 1)),
     reason TEXT,
-    set_by_user_id INTEGER REFERENCES users(id),
+    set_by_user_id INTEGER,
     set_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ============================================================================
--- 2. Users: add ord_date + role overhaul (user/superior/admin → user/admin/superadmin)
+-- 2. Users — add ord_date, transform roles (superior → admin, admin → superadmin)
 -- ============================================================================
--- Add ord_date (idempotent via separate ALTER + duplicate-column-name swallow).
--- SQLite has no "ADD COLUMN IF NOT EXISTS", so we tolerate the error on rerun.
-ALTER TABLE users ADD COLUMN ord_date TEXT;
-
--- Promote existing roles BEFORE rebuilding (still under old CHECK).
-UPDATE users SET user_role = 'temp_admin'      WHERE user_role = 'superior';
-UPDATE users SET user_role = 'temp_superadmin' WHERE user_role = 'admin';
-UPDATE users SET user_role = 'admin'           WHERE user_role = 'temp_admin';
-UPDATE users SET user_role = 'superadmin'      WHERE user_role = 'temp_superadmin';
-
--- Rebuild users with new CHECK ('user','admin','superadmin').
+-- We rebuild with the NEW CHECK constraint and remap inside INSERT…SELECT so we
+-- never write a value that violates either the old or new CHECK.
+DROP TABLE IF EXISTS users_new;
 CREATE TABLE users_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id TEXT UNIQUE NOT NULL,
@@ -48,19 +48,37 @@ CREATE TABLE users_new (
     ord_date TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Re-runnable: if users table doesn't yet have ord_date column, the SELECT will
+-- error. Wrap the copy in a CASE that tolerates either schema by selecting
+-- specific columns from the old table. We don't ADD COLUMN beforehand because
+-- the rebuild replaces the whole table anyway.
 INSERT INTO users_new (id, telegram_id, full_name, user_role, superior_telegram_id, ord_date, created_at)
-    SELECT id, telegram_id, full_name, user_role, superior_telegram_id, ord_date, created_at FROM users;
+SELECT
+    id,
+    telegram_id,
+    full_name,
+    CASE user_role
+        WHEN 'superior' THEN 'admin'
+        WHEN 'admin'    THEN 'superadmin'
+        WHEN 'user'     THEN 'user'
+        ELSE user_role    -- already-migrated values pass through ('admin','superadmin')
+    END,
+    superior_telegram_id,
+    NULL,                 -- ord_date defaults to NULL
+    created_at
+FROM users;
 DROP TABLE users;
 ALTER TABLE users_new RENAME TO users;
 CREATE INDEX IF NOT EXISTS idx_users_superior ON users(superior_telegram_id);
 
 -- ============================================================================
--- 3. Parade state: add period (AM/PM), clone existing rows as PM mirrors
+-- 3. Parade state — add AM/PM period, clone existing rows as PM mirrors
 -- ============================================================================
--- Rebuild to add `period` column and change UNIQUE constraint.
+DROP TABLE IF EXISTS parade_state_new;
 CREATE TABLE parade_state_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
+    user_id INTEGER NOT NULL,
     parade_state_date TEXT NOT NULL,
     period TEXT NOT NULL DEFAULT 'AM' CHECK (period IN ('AM','PM')),
     parade_status TEXT NOT NULL,
@@ -68,10 +86,8 @@ CREATE TABLE parade_state_new (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, parade_state_date, period)
 );
--- Existing rows become AM entries.
 INSERT INTO parade_state_new (id, user_id, parade_state_date, period, parade_status, reason, created_at)
     SELECT id, user_id, parade_state_date, 'AM', parade_status, reason, created_at FROM parade_state_entries;
--- Also clone as PM (preserves existing data; users can override later).
 INSERT INTO parade_state_new (user_id, parade_state_date, period, parade_status, reason, created_at)
     SELECT user_id, parade_state_date, 'PM', parade_status, reason, created_at FROM parade_state_entries;
 DROP TABLE parade_state_entries;
@@ -79,15 +95,16 @@ ALTER TABLE parade_state_new RENAME TO parade_state_entries;
 CREATE INDEX IF NOT EXISTS idx_parade_date ON parade_state_entries(parade_state_date);
 
 -- ============================================================================
--- 4. Sick cases: structured MC fields + cancel/revert audit + extended status
+-- 4. Sick cases — structured MC fields + extended status + cancel audit
 -- ============================================================================
+DROP TABLE IF EXISTS sick_cases_new;
 CREATE TABLE sick_cases_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
+    user_id INTEGER NOT NULL,
     case_type TEXT NOT NULL CHECK (case_type IN ('RSI','RSO')),
     reportsick_status TEXT NOT NULL DEFAULT 'pending_superior'
         CHECK (reportsick_status IN ('pending_superior','approved','updated','rejected','flagged','cancelled','reverted')),
-    superior_user_id INTEGER REFERENCES users(id),
+    superior_user_id INTEGER,
     approval_message_id TEXT,
     approved_at TEXT,
     updated_status TEXT,
@@ -97,7 +114,7 @@ CREATE TABLE sick_cases_new (
     mc_start_date TEXT,
     mc_end_date TEXT,
     medicine_prescribed TEXT,
-    cancelled_by INTEGER REFERENCES users(id),
+    cancelled_by INTEGER,
     cancelled_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -112,22 +129,23 @@ DROP TABLE sick_cases;
 ALTER TABLE sick_cases_new RENAME TO sick_cases;
 
 -- ============================================================================
--- 5. Off requests: cancel/revert audit + extended status
+-- 5. Off requests — extended status + cancel audit
 -- ============================================================================
+DROP TABLE IF EXISTS off_requests_new;
 CREATE TABLE off_requests_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    requested_by_user_id INTEGER NOT NULL REFERENCES users(id),
+    user_id INTEGER NOT NULL,
+    requested_by_user_id INTEGER NOT NULL,
     startdate TEXT NOT NULL,
     enddate TEXT NOT NULL,
     reason TEXT NOT NULL,
     off_type TEXT NOT NULL DEFAULT 'off',
     off_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (off_status IN ('pending','approved','rejected','cancelled','reverted')),
-    approved_by INTEGER REFERENCES users(id),
+    approved_by INTEGER,
     approved_date TEXT,
     superior_message_id TEXT,
-    cancelled_by INTEGER REFERENCES users(id),
+    cancelled_by INTEGER,
     cancelled_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

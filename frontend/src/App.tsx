@@ -4,9 +4,10 @@ import { OffTab } from './tabs/OffTab';
 import { SickTab } from './tabs/SickTab';
 import { ParadeTab } from './tabs/ParadeTab';
 import { AdminTab } from './tabs/AdminTab';
+import { TodayTab } from './tabs/TodayTab';
 import './app.css';
 
-type TabKey = 'off' | 'sick' | 'parade' | 'admin';
+type TabKey = 'today' | 'off' | 'sick' | 'parade' | 'admin';
 
 export default function App() {
 	const [me, setMe] = useState<Me | null>(null);
@@ -34,6 +35,7 @@ export default function App() {
 
 	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
+		{ key: 'today', label: '📊 Today', show: isAdminish },
 		{ key: 'off', label: '📅 Off', show: true },
 		{ key: 'sick', label: '🤒 Sick', show: true },
 		{ key: 'parade', label: '🪖 Parade', show: true },
@@ -48,6 +50,7 @@ export default function App() {
 			</header>
 
 			<main className="content">
+				{tab === 'today' && isAdminish && <TodayTab me={me} />}
 				{tab === 'off' && <OffTab me={me} />}
 				{tab === 'sick' && <SickTab me={me} />}
 				{tab === 'parade' && <ParadeTab me={me} />}
