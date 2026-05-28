@@ -1,7 +1,7 @@
 # depot-bot
 
-Telegram bot + Telegram WebApp for a Singaporean UAF depot (~90 users on weekdays).
-Built on Cloudflare Workers + D1 + React. Free tier the whole way.
+Telegram bot + Telegram WebApp for UAF depot (~100 daily users).
+Built on Cloudflare Workers + D1 + React. Completely Free tier for all.
 
 Three core features today:
 
