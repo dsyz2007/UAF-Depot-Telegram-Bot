@@ -393,6 +393,7 @@ Always apply in numeric order on both local and remote.
 | `003_off_credits_and_department.sql` | `users.department`, `users.off_credits`, `off_credit_grants` table |
 | `004_personnel_type_subdept_status_remap.sql` | `users.personnel_type`, `users.sub_department`, remap legacy parade statuses (`Off → OFF`, `Leave → LL`, `Overseas Leave → OL`, `Attached-Out → AO`) |
 | `005_rename_dsp_to_stg.sql` | Rename `users.department` value `DSP → STG` (the section was always called STG in the report; the dept enum now matches) |
+| `006_indexes.sql` | Add missing read-path indexes: `idx_sick_user_status`, `idx_sick_status`, `idx_off_status_enddate`, `idx_reminders_related`, partial `idx_users_ord_date`. Pure CREATE INDEX IF NOT EXISTS — safe to re-run. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.
