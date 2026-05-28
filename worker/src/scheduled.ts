@@ -148,13 +148,17 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 		rows = (results ?? []).map((u) => ({ user: u, hasEntry: false }));
 	} else if (kind === 'morning_am') {
 		// 5:30am: general reminder. Reassure if EITHER AM or PM (or both) is filled.
+		// Single LEFT JOIN + GROUP BY instead of a correlated COUNT subquery —
+		// uses the UNIQUE(user_id, parade_state_date, period) index for the join.
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
-				        (SELECT COUNT(*) FROM parade_state_entries p
-				          WHERE p.user_id = u.id AND p.parade_state_date = ?) AS filled_periods
+				        COUNT(p.id) AS filled_periods
 				 FROM users u
-				 WHERE u.full_name NOT LIKE 'PENDING:%'`,
+				 LEFT JOIN parade_state_entries p
+				   ON p.user_id = u.id AND p.parade_state_date = ?
+				 WHERE u.full_name NOT LIKE 'PENDING:%'
+				 GROUP BY u.id`,
 			)
 			.bind(targetDate)
 			.all<UserRow & { filled_periods: number }>();

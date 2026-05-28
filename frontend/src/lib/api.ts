@@ -53,8 +53,14 @@ export const api = {
 	},
 };
 
-export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'DSP' | 'Others';
-export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others'];
+export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'STG' | 'Others';
+export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'STG', 'Others'];
+
+export type StgSubDepartment = 'C1+C2' | 'C3+C4';
+export const STG_SUB_DEPARTMENTS: readonly StgSubDepartment[] = ['C1+C2', 'C3+C4'];
+
+export type PersonnelType = 'NSF' | 'NSF Officer' | 'Regular';
+export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'NSF Officer', 'Regular'];
 
 export interface Me {
 	id: number;
@@ -64,8 +70,42 @@ export interface Me {
 	superior_telegram_id: string | null;
 	ord_date: string | null;
 	department: Department | null;
+	sub_department: StgSubDepartment | null;
+	personnel_type: PersonnelType | null;
 	off_credits: number;
 	pending: boolean;
+}
+
+// Telegram's WebApp.showConfirm is flaky — on some clients the callback never
+// fires, which makes `await new Promise(r => WebApp.showConfirm(msg, r))` hang
+// forever. This wrapper races showConfirm against a short timeout; if showConfirm
+// hasn't responded by then we fall back to window.confirm (always synchronous).
+export function confirmDialog(message: string): Promise<boolean> {
+	const tg = (window as unknown as {
+		Telegram?: { WebApp?: { showConfirm?: (m: string, cb: (ok: boolean) => void) => void } };
+	}).Telegram?.WebApp;
+	if (!tg || typeof tg.showConfirm !== 'function') {
+		return Promise.resolve(window.confirm(message));
+	}
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		const finish = (ok: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(ok);
+		};
+		try {
+			tg.showConfirm!(message, (ok) => finish(!!ok));
+		} catch {
+			finish(window.confirm(message));
+			return;
+		}
+		// If showConfirm never invokes the callback (broken on this client),
+		// fall back after a short grace period so the calling action isn't stuck.
+		setTimeout(() => {
+			if (!settled) finish(window.confirm(message));
+		}, 2000);
+	});
 }
 
 // Generic DELETE helper for the admin overrides endpoint.

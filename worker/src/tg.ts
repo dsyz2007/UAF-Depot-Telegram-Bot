@@ -43,3 +43,28 @@ export async function tgAnswerCallback(botToken: string, callbackQueryId: string
 		body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
 	});
 }
+
+// Send a file (e.g. CSV export) to a chat. Telegram's in-app WebView blocks
+// browser blob downloads, so the reliable way to deliver a file is to push it
+// into the user's chat with the bot via sendDocument (multipart upload).
+export async function tgSendDocument(
+	botToken: string,
+	chatId: number | string,
+	filename: string,
+	content: string,
+	caption?: string,
+): Promise<boolean> {
+	const form = new FormData();
+	form.append('chat_id', String(chatId));
+	if (caption) form.append('caption', caption);
+	form.append('document', new Blob([content], { type: 'text/csv' }), filename);
+	const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+		method: 'POST',
+		body: form,
+	});
+	if (!res.ok) {
+		console.error('tgSendDocument failed', res.status, await res.text());
+		return false;
+	}
+	return true;
+}

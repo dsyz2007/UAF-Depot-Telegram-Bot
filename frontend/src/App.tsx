@@ -12,7 +12,7 @@ type TabKey = 'today' | 'off' | 'sick' | 'parade' | 'admin';
 export default function App() {
 	const [me, setMe] = useState<Me | null>(null);
 	const [error, setError] = useState<string | null>(null);
-	const [tab, setTab] = useState<TabKey>('off');
+	const [tab, setTab] = useState<TabKey>('parade');
 
 	useEffect(() => {
 		api
@@ -35,10 +35,10 @@ export default function App() {
 
 	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
-		{ key: 'today', label: '📊 Today', show: isAdminish },
+		{ key: 'parade', label: '🪖 Parade', show: true },
 		{ key: 'off', label: '📅 Off', show: true },
 		{ key: 'sick', label: '🤒 Sick', show: true },
-		{ key: 'parade', label: '🪖 Parade', show: true },
+		{ key: 'today', label: '📊 Today', show: isAdminish },
 		{ key: 'admin', label: '⚙ Admin', show: isAdminish },
 	];
 

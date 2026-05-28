@@ -156,26 +156,28 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
+		// Recipients to notify, deduped — avoids double messages when the
+		// recipient is also the granter and/or the approver (common in tests
+		// and in self-credit flows). `approverTid` is declared above.
+		const notify = (chatId: string, text: string, exclude: Set<string>) => {
+			if (exclude.has(chatId)) return Promise.resolve();
+			exclude.add(chatId);
+			return tgSendMessage(env.BOT_TOKEN, { chat_id: chatId, text });
+		};
+
 		if (action === 'reject') {
 			await env.depot_db
 				.prepare(`UPDATE off_credit_grants SET status = 'rejected', superior_user_id = ? WHERE id = ?`)
 				.bind(approver.id, grantId)
 				.run();
 			await ctx.editMessageText(
-				`❌ Off-credit grant rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`,
+				`❌ Off-credit request rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`,
 			);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			const sent = new Set<string>([approverTid]); // approver already sees the edited msg
 			await Promise.allSettled([
-				tgSendMessage(env.BOT_TOKEN, {
-					chat_id: row.staff_tid,
-					text: `❌ Your proposed off-credit grant (${row.num_days} day[s]) was rejected by ${approver.full_name}.`,
-				}),
-				row.granted_by_tid !== approver.id.toString()
-					? tgSendMessage(env.BOT_TOKEN, {
-							chat_id: row.granted_by_tid,
-							text: `❌ Your off-credit grant to ${row.staff_name} (${row.num_days} day[s]) was rejected by ${approver.full_name}.`,
-						})
-					: Promise.resolve(),
+				notify(row.staff_tid, `❌ Your off-credit request (${row.num_days} day[s]) was rejected by ${approver.full_name}.`, sent),
+				notify(row.granted_by_tid, `❌ Your off-credit request for ${row.staff_name} (${row.num_days} day[s]) was rejected by ${approver.full_name}.`, sent),
 			]);
 			return;
 		}
@@ -200,18 +202,21 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			.first<{ off_credits: number }>();
 
 		await ctx.editMessageText(
-			`✅ Off-credit grant approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${balanceAfter?.off_credits ?? '?'}.`,
+			`✅ Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${balanceAfter?.off_credits ?? '?'}.`,
 		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		const sent = new Set<string>([approverTid]); // approver already sees the edited msg
 		await Promise.allSettled([
-			tgSendMessage(env.BOT_TOKEN, {
-				chat_id: row.staff_tid,
-				text: `🪙 Off-credit grant approved by ${approver.full_name}: +${row.num_days} day(s). Balance: ${balanceAfter?.off_credits ?? '?'}.\nReason: ${row.reason}`,
-			}),
-			tgSendMessage(env.BOT_TOKEN, {
-				chat_id: row.granted_by_tid,
-				text: `✅ ${approver.full_name} approved your grant to ${row.staff_name}: +${row.num_days} day(s).`,
-			}),
+			notify(
+				row.staff_tid,
+				`🪙 Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s). Balance: ${balanceAfter?.off_credits ?? '?'}.\nReason: ${row.reason}`,
+				sent,
+			),
+			notify(
+				row.granted_by_tid,
+				`✅ ${approver.full_name} approved the off-credit for ${row.staff_name}: +${row.num_days} day(s).`,
+				sent,
+			),
 		]);
 	});
 }

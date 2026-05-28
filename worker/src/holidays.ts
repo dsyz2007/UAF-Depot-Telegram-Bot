@@ -117,12 +117,15 @@ export async function refreshHolidays(env: Env): Promise<RefreshReport> {
 	}
 
 	// Detect bootstrap: do we already have ANY rows in this year/next-year window?
+	// Range filter on the PK column instead of substr() — uses the index.
+	const yearStart = `${todayYear}-01-01`;
+	const yearAfterNext = `${todayYear + 2}-01-01`;
 	const { results: existingRows } = await env.depot_db
 		.prepare(
 			`SELECT holiday_date, name, confirmed FROM public_holidays
-			 WHERE substr(holiday_date, 1, 4) IN (?, ?)`,
+			 WHERE holiday_date >= ? AND holiday_date < ?`,
 		)
-		.bind(String(todayYear), String(todayYear + 1))
+		.bind(yearStart, yearAfterNext)
 		.all<{ holiday_date: string; name: string; confirmed: number }>();
 	const existing = new Map((existingRows ?? []).map((r) => [r.holiday_date, r]));
 	const isBootstrap = existing.size === 0;

@@ -1,6 +1,13 @@
 import { json, type AuthedContext } from './router';
 import { refreshHolidays, sgtToday, sgtDateAddDays } from '../holidays';
-import { DEPARTMENTS, type Department } from '../types';
+import {
+	DEPARTMENTS,
+	STG_SUB_DEPARTMENTS,
+	PERSONNEL_TYPES,
+	type Department,
+	type StgSubDepartment,
+	type PersonnelType,
+} from '../types';
 
 function isAdminish(role: string): boolean {
 	return role === 'admin' || role === 'superadmin';
@@ -13,6 +20,12 @@ function isValidDate(s: unknown): s is string {
 function isValidDepartment(s: unknown): s is Department {
 	return typeof s === 'string' && (DEPARTMENTS as readonly string[]).includes(s);
 }
+function isValidSubDepartment(s: unknown): s is StgSubDepartment {
+	return typeof s === 'string' && (STG_SUB_DEPARTMENTS as readonly string[]).includes(s);
+}
+function isValidPersonnelType(s: unknown): s is PersonnelType {
+	return typeof s === 'string' && (PERSONNEL_TYPES as readonly string[]).includes(s);
+}
 
 export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
@@ -24,7 +37,7 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, ord_date,
-				        department, off_credits, created_at
+				        department, sub_department, personnel_type, off_credits, created_at
 				 FROM users ORDER BY full_name LIKE 'PENDING:%' DESC, full_name`,
 			)
 			.all();
@@ -39,6 +52,8 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 			superior_telegram_id?: string | null;
 			ord_date?: string | null;
 			department?: string | null;
+			sub_department?: string | null;
+			personnel_type?: string | null;
 		};
 		if (!Number.isInteger(body.id) || !body.full_name?.trim()) {
 			return json({ error: 'invalid_body' }, { status: 400 });
@@ -57,10 +72,18 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 		const dept = body.department?.trim();
 		const departmentValue = dept && isValidDepartment(dept) ? dept : null;
 
+		// Sub-department only applies when department is STG; ignored otherwise.
+		const subRaw = body.sub_department?.trim();
+		const subDepartmentValue =
+			departmentValue === 'STG' && subRaw && isValidSubDepartment(subRaw) ? subRaw : null;
+
+		const ptRaw = body.personnel_type?.trim();
+		const personnelTypeValue = ptRaw && isValidPersonnelType(ptRaw) ? ptRaw : null;
+
 		await env.depot_db
 			.prepare(
 				`UPDATE users SET full_name = ?, user_role = ?, superior_telegram_id = ?,
-				   ord_date = ?, department = ? WHERE id = ?`,
+				   ord_date = ?, department = ?, sub_department = ?, personnel_type = ? WHERE id = ?`,
 			)
 			.bind(
 				body.full_name.trim(),
@@ -68,13 +91,15 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 				body.superior_telegram_id?.trim() || null,
 				ordDate,
 				departmentValue,
+				subDepartmentValue,
+				personnelTypeValue,
 				body.id,
 			)
 			.run();
 		const updated = await env.depot_db
 			.prepare(
 				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, ord_date,
-				        department, off_credits, created_at
+				        department, sub_department, personnel_type, off_credits, created_at
 				 FROM users WHERE id = ?`,
 			)
 			.bind(body.id)
@@ -111,6 +136,34 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 			.bind(sgtDateAddDays(sgtToday(), -30))
 			.all();
 		return json(results ?? []);
+	}
+
+	// Manually add a holiday (in case the nager.date fetch is unavailable or
+	// MOM declares an ad-hoc holiday). Stored as confirmed=1 immediately.
+	if (request.method === 'POST' && sub === '/holidays/add') {
+		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
+		const body = (await request.json()) as { date?: string; name?: string };
+		if (!isValidDate(body.date) || !body.name?.trim()) {
+			return json({ error: 'invalid_body' }, { status: 400 });
+		}
+		await env.depot_db
+			.prepare(
+				`INSERT INTO public_holidays (holiday_date, name, confirmed) VALUES (?, ?, 1)
+				 ON CONFLICT(holiday_date) DO UPDATE SET name = excluded.name, confirmed = 1,
+				   refreshed_at = datetime('now')`,
+			)
+			.bind(body.date, body.name.trim())
+			.run();
+		return json({ ok: true });
+	}
+
+	// Delete a confirmed holiday from the Holidays UI.
+	if (request.method === 'POST' && sub === '/holidays/delete') {
+		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
+		const body = (await request.json()) as { date?: string };
+		if (!isValidDate(body.date)) return json({ error: 'invalid_body' }, { status: 400 });
+		await env.depot_db.prepare(`DELETE FROM public_holidays WHERE holiday_date = ?`).bind(body.date).run();
+		return json({ ok: true });
 	}
 
 	// Confirm/reject a single pending holiday from the Holidays UI.

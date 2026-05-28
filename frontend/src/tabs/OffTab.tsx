@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
-import { api, type Me } from '../lib/api';
+import { api, confirmDialog, type Me } from '../lib/api';
 
 interface SummaryRow {
 	id: number;
@@ -96,7 +96,7 @@ export function OffTab({ me }: { me: Me }) {
 	}
 
 	async function cancelMine(id: number) {
-		const ok = await new Promise<boolean>((resolve) => WebApp.showConfirm('Cancel this off request?', resolve));
+		const ok = await confirmDialog('Cancel this off request?');
 		if (!ok) return;
 		try {
 			await api.post('/api/off/cancel', { id });
@@ -107,9 +107,7 @@ export function OffTab({ me }: { me: Me }) {
 		}
 	}
 	async function revertApproval(id: number) {
-		const ok = await new Promise<boolean>((resolve) =>
-			WebApp.showConfirm('Revert this approval? Credits will be refunded.', resolve),
-		);
+		const ok = await confirmDialog('Revert this approval? Credits will be refunded.');
 		if (!ok) return;
 		try {
 			await api.post('/api/off/revert', { id });
@@ -181,9 +179,7 @@ export function OffTab({ me }: { me: Me }) {
 
 			<div className="actions" style={{ marginTop: 10 }}>
 				<button className="btn" onClick={() => setShowRequest(true)}>+ Request Off</button>
-				{isAdminish(me.user_role) && (
-					<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Give Off Credits</button>
-				)}
+				<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Credit Off(s)</button>
 			</div>
 
 			{pendingGrants.length > 0 && (
@@ -238,7 +234,7 @@ export function OffTab({ me }: { me: Me }) {
 				<RequestOffModal balance={credits} onClose={() => setShowRequest(false)} onDone={refreshAll} />
 			)}
 			{showGive && (
-				<GiveCreditModal onClose={() => setShowGive(false)} onDone={refreshAll} />
+				<CreditOffModal me={me} onClose={() => setShowGive(false)} onDone={refreshAll} />
 			)}
 		</div>
 	);
@@ -301,57 +297,66 @@ function RequestOffModal({
 	);
 }
 
-function GiveCreditModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; onDone: () => Promise<void> }) {
+	const canCreditOthers = isAdminish(me.user_role);
 	const [staff, setStaff] = useState<StaffRow[]>([]);
+	// '' means self for normal users; admins pick from the dropdown.
 	const [staffId, setStaffId] = useState<number | ''>('');
 	const [numDays, setNumDays] = useState<number | ''>('');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
 	useEffect(() => {
-		api.get<StaffRow[]>('/api/off/staff').then(setStaff);
-	}, []);
+		if (canCreditOthers) api.get<StaffRow[]>('/api/off/staff').then(setStaff);
+	}, [canCreditOthers]);
 
+	const selfSelected = !canCreditOthers || staffId === '' || staffId === me.id;
 	const selected = staff.find((s) => s.id === staffId);
 
 	async function submit() {
 		setBusy(true);
 		try {
-			await api.post('/api/off/grant', {
-				staff_id: staffId,
-				num_days: Number(numDays),
-				reason,
-			});
+			// Omit staff_id to default to self on the server.
+			const payload: Record<string, unknown> = { num_days: Number(numDays), reason };
+			if (canCreditOthers && staffId !== '') payload.staff_id = staffId;
+			await api.post('/api/off/grant', payload);
 			await onDone();
 			onClose();
-			WebApp.showAlert(`Submitted — grant of ${numDays} day(s) is pending superior approval.`);
+			WebApp.showAlert(`Submitted — ${numDays} off credit(s) pending superior approval.`);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
-	const ok = !!staffId && typeof numDays === 'number' && numDays > 0 && reason.trim().length > 0;
+	const ok = typeof numDays === 'number' && numDays > 0 && reason.trim().length > 0;
 
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3>Give Off Credits (Admins only)</h3>
-				<p className="muted">Grant a number of off days to a staff member. Requires the staff's superior to approve before the credits are added.</p>
-				<label>Staff
-					<select value={staffId} onChange={(e) => setStaffId(Number(e.target.value))}>
-						<option value="">— select —</option>
-						{staff.map((s) => (
-							<option key={s.id} value={s.id}>
-								{s.full_name}{s.department ? ` (${s.department})` : ''} — 🪙 {s.off_credits}
-							</option>
-						))}
-					</select>
-				</label>
-				{selected && (
-					<div className="muted" style={{ marginBottom: 8 }}>
-						{selected.full_name} currently has 🪙 {selected.off_credits} credit{selected.off_credits === 1 ? '' : 's'}.
-					</div>
+				<h3>Credit Off(s)</h3>
+				<p className="muted">
+					Request a number of off days to be credited to your balance. Your superior must approve before the credits are added.
+					{canCreditOthers && ' As an admin, you can also credit your staff.'}
+				</p>
+				{canCreditOthers && (
+					<>
+						<label>Recipient
+							<select value={staffId} onChange={(e) => setStaffId(e.target.value === '' ? '' : Number(e.target.value))}>
+								<option value="">Myself ({me.full_name})</option>
+								{staff.map((s) => (
+									<option key={s.id} value={s.id}>
+										{s.full_name}{s.department ? ` (${s.department})` : ''} — 🪙 {s.off_credits}
+									</option>
+								))}
+							</select>
+						</label>
+						{!selfSelected && selected && (
+							<div className="muted" style={{ marginBottom: 8 }}>
+								{selected.full_name} currently has 🪙 {selected.off_credits} credit{selected.off_credits === 1 ? '' : 's'}.
+							</div>
+						)}
+					</>
 				)}
 				<label>Number of off days
 					<input

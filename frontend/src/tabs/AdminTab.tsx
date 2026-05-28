@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
-import { api, apiDelete, DEPARTMENTS, type Department, type Me } from '../lib/api';
+import {
+	api,
+	apiDelete,
+	confirmDialog,
+	DEPARTMENTS,
+	STG_SUB_DEPARTMENTS,
+	PERSONNEL_TYPES,
+	type Department,
+	type StgSubDepartment,
+	type Me,
+	type PersonnelType,
+} from '../lib/api';
 
 interface AdminUser {
 	id: number;
@@ -10,6 +21,8 @@ interface AdminUser {
 	superior_telegram_id: string | null;
 	ord_date: string | null;
 	department: Department | null;
+	sub_department: StgSubDepartment | null;
+	personnel_type: PersonnelType | null;
 	off_credits: number;
 	created_at: string;
 }
@@ -75,15 +88,27 @@ function UsersSection({ me }: { me: Me }) {
 	const byDept = useMemo(() => {
 		const m = new Map<string, AdminUser[]>();
 		for (const u of active) {
-			const key = u.department ?? 'Unassigned';
+			let key: string;
+			if (u.department === 'STG' && u.sub_department) key = `STG — ${u.sub_department}`;
+			else key = u.department ?? 'Unassigned';
 			const arr = m.get(key) ?? [];
 			arr.push(u);
 			m.set(key, arr);
 		}
 		return m;
 	}, [active]);
-	// Stable department order: DHQ, DMSP, DCS, DSP, Others, Unassigned
-	const deptOrder = [...DEPARTMENTS, 'Unassigned' as const];
+	// Stable grouping order: DHQ, DMSP, DCS, STG (C1+C2), STG (C3+C4), STG (no sub),
+	// then Others, then Unassigned.
+	const deptOrder: string[] = [
+		'DHQ',
+		'DMSP',
+		'DCS',
+		'STG — C1+C2',
+		'STG — C3+C4',
+		'STG',
+		'Others',
+		'Unassigned',
+	];
 
 	return (
 		<div>
@@ -99,18 +124,6 @@ function UsersSection({ me }: { me: Me }) {
 				</>
 			)}
 
-			{ordingSoon.length > 0 && (
-				<>
-					<h3 style={{ marginTop: 24 }}>Upcoming ORD</h3>
-					{ordingSoon.map((u) => (
-						<div key={u.id} className="row" onClick={() => setEditing(u)}>
-							<span>{u.full_name}</span>
-							<span className="muted">{u.ord_date}</span>
-						</div>
-					))}
-				</>
-			)}
-
 			<h3 style={{ marginTop: 24 }}>Active ({active.length})</h3>
 			{deptOrder.map((d) => {
 				const list = byDept.get(d);
@@ -120,7 +133,25 @@ function UsersSection({ me }: { me: Me }) {
 						<h4 className="section-title">{d} ({list.length})</h4>
 						{list.map((u) => (
 							<div key={u.id} className="row" onClick={() => setEditing(u)}>
-								<span>{u.full_name}</span>
+								<span>
+									{u.full_name}
+									{u.personnel_type && (
+										<span
+											className="badge"
+											style={{
+												marginLeft: 6,
+												background:
+													u.personnel_type === 'NSF'
+														? '#2e7d32'
+														: u.personnel_type === 'NSF Officer'
+															? '#b8860b'
+															: '#5e35b1',
+											}}
+										>
+											{u.personnel_type}
+										</span>
+									)}
+								</span>
 								<span className="muted">
 									{u.user_role} · 🪙 {u.off_credits}
 								</span>
@@ -129,6 +160,18 @@ function UsersSection({ me }: { me: Me }) {
 					</div>
 				);
 			})}
+
+			{ordingSoon.length > 0 && (
+				<>
+					<h3 style={{ marginTop: 28 }}>Upcoming ORD</h3>
+					{ordingSoon.map((u) => (
+						<div key={u.id} className="row" onClick={() => setEditing(u)}>
+							<span>{u.full_name}</span>
+							<span className="muted">{u.ord_date}</span>
+						</div>
+					))}
+				</>
+			)}
 
 			{editing && (
 				<EditUserModal
@@ -168,9 +211,17 @@ function EditUserModal({
 	const [supTid, setSupTid] = useState(user.superior_telegram_id ?? '');
 	const [ordDate, setOrdDate] = useState(user.ord_date ?? '');
 	const [department, setDepartment] = useState<string>(user.department ?? '');
+	const [subDepartment, setSubDepartment] = useState<string>(user.sub_department ?? '');
+	const [personnelType, setPersonnelType] = useState<string>(user.personnel_type ?? '');
 	const [busy, setBusy] = useState(false);
 
 	const canGrantSuperadmin = me.user_role === 'superadmin';
+
+	function onDepartmentChange(next: string) {
+		setDepartment(next);
+		// Sub-department only meaningful for STG — clear it otherwise.
+		if (next !== 'STG') setSubDepartment('');
+	}
 
 	async function save() {
 		setBusy(true);
@@ -182,6 +233,8 @@ function EditUserModal({
 				superior_telegram_id: supTid || null,
 				ord_date: ordDate || null,
 				department: department || null,
+				sub_department: department === 'STG' ? subDepartment || null : null,
+				personnel_type: personnelType || null,
 			});
 			onSaved(res.user);
 			WebApp.showAlert('Saved.');
@@ -192,9 +245,7 @@ function EditUserModal({
 	}
 
 	async function del() {
-		const ok = await new Promise<boolean>((resolve) =>
-			WebApp.showConfirm(`Delete ${stripped}? This cannot be undone.`, resolve),
-		);
+		const ok = await confirmDialog(`Delete ${stripped}? This cannot be undone.`);
 		if (!ok) return;
 		setBusy(true);
 		try {
@@ -213,12 +264,26 @@ function EditUserModal({
 				<h3>Edit user</h3>
 				<div className="muted">Telegram ID: {user.telegram_id} · 🪙 {user.off_credits} off credits</div>
 				<label>Full name<input value={name} onChange={(e) => setName(e.target.value)} /></label>
+				<label>Personnel type
+					<select value={personnelType} onChange={(e) => setPersonnelType(e.target.value)}>
+						<option value="">— unspecified —</option>
+						{PERSONNEL_TYPES.map((p) => <option key={p} value={p}>{p}</option>)}
+					</select>
+				</label>
 				<label>Department
-					<select value={department} onChange={(e) => setDepartment(e.target.value)}>
+					<select value={department} onChange={(e) => onDepartmentChange(e.target.value)}>
 						<option value="">— unassigned —</option>
 						{DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
 					</select>
 				</label>
+				{department === 'STG' && (
+					<label>STG sub-department
+						<select value={subDepartment} onChange={(e) => setSubDepartment(e.target.value)}>
+							<option value="">— select —</option>
+							{STG_SUB_DEPARTMENTS.map((s) => <option key={s} value={s}>{s}</option>)}
+						</select>
+					</label>
+				)}
 				<label>Role
 					<select value={role} onChange={(e) => setRole(e.target.value as AdminUser['user_role'])}>
 						<option value="user">user</option>
@@ -260,9 +325,7 @@ function OverridesSection({ me }: { me: Me }) {
 	}, []);
 
 	async function remove(date: string) {
-		const ok = await new Promise<boolean>((resolve) =>
-			WebApp.showConfirm(`Remove override for ${date}?`, resolve),
-		);
+		const ok = await confirmDialog(`Remove override for ${date}?`);
 		if (!ok) return;
 		try {
 			await apiDelete(`/api/admin/overrides?date=${date}`);
@@ -362,6 +425,7 @@ function HolidaysSection({ me }: { me: Me }) {
 	const [holidays, setHolidays] = useState<Holiday[]>([]);
 	const [busy, setBusy] = useState(false);
 	const [lastReport, setLastReport] = useState<string | null>(null);
+	const [showAdd, setShowAdd] = useState(false);
 
 	function refresh() {
 		return api.get<Holiday[]>('/api/admin/holidays').then(setHolidays);
@@ -369,6 +433,17 @@ function HolidaysSection({ me }: { me: Me }) {
 	useEffect(() => {
 		refresh().catch(console.error);
 	}, []);
+
+	async function deleteHoliday(date: string) {
+		const ok = await confirmDialog(`Remove holiday on ${date}?`);
+		if (!ok) return;
+		try {
+			await api.post('/api/admin/holidays/delete', { date });
+			await refresh();
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
 
 	async function forceRefresh() {
 		setBusy(true);
@@ -416,14 +491,17 @@ function HolidaysSection({ me }: { me: Me }) {
 		<div>
 			<p className="muted">SG public holidays sourced from <b>nager.date</b>. Auto-refresh runs daily at 12:00 SGT; new/changed entries are DM'd to all superadmins for confirm.</p>
 			{me.user_role === 'superadmin' && (
-				<button className="btn" disabled={busy} onClick={forceRefresh}>
-					{busy ? 'Refreshing…' : '🔄 Force refresh now'}
-				</button>
+				<div className="actions">
+					<button className="btn" disabled={busy} onClick={forceRefresh}>
+						{busy ? 'Refreshing…' : '🔄 Force refresh'}
+					</button>
+					<button className="btn btn-secondary" onClick={() => setShowAdd(true)}>+ Add holiday</button>
+				</div>
 			)}
 			{lastReport && <div className="muted" style={{ marginTop: 8 }}>{lastReport}</div>}
 
 			{holidays.length === 0 ? (
-				<p className="muted" style={{ marginTop: 12 }}>No holidays cached yet. Tap "Force refresh" above.</p>
+				<p className="muted" style={{ marginTop: 12 }}>No holidays cached yet. Tap "Force refresh" or "Add holiday".</p>
 			) : (
 				<table style={{ marginTop: 12 }}>
 					<thead><tr><th>Date</th><th>Name</th><th>Status</th>{me.user_role === 'superadmin' && <th></th>}</tr></thead>
@@ -433,19 +511,59 @@ function HolidaysSection({ me }: { me: Me }) {
 								<td>{h.holiday_date}</td>
 								<td>{h.name}</td>
 								<td>{h.confirmed === 1 ? '✅' : '⏳ pending'}</td>
-								{me.user_role === 'superadmin' && h.confirmed !== 1 && (
+								{me.user_role === 'superadmin' && (
 									<td>
-										<button className="btn-link" onClick={() => confirmOne(h.holiday_date, 'confirm')}>Confirm</button>
-										{' · '}
-										<button className="btn-link danger" onClick={() => confirmOne(h.holiday_date, 'reject')}>Reject</button>
+										{h.confirmed !== 1 ? (
+											<>
+												<button className="btn-link" onClick={() => confirmOne(h.holiday_date, 'confirm')}>Confirm</button>
+												{' · '}
+												<button className="btn-link danger" onClick={() => confirmOne(h.holiday_date, 'reject')}>Reject</button>
+											</>
+										) : (
+											<button className="btn-link danger" onClick={() => deleteHoliday(h.holiday_date)}>Remove</button>
+										)}
 									</td>
 								)}
-								{me.user_role === 'superadmin' && h.confirmed === 1 && <td></td>}
 							</tr>
 						))}
 					</tbody>
 				</table>
 			)}
+
+			{showAdd && <AddHolidayModal onClose={() => setShowAdd(false)} onDone={refresh} />}
+		</div>
+	);
+}
+
+function AddHolidayModal({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+	const [date, setDate] = useState('');
+	const [name, setName] = useState('');
+	const [busy, setBusy] = useState(false);
+
+	async function save() {
+		setBusy(true);
+		try {
+			await api.post('/api/admin/holidays/add', { date, name });
+			await onDone();
+			onClose();
+			WebApp.showAlert('Holiday added.');
+		} catch (e) {
+			setBusy(false);
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	return (
+		<div className="modal-backdrop" onClick={onClose}>
+			<div className="modal" onClick={(e) => e.stopPropagation()}>
+				<h3>Add public holiday</h3>
+				<p className="muted">Use this if nager.date is unavailable or MOM declares an ad-hoc holiday. Added as confirmed immediately.</p>
+				<label>Date<input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label>
+				<label>Name<input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Polling Day" /></label>
+				<button className="btn" disabled={busy || !date || !name.trim()} onClick={save}>
+					{busy ? 'Saving…' : 'Add'}
+				</button>
+			</div>
 		</div>
 	);
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
-import { api, type Me } from '../lib/api';
+import { api, confirmDialog, type Me } from '../lib/api';
 
 interface OpenCase {
 	id: number;
@@ -55,7 +55,7 @@ export function SickTab(_: { me: Me }) {
 
 	async function cancelPending() {
 		if (!open) return;
-		const ok = await new Promise<boolean>((resolve) => WebApp.showConfirm('Cancel this sick report?', resolve));
+		const ok = await confirmDialog('Cancel this sick report?');
 		if (!ok) return;
 		setBusy(true);
 		try {

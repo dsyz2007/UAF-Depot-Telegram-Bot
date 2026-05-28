@@ -50,13 +50,18 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 
 	// -------- read ---------------------------------------------------------
 	if (request.method === 'GET' && sub === '/summary') {
+		// Single JOIN+GROUP BY instead of an N+1 correlated COUNT subquery —
+		// idx_off_user_status (user_id, off_status) makes the join an indexed
+		// lookup per user.
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id, u.full_name, u.off_credits, u.department,
-				   (SELECT COUNT(*) FROM off_requests o
-				      WHERE o.user_id = u.id AND o.off_status = 'approved') AS off_count
+				        COUNT(o.id) AS off_count
 				 FROM users u
+				 LEFT JOIN off_requests o
+				   ON o.user_id = u.id AND o.off_status = 'approved'
 				 WHERE u.full_name NOT LIKE 'PENDING:%'
+				 GROUP BY u.id
 				 ORDER BY u.full_name`,
 			)
 			.all<SummaryRow>();
@@ -170,26 +175,31 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, id: ins.id, days_requested: days, balance_after_approval: user.off_credits - days });
 	}
 
-	// -------- grant credits (admin → user, needs superior approval) -------
+	// -------- credit offs (self or admin→staff, needs superior approval) --
 	if (request.method === 'POST' && sub === '/grant') {
-		if (!isAdminish(user.user_role)) {
-			return json({ error: 'forbidden' }, { status: 403 });
-		}
 		const body = (await request.json()) as {
 			staff_id?: number;
 			num_days?: number;
 			reason?: string;
 		};
-		if (!Number.isInteger(body.staff_id) || !Number.isInteger(body.num_days) || body.num_days! <= 0 || !body.reason?.trim()) {
+		// Default target = self (lets normal users credit themselves).
+		const targetId = Number.isInteger(body.staff_id) ? body.staff_id! : user.id;
+		if (!Number.isInteger(body.num_days) || body.num_days! <= 0 || !body.reason?.trim()) {
 			return json({ error: 'invalid_body' }, { status: 400 });
 		}
+
+		const isSelf = targetId === user.id;
+		if (!isSelf && !isAdminish(user.user_role)) {
+			return json({ error: 'forbidden' }, { status: 403 });
+		}
+
 		const staff = await env.depot_db
 			.prepare('SELECT id, telegram_id, full_name, superior_telegram_id FROM users WHERE id = ?')
-			.bind(body.staff_id)
+			.bind(targetId)
 			.first<{ id: number; telegram_id: string; full_name: string; superior_telegram_id: string | null }>();
 		if (!staff) return json({ error: 'staff_not_found' }, { status: 404 });
-		// Admins can grant only to their direct reports; superadmins to anyone.
-		if (user.user_role === 'admin' && staff.superior_telegram_id !== user.telegram_id) {
+		// Admins can credit only their direct reports; superadmins anyone; anyone can self-credit.
+		if (!isSelf && user.user_role === 'admin' && staff.superior_telegram_id !== user.telegram_id) {
 			return json({ error: 'not_your_staff' }, { status: 403 });
 		}
 
@@ -203,18 +213,18 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// DM the staff's superior to approve. If admin == superior, the DM
-		// goes to admin themselves which is fine (they can self-approve).
+		// The approver is the recipient's superior (fallback: any admin).
 		const approverTid = staff.superior_telegram_id ?? (await firstAdminTid(env));
+		const whoLine = isSelf ? `${staff.full_name} (self-credit)` : `${user.full_name} → ${staff.full_name}`;
 		if (approverTid) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: approverTid,
-				text: `🪙 <b>Off-credit grant</b>\n${user.full_name} → ${staff.full_name}: ${body.num_days} day(s)\nReason: ${body.reason}`,
+				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${body.num_days} day(s)\nReason: ${body.reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
 						[
-							{ text: '✅ Approve grant', callback_data: `grant:approve:${ins.id}` },
+							{ text: '✅ Approve', callback_data: `grant:approve:${ins.id}` },
 							{ text: '❌ Reject', callback_data: `grant:reject:${ins.id}` },
 						],
 					],
@@ -227,11 +237,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 					.run();
 			}
 		}
-		// Also notify the staff that a grant is pending
-		await tgSendMessage(env.BOT_TOKEN, {
-			chat_id: staff.telegram_id,
-			text: `🪙 ${user.full_name} proposed granting you ${body.num_days} off day(s) — pending superior approval. Reason: ${body.reason}`,
-		});
+		// Notify the recipient ONLY when they didn't initiate it themselves and
+		// they aren't the approver (avoids duplicate messages to one person).
+		if (staff.telegram_id !== user.telegram_id && staff.telegram_id !== approverTid) {
+			await tgSendMessage(env.BOT_TOKEN, {
+				chat_id: staff.telegram_id,
+				text: `🪙 ${user.full_name} proposed crediting you ${body.num_days} off day(s) — pending superior approval. Reason: ${body.reason}`,
+			});
+		}
 
 		return json({ ok: true, id: ins.id });
 	}

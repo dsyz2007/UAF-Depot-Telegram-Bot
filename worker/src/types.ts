@@ -11,8 +11,15 @@ declare global {
 
 export type UserRole = 'user' | 'admin' | 'superadmin';
 
-export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'DSP' | 'Others';
-export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others'];
+export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'STG' | 'Others';
+export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'STG', 'Others'];
+
+// Only meaningful when department = 'STG'.
+export type StgSubDepartment = 'C1+C2' | 'C3+C4';
+export const STG_SUB_DEPARTMENTS: readonly StgSubDepartment[] = ['C1+C2', 'C3+C4'];
+
+export type PersonnelType = 'NSF' | 'NSF Officer' | 'Regular';
+export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'NSF Officer', 'Regular'];
 
 export interface DbUser {
 	id: number;
@@ -22,6 +29,8 @@ export interface DbUser {
 	superior_telegram_id: string | null;
 	ord_date: string | null;
 	department: Department | null;
+	sub_department: StgSubDepartment | null;
+	personnel_type: PersonnelType | null;
 	off_credits: number;
 	created_at: string;
 }
@@ -34,24 +43,49 @@ export interface TgWebAppUser {
 	language_code?: string;
 }
 
+// Parade-state options shown in the UI dropdown. Order matters — drives
+// dropdown order, legend order, and copy-state grouping order.
 export type ParadeStatus =
 	| 'Present'
-	| 'Off'
-	| 'Leave'
-	| 'Overseas Leave'
+	| 'Course'
+	| 'AO'
+	| 'MA'
 	| 'MC'
-	| 'Attached-Out'
+	| 'RSO'
+	| 'RSI'
+	| 'OFF'
+	| 'LL'
+	| 'OL'
 	| 'Others';
 
 export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Present',
-	'Off',
-	'Leave',
-	'Overseas Leave',
+	'Course',
+	'AO',
+	'MA',
 	'MC',
-	'Attached-Out',
+	'RSO',
+	'RSI',
+	'OFF',
+	'LL',
+	'OL',
 	'Others',
 ];
+
+// Long-form labels for the legend / dropdown tooltips.
+export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
+	Present: 'Present',
+	Course: 'Course',
+	AO: 'AO (Attached-Out)',
+	MA: 'MA (Medical Appointment)',
+	MC: 'MC',
+	RSO: 'RSO',
+	RSI: 'RSI',
+	OFF: 'OFF',
+	LL: 'LL (Local Leave)',
+	OL: 'OL (Overseas Leave)',
+	Others: 'Others',
+};
 
 export function dayCountInclusive(startdate: string, enddate: string): number {
 	const a = new Date(`${startdate}T00:00:00Z`).getTime();
