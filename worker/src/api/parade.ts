@@ -38,6 +38,65 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/parade'.length);
 
+	// Calendar chip data — only the caller's own entries for the visible month.
+	// Returns ~60 rows max (1 user × 30 days × 2 periods) instead of the
+	// everyone-in-the-month payload, which is ~5,400 rows. Big read-cost win.
+	if (request.method === 'GET' && sub === '/my-month') {
+		const ym = url.searchParams.get('ym') ?? '';
+		if (!/^\d{4}-\d{2}$/.test(ym)) return json({ error: 'bad_ym' }, { status: 400 });
+		const start = `${ym}-01`;
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT parade_state_date, period, parade_status, reason
+				 FROM parade_state_entries
+				 WHERE user_id = ?
+				   AND parade_state_date >= ?
+				   AND parade_state_date < date(?, '+1 month')
+				 ORDER BY parade_state_date, period`,
+			)
+			.bind(user.id, start, start)
+			.all<{
+				parade_state_date: string;
+				period: 'AM' | 'PM';
+				parade_status: string;
+				reason: string | null;
+			}>();
+		return json(results ?? []);
+	}
+
+	// Day-details data — EVERY active user with their entries for the date.
+	// LEFT JOIN from users so unfilled users still appear (with NULL fields).
+	// Each user contributes 1–3 rows: 1 placeholder row if they submitted
+	// nothing, or one row per period they did submit.
+	if (request.method === 'GET' && sub === '/day') {
+		const date = url.searchParams.get('date') ?? '';
+		if (!isValidDate(date)) return json({ error: 'bad_date' }, { status: 400 });
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT u.id AS user_id, u.full_name, u.department, u.sub_department,
+				        p.parade_state_date, p.period, p.parade_status, p.reason
+				 FROM users u
+				 LEFT JOIN parade_state_entries p
+				   ON p.user_id = u.id AND p.parade_state_date = ?
+				 WHERE u.full_name NOT LIKE 'PENDING:%'
+				 ORDER BY u.department, u.sub_department, u.full_name, p.period`,
+			)
+			.bind(date)
+			.all<{
+				user_id: number;
+				full_name: string;
+				department: string | null;
+				sub_department: string | null;
+				parade_state_date: string | null;
+				period: 'AM' | 'PM' | null;
+				parade_status: string | null;
+				reason: string | null;
+			}>();
+		return json(results ?? []);
+	}
+
+	// Deprecated — keep until any cached old WebApp bundles roll over. New
+	// frontend uses /my-month + /day above instead.
 	if (request.method === 'GET' && sub === '/month') {
 		const ym = url.searchParams.get('ym') ?? '';
 		if (!/^\d{4}-\d{2}$/.test(ym)) return json({ error: 'bad_ym' }, { status: 400 });

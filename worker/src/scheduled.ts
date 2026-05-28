@@ -102,9 +102,9 @@ async function drainReminders(env: Env): Promise<void> {
 function renderReminder(r: DueRow): string {
 	switch (r.reminder_type) {
 		case 'sick_update_personnel':
-			return `⏰ Reminder: please update your ${r.case_type ?? 'sick'} status in the depot app (MC days, medicine, etc.).`;
+			return `⏰ Update your ${r.case_type ?? 'sick'} status (MC days, dates, medicine) in Depot App → 🤒 Sick.`;
 		case 'sick_update_personnel_2':
-			return `⏰ Second reminder: your ${r.case_type ?? 'sick'} status is still unset. Please update soon.`;
+			return `⏰ Second reminder: your ${r.case_type ?? 'sick'} status is still unset — update in Depot App → 🤒 Sick.`;
 		case 'sick_update_superior_flag':
 			return `🚩 ${r.full_name} has not updated their ${r.case_type ?? 'sick'} status after 8h.`;
 		default:
@@ -198,15 +198,15 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 function nudgeText(kind: NudgeKind, targetDate: string, hasEntry: boolean): string {
 	switch (kind) {
 		case 'evening_prev_am':
-			return `📋 Please submit tomorrow's AM parade state (${targetDate}). You can edit anytime before 7am.`;
+			return `📋 Submit tomorrow's AM parade state (${targetDate}) in Depot App → 🪖 Parade. Editable anytime before 7am.`;
 		case 'morning_am':
 			return hasEntry
-				? `☀ Reminder: please check today's (${targetDate}) parade state in case anything's changed. If already submitted and nothing's new, you can ignore this.`
-				: `☀ Reminder: please update today's (${targetDate}) parade state. Update both AM and PM as needed.`;
+				? `☀ Check today's (${targetDate}) parade state in Depot App → 🪖 Parade. If already submitted and nothing's changed, ignore this.`
+				: `☀ Update today's (${targetDate}) parade state in Depot App → 🪖 Parade. AM and PM as needed.`;
 		case 'noon_pm':
 			return hasEntry
-				? `🕛 Reminder: please check today's (${targetDate}) PM parade state in case anything's changed. If PM is already submitted and nothing's new, you can ignore this.`
-				: `🕛 Reminder: please update today's (${targetDate}) PM parade state.`;
+				? `🕛 Check today's PM parade state in Depot App → 🪖 Parade. If already submitted and nothing's changed, ignore this.`
+				: `🕛 Update today's PM parade state in Depot App → 🪖 Parade.`;
 	}
 }
 

@@ -9,9 +9,12 @@ interface Entry {
 	full_name: string;
 	department: string | null;
 	sub_department: string | null;
-	parade_state_date: string;
-	period: 'AM' | 'PM';
-	parade_status: string;
+	// /api/parade/day LEFT JOINs from users, so unfilled users return rows
+	// where these four are null. The bottom panel still renders them so admins
+	// can see at a glance who hasn't submitted.
+	parade_state_date: string | null;
+	period: 'AM' | 'PM' | null;
+	parade_status: string | null;
 	reason: string | null;
 }
 
@@ -29,6 +32,20 @@ const DEPT_ORDER: readonly string[] = [
 function deptKeyFor(e: { department: string | null; sub_department: string | null }): string {
 	if (e.department === 'STG' && e.sub_department) return `STG — ${e.sub_department}`;
 	return e.department ?? 'Unassigned';
+}
+
+// Render a single AM-or-PM cell: coloured status badge stacked above the
+// (truncated) reason. Empty cell when there's no entry for that period.
+function renderStatusCell(entry: { parade_status: string | null; reason: string | null } | undefined) {
+	if (!entry || !entry.parade_status) return <span className="muted">—</span>;
+	return (
+		<div>
+			<span className="badge" style={{ background: COLORS[entry.parade_status] }}>
+				{entry.parade_status}
+			</span>
+			{entry.reason && <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{entry.reason}</div>}
+		</div>
+	);
 }
 
 const STATUSES = ['Present', 'Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Others'] as const;
@@ -173,50 +190,79 @@ function buildStrengthReport(users: StrengthRow[], period: 'AM' | 'PM'): string 
 	return lines.join('\n');
 }
 
+// My own parade entries for the visible month (calendar chips). Subset of Entry.
+interface MyMonthRow {
+	parade_state_date: string;
+	period: 'AM' | 'PM';
+	parade_status: string;
+	reason: string | null;
+}
+
+// ±3 month navigation cap. Computed once on mount; the UI restricts navigation
+// to this window so the calendar can't be scrolled into arbitrarily-distant
+// months (defensive bound on /api/parade/day cost).
+function calendarBounds(): { start: Date; end: Date; minIso: string; maxIso: string } {
+	const t = todayLocal();
+	const start = new Date(t.getFullYear(), t.getMonth() - 3, 1);
+	const end = new Date(t.getFullYear(), t.getMonth() + 3, 1);
+	// Last day of (current month + 3) — pass 0 as day of the month *after* end.
+	const lastDayEnd = new Date(t.getFullYear(), t.getMonth() + 4, 0);
+	return {
+		start,
+		end,
+		minIso: ymdKey(start),
+		maxIso: ymdKey(lastDayEnd),
+	};
+}
+
 export function ParadeTab({ me }: { me: Me }) {
 	const [month, setMonth] = useState<Date>(todayLocal());
-	const [entries, setEntries] = useState<Entry[]>([]);
+	const [myMonthByDate, setMyMonthByDate] = useState<Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>>(new Map());
+	const [dayDetails, setDayDetails] = useState<Entry[]>([]);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [selectedDate, setSelectedDate] = useState<Date>(todayLocal());
 	const [showSubmit, setShowSubmit] = useState(false);
 	const [copyModalText, setCopyModalText] = useState<string | null>(null);
 
-	function refresh() {
+	const bounds = useMemo(() => calendarBounds(), []);
+
+	// Fetch only the current user's entries for the visible month (~60 rows max).
+	function refreshMyMonth() {
 		setLoadError(null);
 		return api
-			.get<Entry[]>(`/api/parade/month?ym=${ymKey(month)}`)
-			.then(setEntries)
+			.get<MyMonthRow[]>(`/api/parade/my-month?ym=${ymKey(month)}`)
+			.then((rows) => {
+				const m = new Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>();
+				for (const r of rows) {
+					const cur = m.get(r.parade_state_date) ?? {};
+					cur[r.period] = r;
+					m.set(r.parade_state_date, cur);
+				}
+				setMyMonthByDate(m);
+			})
 			.catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
 	}
+
+	// Fetch everyone's entries for the selected date (~180 rows max).
+	function refreshDay() {
+		return api
+			.get<Entry[]>(`/api/parade/day?date=${ymdKey(selectedDate)}`)
+			.then(setDayDetails)
+			.catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
+	}
+
+	async function refresh(): Promise<void> {
+		await Promise.all([refreshMyMonth(), refreshDay()]);
+	}
+
 	useEffect(() => {
-		refresh();
+		refreshMyMonth();
 	}, [month]);
+	useEffect(() => {
+		refreshDay();
+	}, [selectedDate]);
 
-	// Map (date → {AM?, PM?}) for me, recomputed when entries change.
-	const myByDate = useMemo(() => {
-		const map = new Map<string, { AM?: Entry; PM?: Entry }>();
-		entries
-			.filter((e) => e.user_id === me.id)
-			.forEach((e) => {
-				const cur = map.get(e.parade_state_date) ?? {};
-				cur[e.period] = e;
-				map.set(e.parade_state_date, cur);
-			});
-		return map;
-	}, [entries, me.id]);
-
-	const allByDate = useMemo(() => {
-		const map = new Map<string, Entry[]>();
-		entries.forEach((e) => {
-			const arr = map.get(e.parade_state_date) ?? [];
-			arr.push(e);
-			map.set(e.parade_state_date, arr);
-		});
-		return map;
-	}, [entries]);
-
-	const dayDetails = allByDate.get(ymdKey(selectedDate)) ?? [];
-	const myToday = myByDate.get(ymdKey(selectedDate));
+	const myToday = myMonthByDate.get(ymdKey(selectedDate));
 
 	if (loadError) {
 		return (
@@ -235,18 +281,24 @@ export function ParadeTab({ me }: { me: Me }) {
 
 	return (
 		<div>
-			{/* Key forces DayPicker to fully re-render whenever entries change. */}
+			{/* Key forces DayPicker to fully re-render when my own entries change. */}
 			<DayPicker
-				key={`cal-${entries.length}-${ymKey(month)}`}
+				key={`cal-${myMonthByDate.size}-${ymKey(month)}`}
 				mode="single"
 				month={month}
 				onMonthChange={setMonth}
 				selected={selectedDate}
 				onSelect={(d) => d && setSelectedDate(d)}
+				startMonth={bounds.start}
+				endMonth={bounds.end}
+				disabled={{
+					before: bounds.start,
+					after: new Date(bounds.end.getFullYear(), bounds.end.getMonth() + 1, 0),
+				}}
 				components={{
 					DayButton: (props) => {
 						const dateKey = ymdKey(props.day.date);
-						const my = myByDate.get(dateKey);
+						const my = myMonthByDate.get(dateKey);
 						const { day: _day, modifiers: _modifiers, ...buttonProps } = props;
 						void _day;
 						void _modifiers;
@@ -326,7 +378,7 @@ export function ParadeTab({ me }: { me: Me }) {
 					</button>
 				</div>
 				{dayDetails.length === 0 ? (
-					<p className="muted">No submissions yet.</p>
+					<p className="muted">No active users.</p>
 				) : (
 					(() => {
 						// Group the day's entries by department for clearer display.
@@ -342,26 +394,33 @@ export function ParadeTab({ me }: { me: Me }) {
 								{DEPT_ORDER.map((dept) => {
 									const list = groups.get(dept);
 									if (!list || list.length === 0) return null;
+									// Collapse the (user, period) rows into one row per user
+									// with AM/PM cells side-by-side. Users with no entries for
+									// this date come back as a single row with period=null —
+									// we still register them so they show up as "—/—".
+									const byUser = new Map<number, { full_name: string; AM?: Entry; PM?: Entry }>();
+									for (const e of list) {
+										const cur = byUser.get(e.user_id) ?? { full_name: e.full_name };
+										if (e.period === 'AM') cur.AM = e;
+										else if (e.period === 'PM') cur.PM = e;
+										byUser.set(e.user_id, cur);
+									}
+									const users = [...byUser.values()].sort((a, b) => a.full_name.localeCompare(b.full_name));
 									return (
 										<div key={dept} style={{ marginTop: 12 }}>
 											<h5 className="section-title" style={{ margin: '0 0 4px' }}>
-												{dept} ({list.length})
+												{dept} ({users.length})
 											</h5>
 											<table>
 												<thead>
-													<tr><th>Name</th><th>Period</th><th>Status</th><th>Reason</th></tr>
+													<tr><th>Name</th><th>AM</th><th>PM</th></tr>
 												</thead>
 												<tbody>
-													{list.map((e) => (
-														<tr key={`${e.user_id}-${e.period}`}>
-															<td>{e.full_name}</td>
-															<td>{e.period}</td>
-															<td>
-																<span className="badge" style={{ background: COLORS[e.parade_status] }}>
-																	{e.parade_status}
-																</span>
-															</td>
-															<td>{e.reason ?? '—'}</td>
+													{users.map((u) => (
+														<tr key={u.full_name}>
+															<td>{u.full_name}</td>
+															<td>{renderStatusCell(u.AM)}</td>
+															<td>{renderStatusCell(u.PM)}</td>
 														</tr>
 													))}
 												</tbody>
@@ -378,6 +437,8 @@ export function ParadeTab({ me }: { me: Me }) {
 			{showSubmit && (
 				<SubmitModal
 					initialDate={ymdKey(selectedDate)}
+					minIso={bounds.minIso}
+					maxIso={bounds.maxIso}
 					onClose={() => setShowSubmit(false)}
 					onDone={refresh}
 				/>
@@ -396,10 +457,14 @@ const NONE = '' as const;
 
 function SubmitModal({
 	initialDate,
+	minIso,
+	maxIso,
 	onClose,
 	onDone,
 }: {
 	initialDate: string;
+	minIso: string;
+	maxIso: string;
 	onClose: () => void;
 	onDone: () => Promise<void>;
 }) {
@@ -412,16 +477,18 @@ function SubmitModal({
 	const [busy, setBusy] = useState(false);
 
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
+	const inRange = !!startdate && !!enddate && startdate >= minIso && enddate <= maxIso;
 	const amFilled = amStatus !== NONE;
 	const pmFilled = pmStatus !== NONE;
 	const amReasonOk = amStatus !== 'Others' || amReason.trim().length > 0;
 	const pmReasonOk = pmStatus !== 'Others' || pmReason.trim().length > 0;
 	const atLeastOne = amFilled || pmFilled;
-	const canSave = datesValid && atLeastOne && amReasonOk && pmReasonOk;
+	const canSave = datesValid && inRange && atLeastOne && amReasonOk && pmReasonOk;
 
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
+	else if (!inRange) hint = `Dates must be within ${minIso} → ${maxIso} (±3 months from this month).`;
 	else if (!atLeastOne) hint = 'Set at least one of AM / PM status.';
 	else if (amFilled && !amReasonOk) hint = 'AM reason is required when AM status = Others.';
 	else if (pmFilled && !pmReasonOk) hint = 'PM reason is required when PM status = Others.';
@@ -458,8 +525,8 @@ function SubmitModal({
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Submit / Edit Parade Status</h3>
 
-				<label>Start date<input type="date" value={startdate} onChange={(e) => setStartdate(e.target.value)} /></label>
-				<label>End date<input type="date" value={enddate} onChange={(e) => setEnddate(e.target.value)} /></label>
+				<label>Start date<input type="date" value={startdate} min={minIso} max={maxIso} onChange={(e) => setStartdate(e.target.value)} /></label>
+				<label>End date<input type="date" value={enddate} min={minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
 
 				<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
 					<b>🌅 AM</b>

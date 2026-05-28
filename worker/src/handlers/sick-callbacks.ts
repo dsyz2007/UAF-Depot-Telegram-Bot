@@ -85,7 +85,7 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.personnel_tid,
-			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, please update your status (MC days / medicine) in the depot app.`,
+			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.`,
 		});
 	});
 }
