@@ -1,6 +1,17 @@
 import { json, type AuthedContext } from './router';
 import { PARADE_STATUSES, type ParadeStatus } from '../types';
-import { tgSendDocument } from '../tg';
+import { tgSendDocument, tgSendMessage } from '../tg';
+import { isWorkingDay, sgtToday } from '../holidays';
+
+const AM_CUTOFF_MIN = 7 * 60 + 30; // 07:30 SGT
+const PM_CUTOFF_MIN = 13 * 60 + 30; // 13:30 SGT
+
+// SGT minutes-into-day (0..1439). Uses UTC + 8h offset (no DST in SG).
+function sgtMinutesIntoDay(): number {
+	const now = new Date();
+	const sgt = new Date(now.getTime() + 8 * 3_600_000);
+	return sgt.getUTCHours() * 60 + sgt.getUTCMinutes();
+}
 
 interface MonthRow {
 	user_id: number;
@@ -148,20 +159,98 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		}
 
 		const dates = expandRange(body.startdate, body.enddate);
-		const stmt = env.depot_db.prepare(
+		const today = sgtToday();
+		const minutesNow = sgtMinutesIntoDay();
+		const todayIsWorking = await isWorkingDay(env, today);
+
+		// Split each (date, period) entry into either "apply now" or "pending
+		// superior approval". Approval is needed only when ALL of:
+		//   1. target date is today (SGT)
+		//   2. today is a working day
+		//   3. period AM and SGT time ≥ 07:30  OR  period PM and SGT time ≥ 13:30
+		// Future/past dates and non-working days apply immediately.
+		const directOps: ReturnType<typeof env.depot_db.prepare>[] = [];
+		const upsertStmt = env.depot_db.prepare(
 			`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
 			 VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT(user_id, parade_state_date, period)
 			 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 		);
-		const ops = [];
+		const pendingPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
+
 		for (const d of dates) {
 			for (const e of clean) {
-				ops.push(stmt.bind(user.id, d, e.period, e.status, e.reason));
+				const isLate =
+					todayIsWorking &&
+					d === today &&
+					((e.period === 'AM' && minutesNow >= AM_CUTOFF_MIN) ||
+						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
+				if (isLate) {
+					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
+				} else {
+					directOps.push(upsertStmt.bind(user.id, d, e.period, e.status, e.reason));
+				}
 			}
 		}
-		await env.depot_db.batch(ops);
-		return json({ ok: true, count: ops.length, periods: clean.map((c) => c.period) });
+
+		if (directOps.length > 0) {
+			await env.depot_db.batch(directOps);
+		}
+
+		// Stage pending requests — supersede any previous pending for the same
+		// (user, date, period) so the superior only ever sees the latest one.
+		const pendingIds: number[] = [];
+		const superiorTid = user.superior_telegram_id ?? (await firstAdminTidForParade(env));
+		for (const p of pendingPayloads) {
+			await env.depot_db
+				.prepare(
+					`UPDATE parade_change_requests SET status = 'cancelled'
+					 WHERE user_id = ? AND parade_state_date = ? AND period = ? AND status = 'pending'`,
+				)
+				.bind(user.id, p.date, p.period)
+				.run();
+			const ins = await env.depot_db
+				.prepare(
+					`INSERT INTO parade_change_requests
+					   (user_id, parade_state_date, period, new_status, new_reason, status)
+					 VALUES (?, ?, ?, ?, ?, 'pending')
+					 RETURNING id`,
+				)
+				.bind(user.id, p.date, p.period, p.status, p.reason)
+				.first<{ id: number }>();
+			if (!ins) continue;
+			pendingIds.push(ins.id);
+
+			if (superiorTid) {
+				const cutoff = p.period === 'AM' ? '07:30' : '13:30';
+				const msg = await tgSendMessage(env.BOT_TOKEN, {
+					chat_id: superiorTid,
+					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,
+					parse_mode: 'HTML',
+					reply_markup: {
+						inline_keyboard: [
+							[
+								{ text: '✅ Approve', callback_data: `paradechg:approve:${ins.id}` },
+								{ text: '❌ Reject', callback_data: `paradechg:reject:${ins.id}` },
+							],
+						],
+					},
+				});
+				if (msg?.message_id) {
+					await env.depot_db
+						.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`)
+						.bind(String(msg.message_id), ins.id)
+						.run();
+				}
+			}
+		}
+
+		return json({
+			ok: true,
+			applied: directOps.length,
+			pending: pendingPayloads.length,
+			pending_ids: pendingIds,
+		});
 	}
 
 	// Strength report data — every active user with their parade entry (or
@@ -222,7 +311,9 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const csvBody = rows
 			.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
 			.join('\n');
-		const csv = header + csvBody + '\n';
+		// UTF-8 BOM so Excel auto-detects encoding and renders headers/Asian
+		// characters correctly without "Import CSV" wizard friction.
+		const csv = '﻿' + header + csvBody + '\n';
 
 		const sent = await tgSendDocument(
 			env.BOT_TOKEN,
@@ -236,4 +327,12 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });
+}
+
+// Fallback approver when the user has no superior_telegram_id set — pick any admin.
+async function firstAdminTidForParade(env: Env): Promise<string | null> {
+	const a = await env.depot_db
+		.prepare(`SELECT telegram_id FROM users WHERE user_role IN ('admin','superadmin') LIMIT 1`)
+		.first<{ telegram_id: string }>();
+	return a?.telegram_id ?? null;
 }

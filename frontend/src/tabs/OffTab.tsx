@@ -5,7 +5,6 @@ import { api, confirmDialog, type Me } from '../lib/api';
 interface SummaryRow {
 	id: number;
 	full_name: string;
-	off_count: number;
 	off_credits: number;
 	department: string | null;
 }
@@ -120,11 +119,14 @@ export function OffTab({ me }: { me: Me }) {
 
 	// ----- Detail view -----------------------------------------------------
 	if (detailUser) {
+		// Total off-days used across all approved requests (one request can
+		// span multiple days; we sum each range inclusive).
+		const totalDaysUsed = details.reduce((sum, d) => sum + dayCount(d.startdate, d.enddate), 0);
 		return (
 			<div>
 				<button className="btn btn-secondary" onClick={() => setDetailUser(null)}>← Back</button>
 				<h3 style={{ marginTop: 12 }}>
-					{detailUser.full_name} — {detailUser.off_count} approved off{detailUser.off_count === 1 ? '' : 's'}
+					{detailUser.full_name} — {totalDaysUsed} off day{totalDaysUsed === 1 ? '' : 's'} used
 					<span className="muted" style={{ fontSize: 13, marginLeft: 8 }}>🪙 {detailUser.off_credits}</span>
 				</h3>
 				{details.length === 0 ? (
@@ -134,6 +136,7 @@ export function OffTab({ me }: { me: Me }) {
 						<thead>
 							<tr>
 								<th>Dates (reason)</th>
+								<th>Num of Offs Used</th>
 								<th>Approved by</th>
 								<th>Approved date</th>
 								{isAdminish(me.user_role) && <th></th>}
@@ -147,6 +150,7 @@ export function OffTab({ me }: { me: Me }) {
 										<br />
 										<span className="muted">{d.reason}</span>
 									</td>
+									<td>{dayCount(d.startdate, d.enddate)}</td>
 									<td>{d.approved_by_name ?? '—'}</td>
 									<td>{d.approved_date?.slice(0, 10) ?? '—'}</td>
 									{isAdminish(me.user_role) && (
@@ -225,7 +229,7 @@ export function OffTab({ me }: { me: Me }) {
 						{row.department && <span className="muted" style={{ marginLeft: 6 }}>· {row.department}</span>}
 					</span>
 					<span className="muted" style={{ fontSize: 13 }}>
-						🪙 {row.off_credits} · taken {row.off_count}
+						🪙 {row.off_credits}
 					</span>
 				</div>
 			))}

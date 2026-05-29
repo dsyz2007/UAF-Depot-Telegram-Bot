@@ -5,7 +5,6 @@ import { dayCountInclusive } from '../types';
 interface SummaryRow {
 	id: number;
 	full_name: string;
-	off_count: number;
 	off_credits: number;
 	department: string | null;
 }
@@ -50,19 +49,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 
 	// -------- read ---------------------------------------------------------
 	if (request.method === 'GET' && sub === '/summary') {
-		// Single JOIN+GROUP BY instead of an N+1 correlated COUNT subquery —
-		// idx_off_user_status (user_id, off_status) makes the join an indexed
-		// lookup per user.
+		// Just users + credit balance + department. We no longer surface
+		// "taken X" so the JOIN with off_requests is removed — saves reads.
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT u.id, u.full_name, u.off_credits, u.department,
-				        COUNT(o.id) AS off_count
-				 FROM users u
-				 LEFT JOIN off_requests o
-				   ON o.user_id = u.id AND o.off_status = 'approved'
-				 WHERE u.full_name NOT LIKE 'PENDING:%'
-				 GROUP BY u.id
-				 ORDER BY u.full_name`,
+				`SELECT id, full_name, off_credits, department
+				 FROM users
+				 WHERE full_name NOT LIKE 'PENDING:%'
+				 ORDER BY full_name`,
 			)
 			.all<SummaryRow>();
 		return json(results ?? []);
@@ -162,6 +156,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 							{ text: '✅ Approve', callback_data: `off:approve:${ins.id}` },
 							{ text: '❌ Reject', callback_data: `off:reject:${ins.id}` },
 						],
+						[{ text: '📅 Open Off page', web_app: { url: `${env.WEBAPP_URL}?tab=off` } }],
 					],
 				},
 			});

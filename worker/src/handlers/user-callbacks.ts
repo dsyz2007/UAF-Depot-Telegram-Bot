@@ -32,7 +32,11 @@ export function registerUserCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
-		await env.depot_db.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run();
+		// Reminders FK from migration 001 still binds users(id) — wipe first.
+		await env.depot_db.batch([
+			env.depot_db.prepare(`DELETE FROM reminders WHERE user_id = ?`).bind(userId),
+			env.depot_db.prepare(`DELETE FROM users WHERE id = ?`).bind(userId),
+		]);
 		await ctx.editMessageText(`🗑 ${target.full_name} removed from depot bot (by ${actor.full_name}).`);
 		await ctx.answerCallbackQuery({ text: 'Deleted.' });
 

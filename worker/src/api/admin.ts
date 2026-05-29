@@ -112,7 +112,15 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		if (body.id === user.id) return json({ error: 'cannot_delete_self' }, { status: 400 });
-		await env.depot_db.prepare(`DELETE FROM users WHERE id = ?`).bind(body.id).run();
+		// `reminders.user_id REFERENCES users(id)` from migration 001 was never
+		// rebuilt, so the FK still blocks DELETE on users. Wipe the user's
+		// reminders first (they're transient anyway), then delete the user.
+		// Other tables (off_requests, sick_cases, parade_state_entries) were
+		// rebuilt in 002 without FK refs — their rows orphan harmlessly.
+		await env.depot_db.batch([
+			env.depot_db.prepare(`DELETE FROM reminders WHERE user_id = ?`).bind(body.id),
+			env.depot_db.prepare(`DELETE FROM users WHERE id = ?`).bind(body.id),
+		]);
 		return json({ ok: true });
 	}
 

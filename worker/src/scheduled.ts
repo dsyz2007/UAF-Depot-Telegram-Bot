@@ -1,14 +1,28 @@
 // Cron dispatcher. Wired via wrangler.jsonc triggers.crons.
 //
-// Crons (UTC → SGT):
-//   */5 * * * *  → every 5 min    drain reminders queue
-//   0 13 * * *   → 21:00 prev day AM-empty nudge for tomorrow (if working day)
-//   30 21 * * *  → 05:30 same day AM update nudge (everyone, with reassurance)
-//   0 4 * * *    → 12:00 same day PM update nudge + holiday refresh
-//   0 0 * * *    → 08:00 SGT      ORD scan + parade pruning
+// Cloudflare free tier caps us at 5 cron triggers. Schedule:
+//   */5 * * * *    → every 5 min        drain reminders queue
+//   0 13 * * *     → 21:00 prev day      AM-empty nudge for tomorrow (if working day)
+//   30 21 * * *    → 05:30 same day      AM update nudge (everyone, with reassurance)
+//   30 23,5 * * *  → 07:30 / 13:30 SGT   AM-empty / PM-empty flag → superior
+//   0 4 * * *      → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
 
 import { tgSendMessage } from './tg';
 import { isWorkingDay, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
+
+// Inline keyboard with a single WebApp button that deep-links to a tab.
+function webAppButton(env: Env, tab: 'parade' | 'sick' | 'off'): {
+	inline_keyboard: { text: string; web_app: { url: string } }[][];
+} {
+	const labels: Record<'parade' | 'sick' | 'off', string> = {
+		parade: '🪖 Open Parade page',
+		sick: '🤒 Open Sick page',
+		off: '📅 Open Off page',
+	};
+	return {
+		inline_keyboard: [[{ text: labels[tab], web_app: { url: `${env.WEBAPP_URL}?tab=${tab}` } }]],
+	};
+}
 
 interface DueRow {
 	id: number;
@@ -41,12 +55,24 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 			await paradeNudge(env, 'morning_am');
 			return;
 		case '0 4 * * *':
+			// 12:00 SGT — bundle PM nudge + holiday refresh + ORD scan + prune
+			// into a single cron to stay under Cloudflare's 5-trigger cap.
 			await paradeNudge(env, 'noon_pm');
-			await runHolidayRefresh(env);
+			await Promise.allSettled([
+				runHolidayRefresh(env),
+				runOrdReminders(env),
+				runParadePrune(env),
+			]);
 			return;
-		case '0 0 * * *':
-			await Promise.allSettled([runOrdReminders(env), runParadePrune(env)]);
+		case '30 23,5 * * *': {
+			// Fires twice a day: 23:30 UTC (07:30 SGT, AM flag) and 05:30 UTC
+			// (13:30 SGT, PM flag). Use scheduledTime to tell them apart so a
+			// delayed fire still routes to the right handler.
+			const period: 'AM' | 'PM' =
+				new Date(event.scheduledTime).getUTCHours() === 23 ? 'AM' : 'PM';
+			await flagPeriodMissing(env, period);
 			return;
+		}
 		default:
 			console.warn('unknown cron', event.cron);
 	}
@@ -72,11 +98,12 @@ async function drainReminders(env: Env): Promise<void> {
 
 	const sends: Promise<unknown>[] = results.map((r) => {
 		const text = renderReminder(r);
-		const targetTid =
-			r.reminder_type === 'sick_update_superior_flag' && r.superior_telegram_id
-				? r.superior_telegram_id
-				: r.telegram_id;
-		return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text });
+		const isSuperiorFlag = r.reminder_type === 'sick_update_superior_flag';
+		const targetTid = isSuperiorFlag && r.superior_telegram_id ? r.superior_telegram_id : r.telegram_id;
+		// Personnel-facing sick reminders deep-link to the Sick page; the
+		// 8h-flag DM to the superior is informational only — no button.
+		const reply_markup = isSuperiorFlag ? undefined : webAppButton(env, 'sick');
+		return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text, reply_markup });
 	});
 	const settled = await Promise.allSettled(sends);
 
@@ -132,87 +159,133 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 	//   morning_am       → all users (reassure if already filled)
 	//   noon_pm          → all users (reassure if already filled)
 	let rows: { user: UserRow; hasEntry: boolean }[] = [];
+	// All three nudges now share a single AM/PM-aware fetch so the 5:30am
+	// reminder can tell the user their actual current status.
+	const { results: statusRows } = await env.depot_db
+		.prepare(
+			`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
+			        MAX(CASE WHEN p.period = 'AM' THEN p.parade_status END) AS am_status,
+			        MAX(CASE WHEN p.period = 'PM' THEN p.parade_status END) AS pm_status
+			 FROM users u
+			 LEFT JOIN parade_state_entries p
+			   ON p.user_id = u.id AND p.parade_state_date = ?
+			 WHERE u.full_name NOT LIKE 'PENDING:%'
+			 GROUP BY u.id`,
+		)
+		.bind(targetDate)
+		.all<UserRow & { am_status: string | null; pm_status: string | null }>();
+
+	type EnrichedRow = { user: UserRow; amStatus: string | null; pmStatus: string | null };
+	let enriched: EnrichedRow[] = [];
+
 	if (kind === 'evening_prev_am') {
-		const { results } = await env.depot_db
-			.prepare(
-				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id
-				 FROM users u
-				 WHERE u.full_name NOT LIKE 'PENDING:%'
-				   AND NOT EXISTS (
-				     SELECT 1 FROM parade_state_entries p
-				     WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = 'AM'
-				   )`,
-			)
-			.bind(targetDate)
-			.all<UserRow>();
-		rows = (results ?? []).map((u) => ({ user: u, hasEntry: false }));
+		// Only users with no AM entry for tomorrow.
+		enriched = (statusRows ?? [])
+			.filter((u) => u.am_status === null)
+			.map((u) => ({
+				user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
+				amStatus: u.am_status,
+				pmStatus: u.pm_status,
+			}));
 	} else if (kind === 'morning_am') {
-		// 5:30am: general reminder. Reassure if EITHER AM or PM (or both) is filled.
-		// Single LEFT JOIN + GROUP BY instead of a correlated COUNT subquery —
-		// uses the UNIQUE(user_id, parade_state_date, period) index for the join.
-		const { results } = await env.depot_db
-			.prepare(
-				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
-				        COUNT(p.id) AS filled_periods
-				 FROM users u
-				 LEFT JOIN parade_state_entries p
-				   ON p.user_id = u.id AND p.parade_state_date = ?
-				 WHERE u.full_name NOT LIKE 'PENDING:%'
-				 GROUP BY u.id`,
-			)
-			.bind(targetDate)
-			.all<UserRow & { filled_periods: number }>();
-		rows = (results ?? []).map((u) => ({
+		// 5:30am: nudge everyone, message includes their AM/PM current values.
+		enriched = (statusRows ?? []).map((u) => ({
 			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
-			hasEntry: u.filled_periods > 0,
+			amStatus: u.am_status,
+			pmStatus: u.pm_status,
 		}));
 	} else {
-		// noon_pm: reassure if PM specifically is filled.
-		const { results } = await env.depot_db
-			.prepare(
-				`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
-				        (SELECT 1 FROM parade_state_entries p
-				          WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = 'PM') AS has_entry
-				 FROM users u
-				 WHERE u.full_name NOT LIKE 'PENDING:%'`,
-			)
-			.bind(targetDate)
-			.all<UserRow & { has_entry: number | null }>();
-		rows = (results ?? []).map((u) => ({
+		// noon_pm: nudge everyone, message focuses on PM.
+		enriched = (statusRows ?? []).map((u) => ({
 			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
-			hasEntry: u.has_entry === 1,
+			amStatus: u.am_status,
+			pmStatus: u.pm_status,
 		}));
 	}
 
-	if (!rows.length) return;
+	if (!enriched.length) return;
 
-	const sends = rows.map(({ user, hasEntry }) =>
+	const sends = enriched.map((e) =>
 		tgSendMessage(env.BOT_TOKEN, {
-			chat_id: user.telegram_id,
-			text: nudgeText(kind, targetDate, hasEntry),
+			chat_id: e.user.telegram_id,
+			text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
+			reply_markup: webAppButton(env, 'parade'),
 		}),
 	);
 	await Promise.allSettled(sends);
 }
 
-function nudgeText(kind: NudgeKind, targetDate: string, hasEntry: boolean): string {
+function fmtStatus(s: string | null): string {
+	return s ?? '— not set —';
+}
+
+function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: string | null): string {
 	switch (kind) {
 		case 'evening_prev_am':
 			return `📋 Submit tomorrow's AM parade state (${targetDate}) in Depot App → 🪖 Parade. Editable anytime before 7am.`;
-		case 'morning_am':
-			return hasEntry
-				? `☀ Check today's (${targetDate}) parade state in Depot App → 🪖 Parade. If already submitted and nothing's changed, ignore this.`
-				: `☀ Update today's (${targetDate}) parade state in Depot App → 🪖 Parade. AM and PM as needed.`;
+		case 'morning_am': {
+			// Show user's actual current AM/PM so they know if any update is
+			// needed at a glance.
+			const lines = [
+				`☀ Today (${targetDate}) parade state:`,
+				`  AM: ${fmtStatus(am)}`,
+				`  PM: ${fmtStatus(pm)}`,
+				'',
+				`Update in Depot App → 🪖 Parade if anything's changed. Otherwise ignore this.`,
+			];
+			return lines.join('\n');
+		}
 		case 'noon_pm':
-			return hasEntry
-				? `🕛 Check today's PM parade state in Depot App → 🪖 Parade. If already submitted and nothing's changed, ignore this.`
-				: `🕛 Update today's PM parade state in Depot App → 🪖 Parade.`;
+			return pm !== null
+				? `🕛 Today's PM is "${pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.`
+				: `🕛 Today's PM parade state is not set. Update in Depot App → 🪖 Parade.`;
 	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────
 // 3. Daily maintenance pieces (08:00 SGT for ORD + prune; 12:00 SGT for holidays)
 // ──────────────────────────────────────────────────────────────────────────
+// 07:30 SGT (AM) and 13:30 SGT (PM): users whose status for that period is
+// still empty get their superior DM'd. Skip non-working days entirely.
+async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
+	const today = sgtToday();
+	if (!(await isWorkingDay(env, today))) return;
+
+	const { results } = await env.depot_db
+		.prepare(
+			`SELECT u.telegram_id, u.full_name, u.superior_telegram_id
+			 FROM users u
+			 WHERE u.full_name NOT LIKE 'PENDING:%'
+			   AND NOT EXISTS (
+			     SELECT 1 FROM parade_state_entries p
+			     WHERE p.user_id = u.id AND p.parade_state_date = ? AND p.period = ?
+			   )`,
+		)
+		.bind(today, period)
+		.all<{ telegram_id: string; full_name: string; superior_telegram_id: string | null }>();
+	const missing = results ?? [];
+	if (!missing.length) return;
+
+	// Group by superior_telegram_id so each superior gets one consolidated DM.
+	const groups = new Map<string, string[]>();
+	for (const r of missing) {
+		if (!r.superior_telegram_id) continue;
+		const arr = groups.get(r.superior_telegram_id) ?? [];
+		arr.push(r.full_name);
+		groups.set(r.superior_telegram_id, arr);
+	}
+
+	const cutoff = period === 'AM' ? '07:30' : '13:30';
+	await Promise.allSettled(
+		[...groups.entries()].map(([tid, names]) =>
+			tgSendMessage(env.BOT_TOKEN, {
+				chat_id: tid,
+				text: `🚩 ${period} parade state still unknown at ${cutoff} (${today}):\n• ${names.join('\n• ')}`,
+			}),
+		),
+	);
+}
+
 async function runOrdReminders(env: Env): Promise<void> {
 	const today = sgtToday();
 	const in30 = sgtDateAddDays(today, 30);

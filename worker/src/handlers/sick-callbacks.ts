@@ -86,6 +86,9 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.personnel_tid,
 			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.`,
+			reply_markup: {
+				inline_keyboard: [[{ text: '🤒 Open Sick page', web_app: { url: `${env.WEBAPP_URL}?tab=sick` } }]],
+			},
 		});
 	});
 }

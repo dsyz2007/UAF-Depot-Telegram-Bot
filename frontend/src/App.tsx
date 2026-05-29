@@ -12,7 +12,15 @@ type TabKey = 'today' | 'off' | 'sick' | 'parade' | 'admin';
 export default function App() {
 	const [me, setMe] = useState<Me | null>(null);
 	const [error, setError] = useState<string | null>(null);
-	const [tab, setTab] = useState<TabKey>('parade');
+	const [tab, setTab] = useState<TabKey>(() => {
+		// Bot reminder buttons deep-link with ?tab=parade|sick|off so the user
+		// lands on the right page immediately.
+		const requested = new URLSearchParams(window.location.search).get('tab');
+		if (requested === 'parade' || requested === 'sick' || requested === 'off' || requested === 'today' || requested === 'admin') {
+			return requested;
+		}
+		return 'parade';
+	});
 
 	useEffect(() => {
 		api

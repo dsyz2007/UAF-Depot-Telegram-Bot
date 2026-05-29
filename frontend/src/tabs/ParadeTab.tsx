@@ -203,10 +203,10 @@ interface MyMonthRow {
 // months (defensive bound on /api/parade/day cost).
 function calendarBounds(): { start: Date; end: Date; minIso: string; maxIso: string } {
 	const t = todayLocal();
-	const start = new Date(t.getFullYear(), t.getMonth() - 3, 1);
-	const end = new Date(t.getFullYear(), t.getMonth() + 3, 1);
-	// Last day of (current month + 3) — pass 0 as day of the month *after* end.
-	const lastDayEnd = new Date(t.getFullYear(), t.getMonth() + 4, 0);
+	const start = new Date(t.getFullYear(), t.getMonth() - 2, 1);
+	const end = new Date(t.getFullYear(), t.getMonth() + 2, 1);
+	// Last day of (current month + 2) — pass 0 as day of the month *after* end.
+	const lastDayEnd = new Date(t.getFullYear(), t.getMonth() + 3, 0);
 	return {
 		start,
 		end,
@@ -488,7 +488,7 @@ function SubmitModal({
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (!inRange) hint = `Dates must be within ${minIso} → ${maxIso} (±3 months from this month).`;
+	else if (!inRange) hint = `Dates must be within ${minIso} → ${maxIso} (±2 months from this month).`;
 	else if (!atLeastOne) hint = 'Set at least one of AM / PM status.';
 	else if (amFilled && !amReasonOk) hint = 'AM reason is required when AM status = Others.';
 	else if (pmFilled && !pmReasonOk) hint = 'PM reason is required when PM status = Others.';
@@ -508,12 +508,21 @@ function SubmitModal({
 
 		setBusy(true);
 		try {
-			await api.post('/api/parade/submit', { startdate, enddate, entries });
+			const res = await api.post<{ applied: number; pending: number }>('/api/parade/submit', { startdate, enddate, entries });
 			await onDone();
 			onClose();
 			const parts = entries.map((e) => `${e.period}: ${e.status}`).join(' · ');
 			const range = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
-			WebApp.showAlert(`✅ Saved\n${parts}\nfor ${range}`);
+			let msg = `✅ ${parts}\nfor ${range}`;
+			if (res.pending > 0) {
+				// AM after 07:30 / PM after 13:30 on a working day → goes through
+				// superior approval first.
+				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:30 / PM after 13:30).`;
+			}
+			if (res.applied === 0 && res.pending === 0) {
+				msg = '⚠ Nothing saved.';
+			}
+			WebApp.showAlert(msg);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -571,12 +580,19 @@ function SubmitModal({
 }
 
 function ExportButton({ selectedDate }: { selectedDate: string }) {
-	const [date, setDate] = useState(selectedDate);
+	// Parade entries are pruned at 5 days, so anything older than today − 4
+	// days will always export blank. Clamp the picker to today − 4 …today.
+	const today = todayLocal();
+	const minIso = ymdKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 4));
+	const maxIso = ymdKey(today);
 
-	// Keep the export date in sync with the calendar's selected date so the
-	// CSV button reflects what the user is currently viewing.
+	// Default the picker to the calendar's selected date but clamp it.
+	const clamp = (d: string) => (d < minIso ? minIso : d > maxIso ? maxIso : d);
+	const [date, setDate] = useState(clamp(selectedDate));
+
 	useEffect(() => {
-		setDate(selectedDate);
+		setDate(clamp(selectedDate));
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [selectedDate]);
 
 	const [busy, setBusy] = useState(false);
@@ -585,7 +601,9 @@ function ExportButton({ selectedDate }: { selectedDate: string }) {
 		setBusy(true);
 		try {
 			const res = await api.post<{ ok: boolean; rows: number }>('/api/parade/export', { date });
-			WebApp.showAlert(`📄 CSV for ${date} (${res.rows} entries) sent to your Telegram chat with the bot.`);
+			WebApp.showAlert(
+				`📄 CSV for ${date} (${res.rows} entries) sent to your Telegram chat with the bot. Excel opens it directly.`,
+			);
 		} catch (e) {
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
@@ -596,8 +614,11 @@ function ExportButton({ selectedDate }: { selectedDate: string }) {
 	return (
 		<div className="card" style={{ marginTop: 12 }}>
 			<h4 style={{ marginTop: 0 }}>Export CSV (Admin/Superadmin)</h4>
-			<p className="muted" style={{ marginTop: 0 }}>Single-date export, grouped by department. The file is sent to your chat with the bot (Telegram blocks in-app downloads).</p>
-			<input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+			<p className="muted" style={{ marginTop: 0 }}>
+				Single-date export, grouped by department. Sent to your chat with the bot — Excel opens it directly.
+				Limited to the last 5 days (older data is pruned).
+			</p>
+			<input type="date" value={date} min={minIso} max={maxIso} onChange={(e) => setDate(e.target.value)} />
 			<button className="btn" disabled={busy} onClick={exportCsv}>
 				{busy ? 'Sending…' : `📤 Send CSV for ${date}`}
 			</button>

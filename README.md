@@ -35,8 +35,10 @@ Cron triggers (in `wrangler.jsonc`):
 | `*/5 * * * *` | every 5 min | drain `reminders` queue (sick 3h/6h/8h follow-ups) |
 | `0 13 * * *` | 21:00 prev day | nudge users with no AM entry for tomorrow (working days only) |
 | `30 21 * * *` | 05:30 same day | general parade-state nudge (reassures if already filled) |
-| `0 4 * * *` | 12:00 same day | PM parade-state nudge + daily nager.date holiday refresh |
-| `0 0 * * *` | 08:00 same day | ORD scan + parade-state pruning (> 5 days old) |
+| `30 23,5 * * *` | 07:30 / 13:30 same day | AM-empty / PM-empty flag to superior (working days only) — same expression fires twice; handler routes by scheduled hour |
+| `0 4 * * *` | 12:00 same day | PM parade-state nudge + nager.date holiday refresh + ORD scan + parade-state pruning |
+
+(Cloudflare free tier caps at 5 cron triggers per worker. The dual-fire `23,5` expression lets us hit both AM and PM late-flag times with a single trigger.)
 
 ---
 
