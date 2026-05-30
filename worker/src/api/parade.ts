@@ -329,8 +329,9 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const csvBody = rows
 			.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
 			.join('\n');
-		// UTF-8 BOM so Excel auto-detects encoding and renders headers/Asian
-		// characters correctly without "Import CSV" wizard friction.
+		// UTF-8 BOM so Excel auto-detects encoding and renders any non-ASCII
+		// characters correctly. (Note: Google Sheets shows the BOM as "ï»¿"
+		// gibberish in the first header cell — open the file in Excel.)
 		const csv = '﻿' + header + csvBody + '\n';
 
 		const sent = await tgSendDocument(
