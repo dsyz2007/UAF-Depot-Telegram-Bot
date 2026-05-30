@@ -3,8 +3,8 @@ import { PARADE_STATUSES, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage } from '../tg';
 import { isWorkingDay, sgtToday } from '../holidays';
 
-const AM_CUTOFF_MIN = 7 * 60 + 30; // 07:30 SGT
-const PM_CUTOFF_MIN = 13 * 60 + 30; // 13:30 SGT
+const AM_CUTOFF_MIN = 7 * 60; // 07:00 SGT
+const PM_CUTOFF_MIN = 13 * 60; // 13:00 SGT
 
 // SGT minutes-into-day (0..1439). Uses UTC + 8h offset (no DST in SG).
 function sgtMinutesIntoDay(): number {
@@ -163,12 +163,14 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const minutesNow = sgtMinutesIntoDay();
 		const todayIsWorking = await isWorkingDay(env, today);
 
-		// Split each (date, period) entry into either "apply now" or "pending
-		// superior approval". Approval is needed only when ALL of:
-		//   1. target date is today (SGT)
-		//   2. today is a working day
-		//   3. period AM and SGT time ≥ 07:30  OR  period PM and SGT time ≥ 13:30
-		// Future/past dates and non-working days apply immediately.
+		// Classify each (date, period) entry into one of three buckets:
+		//   • on-time / future / non-working / past  → apply immediately
+		//   • LATE + status 'Present'                 → apply immediately, but
+		//       send an FYI to the superior (no approval needed)
+		//   • LATE + status ≠ 'Present'               → stage as pending change
+		//       request; superior must approve before it applies
+		// "Late" = target date is today (SGT) on a working day AND
+		//   AM submitted at/after 07:00  OR  PM submitted at/after 13:00.
 		const directOps: ReturnType<typeof env.depot_db.prepare>[] = [];
 		const upsertStmt = env.depot_db.prepare(
 			`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
@@ -177,6 +179,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 		);
 		const pendingPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
+		const lateInformPayloads: { date: string; period: 'AM' | 'PM'; status: string }[] = [];
 
 		for (const d of dates) {
 			for (const e of clean) {
@@ -185,10 +188,13 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					d === today &&
 					((e.period === 'AM' && minutesNow >= AM_CUTOFF_MIN) ||
 						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
-				if (isLate) {
+				if (isLate && e.status !== 'Present') {
+					// Needs superior approval.
 					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
 				} else {
+					// Apply now. If late but Present, also FYI the superior.
 					directOps.push(upsertStmt.bind(user.id, d, e.period, e.status, e.reason));
+					if (isLate) lateInformPayloads.push({ date: d, period: e.period, status: e.status });
 				}
 			}
 		}
@@ -197,10 +203,22 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			await env.depot_db.batch(directOps);
 		}
 
+		const superiorTid = user.superior_telegram_id ?? (await firstAdminTidForParade(env));
+
+		// FYI DMs for late "Present" submissions — informational, no buttons.
+		if (superiorTid) {
+			for (const li of lateInformPayloads) {
+				const cutoff = li.period === 'AM' ? '07:00' : '13:00';
+				await tgSendMessage(env.BOT_TOKEN, {
+					chat_id: superiorTid,
+					text: `ℹ️ ${user.full_name} submitted ${li.period} parade state late (after ${cutoff}) as Present — no action needed.`,
+				});
+			}
+		}
+
 		// Stage pending requests — supersede any previous pending for the same
 		// (user, date, period) so the superior only ever sees the latest one.
 		const pendingIds: number[] = [];
-		const superiorTid = user.superior_telegram_id ?? (await firstAdminTidForParade(env));
 		for (const p of pendingPayloads) {
 			await env.depot_db
 				.prepare(
@@ -222,7 +240,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			pendingIds.push(ins.id);
 
 			if (superiorTid) {
-				const cutoff = p.period === 'AM' ? '07:30' : '13:30';
+				const cutoff = p.period === 'AM' ? '07:00' : '13:00';
 				const msg = await tgSendMessage(env.BOT_TOKEN, {
 					chat_id: superiorTid,
 					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,

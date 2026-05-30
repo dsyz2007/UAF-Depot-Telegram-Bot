@@ -35,10 +35,10 @@ Cron triggers (in `wrangler.jsonc`):
 | `*/5 * * * *` | every 5 min | drain `reminders` queue (sick 3h/6h/8h follow-ups) |
 | `0 13 * * *` | 21:00 prev day | nudge users with no AM entry for tomorrow (working days only) |
 | `30 21 * * *` | 05:30 same day | general parade-state nudge (reassures if already filled) |
-| `30 23,5 * * *` | 07:30 / 13:30 same day | AM-empty / PM-empty flag to superior (working days only) — same expression fires twice; handler routes by scheduled hour |
+| `0 5,23 * * *` | 07:00 / 13:00 same day | AM-empty / PM-empty flag to superior (working days only) — same expression fires twice; handler routes by scheduled hour |
 | `0 4 * * *` | 12:00 same day | PM parade-state nudge + nager.date holiday refresh + ORD scan + parade-state pruning |
 
-(Cloudflare free tier caps at 5 cron triggers per worker. The dual-fire `23,5` expression lets us hit both AM and PM late-flag times with a single trigger.)
+(Cloudflare free tier caps at 5 cron triggers per worker. The dual-fire `0 5,23` expression hits both AM and PM late-flag times with a single trigger.)
 
 ---
 
@@ -60,8 +60,9 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 |---|---|
 | 📊 Today | Visible. Shows: who's on approved off today, all open sick cases, pending off approvals, pending sick approvals. |
 | 📅 Off | **Credit Off(s)** modal now offers a "Recipient" dropdown to credit one of their direct reports (still requires that staff's superior to approve). Can **↩ Revert** approvals they previously gave (credits refund automatically). |
+| 🪖 Parade | **Export CSV** for a single date (grouped by department, limited to the last 5 days) — file is delivered into your Telegram chat with the bot. Same capability as superadmin. |
 | ⚙ Admin | Visible. **Users**: edit name / department / STG sub-department / superior / ORD date / personnel type (NSF, NSF Officer, or Regular) for any user. **Overrides**: read-only view of working-day overrides. **Holidays**: read-only view of confirmed/pending public holidays. |
-| (Telegram DMs) | Receives approval DMs with inline `[Approve] / [Reject]` buttons for: off requests from direct reports, off-credit grant proposals where they are the recipient's superior, sick reports from direct reports. |
+| (Telegram DMs) | Receives approval DMs with inline `[Approve] / [Reject]` buttons for: off requests from direct reports, off-credit grant proposals where they are the recipient's superior, sick reports from direct reports, and late parade-state change requests from direct reports. |
 
 Restriction: admins cannot grant the `superadmin` role; cannot delete users; cannot revert someone else's approval (only their own).
 
@@ -73,8 +74,113 @@ Restriction: admins cannot grant the `superadmin` role; cannot delete users; can
 | ⚙ Admin → Users | Can promote to `superadmin`. Can **🗑 Delete user** (irreversible). |
 | ⚙ Admin → Overrides | Can `+ Add override` (force a date to working or non-working) and remove existing overrides. |
 | ⚙ Admin → Holidays | Can **🔄 Force refresh now** (re-fetches nager.date and stages a confirm flow), **✅ Confirm / ❌ Reject** pending holiday changes, **+ Add holiday** manually (e.g. ad-hoc Polling Day), and **Remove** confirmed holidays. |
-| 🪖 Parade | **Export CSV** for a single date (grouped by department) — file is delivered into your Telegram chat with the bot. |
+| 🪖 Parade | Same single-date **Export CSV** as admin (no extra parade powers beyond admin). |
 | (Telegram DMs) | Receives **ORD reminders** at T-30 days and on-the-day (the day-of message includes a 🗑 Delete user button). Receives **public-holiday change** notifications from the daily nager.date diff, with `[Confirm] / [Reject] / [Treat as working day]` inline buttons. |
+
+---
+
+## Bot message catalog
+
+Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline button; buttons labelled "Open … page" deep-link to `WEBAPP_URL?tab=parade|sick|off`. "(edited)" means the original DM is rewritten in place by `editMessageText` so the buttons disappear once acted on.
+
+### Onboarding (`/start`)
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| First contact (no DB row) | the user | `Welcome to the depot bot. Your account is pending — an admin will assign your name and role shortly.` | — |
+| `/start` while still `PENDING:` | the user | `Your account is still pending admin approval. Please wait.` | — |
+| `/start` when registered | the user | `Welcome back, {full_name}.` + open-app hint | `[🚀 Open Depot App]` |
+| Any other DM message | the user | `Tap the button below to open the depot app.` | `[🚀 Open Depot App]` |
+
+### Off request
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| User submits off request | superior | `🟡 Off request` / `{name}: {start} → {end} (N day[s])` / `Balance after approval: {bal}` / `Reason: {reason}` | `[✅ Approve] [❌ Reject]` `[📅 Open Off page]` |
+| Approve (edited) | superior's DM | `✅ {name}'s off ({start} → {end}, N day[s]) — approved by {superior}.` | — |
+| Reject (edited) | superior's DM | `❌ {name}'s off ({start} → {end}) — rejected by {superior}.` | — |
+| Approve result | requester | `✅ Your off ({start} → {end}) approved by {superior}.` / `🪙 N credit(s) used. Balance: M.` | — |
+| Reject result | requester | `❌ Your off request ({start} → {end}) has been rejected by {superior}.` | — |
+| User cancels pending | superior | `🚫 {name} cancelled their off request ({start} → {end}).` | — |
+| Admin/superadmin reverts | requester + original approver | `↩ Approval reverted by {actor}: off {start} → {end} for {name}. N credit(s) refunded.` | — |
+
+### Off-credit grant
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| Self/admin proposes credits | recipient's superior | `🪙 Off-credit request` / `{granter} → {recipient}: N day(s)` (or `{recipient} (self-credit): …`) / `Reason: {reason}` | `[✅ Approve] [❌ Reject]` |
+| Proposal notice (if recipient ≠ granter ≠ approver) | recipient | `🪙 {granter} proposed crediting you N off day(s) — pending superior approval. Reason: {reason}` | — |
+| Approve (edited) | superior's DM | `✅ Off-credit request approved by {approver}: +N day(s) to {recipient}. Balance: M.` | — |
+| Reject (edited) | superior's DM | `❌ Off-credit request rejected by {approver}: {recipient} (N day[s]).` | — |
+| Approve → recipient | recipient | `🪙 Off-credit request approved by {approver}: +N day(s). Balance: M.` / `Reason: {reason}` | — |
+| Approve → granter | granter | `✅ {approver} approved the off-credit for {recipient}: +N day(s).` | — |
+| Reject → recipient | recipient | `❌ Your off-credit request (N day[s]) was rejected by {approver}.` | — |
+| Reject → granter | granter | `❌ Your off-credit request for {recipient} (N day[s]) was rejected by {approver}.` | — |
+
+### Sick (RSI / RSO)
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| User reports sick | superior | `🟡 {case_type} request from {name}.` | `[✅ Approve] [❌ Reject]` |
+| Approve (edited) | superior's DM | `✅ {name}'s {case_type} approved by {superior}.` | — |
+| Reject (edited) | superior's DM | `❌ {name}'s {case_type} request was rejected by {superior}.` | — |
+| Approve → personnel | personnel | `✅ Your {case_type} request was approved by {superior}.` / `Once seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
+| Reject → personnel | personnel | `❌ Your {case_type} request has been rejected by {superior}.` | — |
+| +3h, status unset | personnel | `⏰ Update your {case_type} status (MC days, dates, medicine) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
+| +6h, status unset | personnel | `⏰ Second reminder: your {case_type} status is still unset — update in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
+| +8h, status unset | superior | `🚩 {name} has not updated their {case_type} status after 8h.` | — |
+| User cancels pending | superior | `🚫 {name} cancelled their {case_type} request.` | — |
+| Personnel updates status | approving superior | `✅ {name} updated their {case_type}: {summary}` | — |
+| Admin/superadmin reverts | requester + approver | `↩ {case_type} approval reverted by {actor} for {name}.` | — |
+
+### Parade-state reminders & flags (working days only)
+
+| Trigger (SGT) | Recipient | Message | Buttons |
+|---|---|---|---|
+| 21:00 prev day, tomorrow AM empty | each missing user | `📋 Submit tomorrow's AM parade state ({date}) in Depot App → 🪖 Parade. Editable anytime before 7am.` | `[🪖 Open Parade page]` |
+| 05:30 same day | every user | `☀ Today ({date}) parade state:` / `  AM: {status or "— not set —"}` / `  PM: {status or "— not set —"}` / `Update in Depot App → 🪖 Parade if anything's changed. Otherwise ignore this.` | `[🪖 Open Parade page]` |
+| 12:00, PM filled | every user | `🕛 Today's PM is "{pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.` | `[🪖 Open Parade page]` |
+| 12:00, PM not filled | every user | `🕛 Today's PM parade state is not set. Update in Depot App → 🪖 Parade.` | `[🪖 Open Parade page]` |
+| 07:00, AM still empty | each missing user's superior (one consolidated DM) | `🚩 AM parade state still unknown at 07:00 ({date}):` / `• {Name}` … | — |
+| 13:00, PM still empty | each missing user's superior (one consolidated DM) | `🚩 PM parade state still unknown at 13:00 ({date}):` / `• {Name}` … | — |
+
+### Parade late-change approval
+
+Edit-lock cutoffs: today's AM after **07:00**, today's PM after **13:00** (working days only). A late submission of **Present applies immediately** (superior just gets an FYI). A late submission of **any non-Present status needs superior approval** before it applies.
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| Late submit, status = **Present** | superior | `ℹ️ {name} submitted {period} parade state late (after {cutoff}) as Present — no action needed.` | — |
+| Late submit, status ≠ **Present** | superior | `🟡 Late {period} parade-state change (after {cutoff})` / `{name}: {date} → {new_status}` / `Reason: {reason}` | `[✅ Approve] [❌ Reject]` |
+| Approve (edited) | superior's DM | `✅ Late {period} change approved by {approver}: {name} on {date} → {new_status}.` | — |
+| Reject (edited) | superior's DM | `❌ Late {period} change rejected by {approver}: {name} on {date} → {new_status}.` | — |
+| Approve → user | user | `✅ Your late {period} change for {date} ({new_status}) was approved by {approver}.` | `[🪖 Open Parade page]` |
+| Reject → user | user | `❌ Your late {period} change for {date} ({new_status}) was rejected by {approver}.` | — |
+
+### Public-holiday diffs (daily 12:00 SGT + on-demand)
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| nager.date diff has ≥1 change | each superadmin | `🇸🇬 Public-holiday updates (nager.date)` + summary list + `Review each change individually below:` | — |
+| One follow-up per change | each superadmin | `🆕 NEW holiday` / `✏ CHANGED` / `❌ REMOVED` + `{date} — {name}` | `[✅ Confirm] [❌ Reject]` `[🛠 Treat as working day]` |
+| Confirm (edited) | superadmin's DM | `✅ Holiday confirmed: {date} — {name}` (or `❌ Holiday removed: …`) / `By {superadmin}.` | — |
+| Reject (edited) | superadmin's DM | `❌ Rejected: {date}` / `By {superadmin}.` | — |
+| Treat as working day (edited) | superadmin's DM | `🛠 {date} marked WORKING (overrides holiday: {name})` / `By {superadmin}.` | — |
+
+### ORD reminders (daily 12:00 SGT)
+
+| Trigger | Recipient | Message | Buttons |
+|---|---|---|---|
+| User with `ord_date = today + 30 days` | every superadmin | `⏳ ORD heads-up (30 days): {name} ORDs on {ord_date}.` | — |
+| User with `ord_date = today` | every superadmin | `🎉 ORD today: {name}. Use the button below to remove from the depot bot.` | `[🗑 Delete user]` |
+| Delete tapped (edited) | superadmin's DM | `🗑 {name} removed from depot bot (by {actor}).` | — |
+| After deletion | other superadmins | `🗑 {actor} removed {name} from the depot bot.` | — |
+
+### CSV export
+
+| Trigger | Recipient | Delivery |
+|---|---|---|
+| Admin/superadmin taps **📤 Send CSV** | the requester | A Telegram **document** (`parade-state_{date}.csv`) with caption `📄 Parade state for {date} (N entries)` |
 
 ---
 
@@ -396,7 +502,7 @@ Always apply in numeric order on both local and remote.
 | `004_personnel_type_subdept_status_remap.sql` | `users.personnel_type`, `users.sub_department`, remap legacy parade statuses (`Off → OFF`, `Leave → LL`, `Overseas Leave → OL`, `Attached-Out → AO`) |
 | `005_rename_dsp_to_stg.sql` | Rename `users.department` value `DSP → STG` (the section was always called STG in the report; the dept enum now matches) |
 | `006_indexes.sql` | Add missing read-path indexes: `idx_sick_user_status`, `idx_sick_status`, `idx_off_status_enddate`, `idx_reminders_related`, partial `idx_users_ord_date`. Pure CREATE INDEX IF NOT EXISTS — safe to re-run. |
-| `007_parade_change_requests.sql` | New `parade_change_requests` table + `idx_parade_change_user`. Backs the late-submission approval flow — today's AM after 07:30 SGT and today's PM after 13:30 SGT are staged here instead of applied directly, pending superior approval via inline Telegram buttons. |
+| `007_parade_change_requests.sql` | New `parade_change_requests` table + `idx_parade_change_user`. Backs the late-submission approval flow — today's AM after 07:00 SGT / PM after 13:00 SGT, for non-Present statuses, are staged here pending superior approval. (Late Present applies immediately with an FYI to the superior.) |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

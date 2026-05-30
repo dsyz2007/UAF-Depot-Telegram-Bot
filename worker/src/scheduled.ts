@@ -1,11 +1,11 @@
 // Cron dispatcher. Wired via wrangler.jsonc triggers.crons.
 //
 // Cloudflare free tier caps us at 5 cron triggers. Schedule:
-//   */5 * * * *    → every 5 min        drain reminders queue
-//   0 13 * * *     → 21:00 prev day      AM-empty nudge for tomorrow (if working day)
-//   30 21 * * *    → 05:30 same day      AM update nudge (everyone, with reassurance)
-//   30 23,5 * * *  → 07:30 / 13:30 SGT   AM-empty / PM-empty flag → superior
-//   0 4 * * *      → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
+//   */5 * * * *      → every 5 min        drain reminders queue
+//   0 13 * * *       → 21:00 prev day      AM-empty nudge for tomorrow (if working day)
+//   30 21 * * *      → 05:30 same day      AM update nudge (everyone, with reassurance)
+//   0 5,23 * * *     → 07:00 SGT (23:00 UTC, AM flag) and 13:00 SGT (05:00 UTC, PM flag)
+//   0 4 * * *        → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
 
 import { tgSendMessage } from './tg';
 import { isWorkingDay, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
@@ -64,12 +64,13 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 				runParadePrune(env),
 			]);
 			return;
-		case '30 23,5 * * *': {
-			// Fires twice a day: 23:30 UTC (07:30 SGT, AM flag) and 05:30 UTC
-			// (13:30 SGT, PM flag). Use scheduledTime to tell them apart so a
-			// delayed fire still routes to the right handler.
-			const period: 'AM' | 'PM' =
-				new Date(event.scheduledTime).getUTCHours() === 23 ? 'AM' : 'PM';
+		case '0 5,23 * * *': {
+			// Fires twice a day — both at minute :00:
+			//   23:00 UTC = 07:00 SGT → AM flag
+			//   05:00 UTC = 13:00 SGT → PM flag
+			// One expression, two meaningful fires, no no-ops. Stays within the
+			// 5-cron cap. scheduledTime tells the two apart (survives delays).
+			const period: 'AM' | 'PM' = new Date(event.scheduledTime).getUTCHours() === 23 ? 'AM' : 'PM';
 			await flagPeriodMissing(env, period);
 			return;
 		}
@@ -245,7 +246,7 @@ function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: s
 // ──────────────────────────────────────────────────────────────────────────
 // 3. Daily maintenance pieces (08:00 SGT for ORD + prune; 12:00 SGT for holidays)
 // ──────────────────────────────────────────────────────────────────────────
-// 07:30 SGT (AM) and 13:30 SGT (PM): users whose status for that period is
+// 07:00 SGT (AM) and 13:00 SGT (PM): users whose status for that period is
 // still empty get their superior DM'd. Skip non-working days entirely.
 async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 	const today = sgtToday();
@@ -275,7 +276,7 @@ async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 		groups.set(r.superior_telegram_id, arr);
 	}
 
-	const cutoff = period === 'AM' ? '07:30' : '13:30';
+	const cutoff = period === 'AM' ? '07:00' : '13:00';
 	await Promise.allSettled(
 		[...groups.entries()].map(([tid, names]) =>
 			tgSendMessage(env.BOT_TOKEN, {

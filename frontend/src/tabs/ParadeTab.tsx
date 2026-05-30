@@ -515,9 +515,9 @@ function SubmitModal({
 			const range = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
 			let msg = `✅ ${parts}\nfor ${range}`;
 			if (res.pending > 0) {
-				// AM after 07:30 / PM after 13:30 on a working day → goes through
-				// superior approval first.
-				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:30 / PM after 13:30).`;
+				// Late non-Present change (today AM after 07:00 / PM after 13:00
+				// on a working day) → goes through superior approval first.
+				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:00 / PM after 13:00, non-Present only).`;
 			}
 			if (res.applied === 0 && res.pending === 0) {
 				msg = '⚠ Nothing saved.';
