@@ -11,7 +11,9 @@ interface OpenCase {
 	num_of_mc_days: number | null;
 	mc_start_date: string | null;
 	mc_end_date: string | null;
-	medicine_prescribed: string | null;
+	location: string | null;
+	approx_time: string | null;
+	mc_file_id: string | null;
 	created_at: string;
 }
 
@@ -31,7 +33,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const row = await env.depot_db
 			.prepare(
 				`SELECT id, case_type, reportsick_status, approved_at, updated_status, updated_at,
-				        num_of_mc_days, mc_start_date, mc_end_date, medicine_prescribed, created_at
+				        num_of_mc_days, mc_start_date, mc_end_date, location, approx_time, mc_file_id, created_at
 				 FROM sick_cases
 				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','flagged')
 				 ORDER BY id DESC LIMIT 1`,
@@ -96,7 +98,8 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			num_of_mc_days?: number;
 			mc_start_date?: string | null;
 			mc_end_date?: string | null;
-			medicine_prescribed?: string | null;
+			location?: string | null;
+			approx_time?: string | null;
 		};
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		if (typeof body.num_of_mc_days !== 'number' || body.num_of_mc_days < 0) {
@@ -135,11 +138,15 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 
 		const startDate = body.num_of_mc_days >= 1 ? body.mc_start_date : null;
 		const endDate = body.num_of_mc_days >= 1 ? body.mc_end_date : null;
-		const medicine = body.medicine_prescribed?.trim() || null;
+		const location = body.location?.trim() || null;
+		const approxTime = body.approx_time?.trim() || null;
+		const extra = [location ? `loc: ${location}` : null, approxTime ? `time: ${approxTime}` : null]
+			.filter(Boolean)
+			.join(' · ');
 		const updatedStatusSummary =
 			body.num_of_mc_days >= 1
-				? `${body.num_of_mc_days} day(s) MC (${startDate} → ${endDate})${medicine ? ` · medicine: ${medicine}` : ''}`
-				: `No MC${medicine ? ` · medicine: ${medicine}` : ''}`;
+				? `${body.num_of_mc_days} day(s) MC (${startDate} → ${endDate})${extra ? ` · ${extra}` : ''}`
+				: `No MC${extra ? ` · ${extra}` : ''}`;
 
 		await env.depot_db
 			.prepare(
@@ -150,10 +157,11 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				   num_of_mc_days = ?,
 				   mc_start_date = ?,
 				   mc_end_date = ?,
-				   medicine_prescribed = ?
+				   location = ?,
+				   approx_time = ?
 				 WHERE id = ?`,
 			)
-			.bind(updatedStatusSummary, body.num_of_mc_days, startDate, endDate, medicine, row.id)
+			.bind(updatedStatusSummary, body.num_of_mc_days, startDate, endDate, location, approxTime, row.id)
 			.run();
 
 		await env.depot_db

@@ -56,7 +56,7 @@ export type ParadeStatus =
 	| 'OFF'
 	| 'LL'
 	| 'OL'
-	| 'Others';
+	| 'Leave (Others)';
 
 export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Present',
@@ -69,7 +69,7 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'OFF',
 	'LL',
 	'OL',
-	'Others',
+	'Leave (Others)',
 ];
 
 // Long-form labels for the legend / dropdown tooltips.
@@ -84,7 +84,7 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	OFF: 'OFF',
 	LL: 'LL (Local Leave)',
 	OL: 'OL (Overseas Leave)',
-	Others: 'Others',
+	'Leave (Others)': 'Leave (Others)',
 };
 
 export function dayCountInclusive(startdate: string, enddate: string): number {

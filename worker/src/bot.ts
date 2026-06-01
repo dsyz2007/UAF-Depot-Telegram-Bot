@@ -11,6 +11,7 @@ import { registerSickCallbacks } from './handlers/sick-callbacks';
 import { registerUserCallbacks } from './handlers/user-callbacks';
 import { registerHolidayCallbacks } from './handlers/holiday-callbacks';
 import { registerParadeChangeCallbacks } from './handlers/parade-change-callbacks';
+import { registerMcUpload } from './handlers/mc-upload';
 import { webAppKeyboard } from './keyboards';
 
 // Module-scope cache for the bot's identity. grammy normally calls Telegram's
@@ -43,6 +44,9 @@ export function createBot(env: Env): Bot {
 	registerUserCallbacks(bot, env);
 	registerHolidayCallbacks(bot, env);
 	registerParadeChangeCallbacks(bot, env);
+	// MC photo/document uploads — must register before the catch-all so a media
+	// message attaches to a sick case instead of getting the generic reply.
+	registerMcUpload(bot, env);
 
 	// Fallback: any other message → re-show the WebApp button.
 	bot.on('message', async (ctx) => {

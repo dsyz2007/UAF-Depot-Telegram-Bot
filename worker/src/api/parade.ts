@@ -149,7 +149,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				return json({ error: 'bad_status' }, { status: 400 });
 			}
 			const reason = e.reason?.trim() || null;
-			if ((e.status as ParadeStatus) === 'Others' && !reason) {
+			if ((e.status as ParadeStatus) === 'Leave (Others)' && !reason) {
 				return json({ error: 'reason_required_for_others', period: e.period }, { status: 400 });
 			}
 			clean.push({ period: e.period, status: e.status, reason });

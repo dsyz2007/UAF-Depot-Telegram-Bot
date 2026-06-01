@@ -6,7 +6,7 @@ Built on Cloudflare Workers + D1 + React. Completely Free tier for all.
 Three core features today:
 
 1. **Off Tracker** — credit-based off-day system. Users (or admins on their behalf) propose off credits → superior approves → credits become spendable on actual off requests (start/end dates), with another superior approval step.
-2. **Report Sick (RSI / RSO)** — user reports → superior approves → structured MC update (days + dates + medicine) → escalation reminder if not updated in time.
+2. **Report Sick (RSI / RSO)** — user reports → superior approves → structured MC update (days + dates + location + approximate time) → escalation reminder if not updated in time. MC document is attached by sending the photo/PDF to the bot (stored as a Telegram file_id, auto-forwarded to the superior).
 3. **Parade State** — per-user, per-day, per-period (AM + PM) status calendar with admin/superadmin CSV export. Auto-nudges 9pm prev day / 5:30am / 12:00 noon SGT on working days only.
 
 Two helper features:
@@ -52,7 +52,7 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 |---|---|
 | 🪖 Parade | Submit/edit own AM and/or PM parade status for any date range (default today, single day; range optional). View the month calendar with their own AM/PM chips. View everyone's submitted entries for the selected day. |
 | 📅 Off | See their own off-credit balance. Request an off (start/end + reason). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). View everyone's approved-off count + per-user detail. |
-| 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; optional medicine). |
+| 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; plus Location and Approximate Time). Attach the MC by sending the photo/PDF directly to the bot in chat. |
 
 ### admin (everything `user` can do, plus)
 
@@ -124,14 +124,17 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 | User reports sick | superior | `🟡 {case_type} request from {name}.` | `[✅ Approve] [❌ Reject]` |
 | Approve (edited) | superior's DM | `✅ {name}'s {case_type} approved by {superior}.` | — |
 | Reject (edited) | superior's DM | `❌ {name}'s {case_type} request was rejected by {superior}.` | — |
-| Approve → personnel | personnel | `✅ Your {case_type} request was approved by {superior}.` / `Once seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
+| Approve → personnel | personnel | `✅ Your {case_type} request was approved by {superior}.` / `Once seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
 | Reject → personnel | personnel | `❌ Your {case_type} request has been rejected by {superior}.` | — |
-| +3h, status unset | personnel | `⏰ Update your {case_type} status (MC days, dates, medicine) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
+| +3h, status unset | personnel | `⏰ Update your {case_type} status (MC days, dates, location, time) in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
 | +6h, status unset | personnel | `⏰ Second reminder: your {case_type} status is still unset — update in Depot App → 🤒 Sick.` | `[🤒 Open Sick page]` |
 | +8h, status unset | superior | `🚩 {name} has not updated their {case_type} status after 8h.` | — |
 | User cancels pending | superior | `🚫 {name} cancelled their {case_type} request.` | — |
-| Personnel updates status | approving superior | `✅ {name} updated their {case_type}: {summary}` | — |
+| Personnel updates status | approving superior | `✅ {name} updated their {case_type}: {summary}` (summary includes MC days/dates + `loc:` / `time:` when given) | — |
 | Admin/superadmin reverts | requester + approver | `↩ {case_type} approval reverted by {actor} for {name}.` | — |
+| Personnel sends photo/PDF to the bot | the uploader | `📎 MC received and attached to your {case_type} case.` | — |
+| …with no active case | the uploader | `No active RSI/RSO case to attach this to. Report sick in the depot app first.` | — |
+| MC attached, superior is distinct | superior | the original photo/PDF, copied, captioned `📎 MC from {name} ({case_type}).` | — |
 
 ### Parade-state reminders & flags (working days only)
 
@@ -503,6 +506,8 @@ Always apply in numeric order on both local and remote.
 | `005_rename_dsp_to_stg.sql` | Rename `users.department` value `DSP → STG` (the section was always called STG in the report; the dept enum now matches) |
 | `006_indexes.sql` | Add missing read-path indexes: `idx_sick_user_status`, `idx_sick_status`, `idx_off_status_enddate`, `idx_reminders_related`, partial `idx_users_ord_date`. Pure CREATE INDEX IF NOT EXISTS — safe to re-run. |
 | `007_parade_change_requests.sql` | New `parade_change_requests` table + `idx_parade_change_user`. Backs the late-submission approval flow — today's AM after 07:00 SGT / PM after 13:00 SGT, for non-Present statuses, are staged here pending superior approval. (Late Present applies immediately with an FYI to the superior.) |
+| `008_mc_file_and_location.sql` | Adds `sick_cases.mc_file_id` + `mc_file_type` (Telegram MC attachment reference — bytes stay on Telegram) and `location` + `approx_time` (replace the old medicine field in the update form; `medicine_prescribed` column left unused). |
+| `009_rename_others_status.sql` | Remap parade status value `Others → Leave (Others)` in `parade_state_entries` and pending `parade_change_requests`. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

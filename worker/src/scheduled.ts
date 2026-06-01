@@ -11,17 +11,20 @@ import { tgSendMessage } from './tg';
 import { isWorkingDay, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
 
 // Inline keyboard with a single WebApp button that deep-links to a tab.
-function webAppButton(env: Env, tab: 'parade' | 'sick' | 'off'): {
-	inline_keyboard: { text: string; web_app: { url: string } }[][];
-} {
+// Optional `date` (YYYY-MM-DD) pre-selects that date on the Parade calendar —
+// used by the 9pm reminder so the button lands on tomorrow, not today.
+function webAppButton(
+	env: Env,
+	tab: 'parade' | 'sick' | 'off',
+	date?: string,
+): { inline_keyboard: { text: string; web_app: { url: string } }[][] } {
 	const labels: Record<'parade' | 'sick' | 'off', string> = {
 		parade: '🪖 Open Parade page',
 		sick: '🤒 Open Sick page',
 		off: '📅 Open Off page',
 	};
-	return {
-		inline_keyboard: [[{ text: labels[tab], web_app: { url: `${env.WEBAPP_URL}?tab=${tab}` } }]],
-	};
+	const url = date ? `${env.WEBAPP_URL}?tab=${tab}&date=${date}` : `${env.WEBAPP_URL}?tab=${tab}`;
+	return { inline_keyboard: [[{ text: labels[tab], web_app: { url } }]] };
 }
 
 interface DueRow {
@@ -210,7 +213,9 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 		tgSendMessage(env.BOT_TOKEN, {
 			chat_id: e.user.telegram_id,
 			text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
-			reply_markup: webAppButton(env, 'parade'),
+			// Deep-link the calendar to the exact date this reminder is about
+			// (tomorrow for the 9pm nudge, today for the others).
+			reply_markup: webAppButton(env, 'parade', targetDate),
 		}),
 	);
 	await Promise.allSettled(sends);

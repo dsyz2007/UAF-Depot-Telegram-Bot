@@ -12,7 +12,9 @@ interface OpenCase {
 	num_of_mc_days: number | null;
 	mc_start_date: string | null;
 	mc_end_date: string | null;
-	medicine_prescribed: string | null;
+	location: string | null;
+	approx_time: string | null;
+	mc_file_id: string | null;
 	created_at: string;
 }
 
@@ -23,7 +25,8 @@ export function SickTab(_: { me: Me }) {
 	const [mcDays, setMcDays] = useState<number | ''>('');
 	const [startDate, setStartDate] = useState('');
 	const [endDate, setEndDate] = useState('');
-	const [medicine, setMedicine] = useState('');
+	const [location, setLocation] = useState('');
+	const [approxTime, setApproxTime] = useState('');
 
 	function refresh() {
 		setLoadError(null);
@@ -86,12 +89,14 @@ export function SickTab(_: { me: Me }) {
 				num_of_mc_days: Number(mcDays),
 				mc_start_date: mcDays >= 1 ? startDate : null,
 				mc_end_date: mcDays >= 1 ? endDate : null,
-				medicine_prescribed: medicine.trim() || null,
+				location: location.trim() || null,
+				approx_time: approxTime.trim() || null,
 			});
 			setMcDays('');
 			setStartDate('');
 			setEndDate('');
-			setMedicine('');
+			setLocation('');
+			setApproxTime('');
 			await refresh();
 			WebApp.showAlert('Update sent.');
 		} catch (e) {
@@ -171,16 +176,27 @@ export function SickTab(_: { me: Me }) {
 						</>
 					)}
 					<label>
-						Medicine prescribed (if any)
-						<textarea
-							value={medicine}
-							onChange={(e) => setMedicine(e.target.value)}
-							placeholder="e.g. Paracetamol 500mg, Lozenges"
+						Location
+						<input
+							value={location}
+							onChange={(e) => setLocation(e.target.value)}
+							placeholder="e.g. Khatib Medical Centre"
+						/>
+					</label>
+					<label>
+						Approximate Time
+						<input
+							value={approxTime}
+							onChange={(e) => setApproxTime(e.target.value)}
+							placeholder="e.g. 0930"
 						/>
 					</label>
 					<button className="btn" disabled={busy || mcDays === ''} onClick={submitUpdate}>
 						{busy ? 'Saving…' : 'Submit update'}
 					</button>
+					<p className="muted" style={{ marginTop: 8 }}>
+						📎 To attach your MC, send the photo or PDF directly to this bot in the chat. It auto-forwards to your superior.
+					</p>
 				</>
 			)}
 		</div>

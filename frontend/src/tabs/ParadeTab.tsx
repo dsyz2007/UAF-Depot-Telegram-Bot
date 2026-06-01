@@ -48,7 +48,7 @@ function renderStatusCell(entry: { parade_status: string | null; reason: string 
 	);
 }
 
-const STATUSES = ['Present', 'Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Others'] as const;
+const STATUSES = ['Present', 'Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Leave (Others)'] as const;
 type Status = (typeof STATUSES)[number];
 
 const STATUS_LABELS: Record<Status, string> = {
@@ -62,7 +62,7 @@ const STATUS_LABELS: Record<Status, string> = {
 	OFF: 'OFF',
 	LL: 'LL (Local Leave)',
 	OL: 'OL (Overseas Leave)',
-	Others: 'Others',
+	'Leave (Others)': 'Leave (Others)',
 };
 
 const COLORS: Record<string, string> = {
@@ -76,7 +76,7 @@ const COLORS: Record<string, string> = {
 	OFF: '#9e9e9e',
 	LL: '#03a9f4',
 	OL: '#00897b',
-	Others: '#9c27b0',
+	'Leave (Others)': '#9c27b0',
 };
 
 // IMPORTANT: use local-time components, NOT toISOString — DayPicker gives us
@@ -118,7 +118,7 @@ function periodByTimeSgt(): 'AM' | 'PM' {
 }
 
 // All non-Present statuses, in the order the report lists them.
-const NON_PRESENT_STATUSES = ['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Others'] as const;
+const NON_PRESENT_STATUSES = ['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Leave (Others)'] as const;
 
 function isNsfish(t: string | null): boolean {
 	return t === 'NSF' || t === 'NSF Officer';
@@ -215,16 +215,29 @@ function calendarBounds(): { start: Date; end: Date; minIso: string; maxIso: str
 	};
 }
 
+// Initial calendar date — honours ?date=YYYY-MM-DD from reminder deep-links
+// (e.g. the 9pm nudge points at tomorrow), clamped to the ±2-month window.
+// Falls back to today for anything missing / malformed / out of range.
+function initialDate(minIso: string, maxIso: string): Date {
+	const t = todayLocal();
+	const raw = new URLSearchParams(window.location.search).get('date');
+	if (raw && /^\d{4}-\d{2}-\d{2}$/.test(raw) && raw >= minIso && raw <= maxIso) {
+		const d = new Date(`${raw}T00:00:00`);
+		if (!Number.isNaN(d.getTime())) return d;
+	}
+	return t;
+}
+
 export function ParadeTab({ me }: { me: Me }) {
-	const [month, setMonth] = useState<Date>(todayLocal());
+	const bounds = useMemo(() => calendarBounds(), []);
+	const initial = useMemo(() => initialDate(bounds.minIso, bounds.maxIso), [bounds]);
+	const [month, setMonth] = useState<Date>(initial);
 	const [myMonthByDate, setMyMonthByDate] = useState<Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>>(new Map());
 	const [dayDetails, setDayDetails] = useState<Entry[]>([]);
 	const [loadError, setLoadError] = useState<string | null>(null);
-	const [selectedDate, setSelectedDate] = useState<Date>(todayLocal());
+	const [selectedDate, setSelectedDate] = useState<Date>(initial);
 	const [showSubmit, setShowSubmit] = useState(false);
 	const [copyModalText, setCopyModalText] = useState<string | null>(null);
-
-	const bounds = useMemo(() => calendarBounds(), []);
 
 	// Fetch only the current user's entries for the visible month (~60 rows max).
 	function refreshMyMonth() {
@@ -480,8 +493,8 @@ function SubmitModal({
 	const inRange = !!startdate && !!enddate && startdate >= minIso && enddate <= maxIso;
 	const amFilled = amStatus !== NONE;
 	const pmFilled = pmStatus !== NONE;
-	const amReasonOk = amStatus !== 'Others' || amReason.trim().length > 0;
-	const pmReasonOk = pmStatus !== 'Others' || pmReason.trim().length > 0;
+	const amReasonOk = amStatus !== 'Leave (Others)' || amReason.trim().length > 0;
+	const pmReasonOk = pmStatus !== 'Leave (Others)' || pmReason.trim().length > 0;
 	const atLeastOne = amFilled || pmFilled;
 	const canSave = datesValid && inRange && atLeastOne && amReasonOk && pmReasonOk;
 
@@ -547,8 +560,8 @@ function SubmitModal({
 					</label>
 					{amFilled && amStatus !== 'Present' && (
 						<label>
-							Reason {amStatus === 'Others' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
-							<input value={amReason} onChange={(e) => setAmReason(e.target.value)} placeholder={amStatus === 'Others' ? 'Specify' : 'Optional'} />
+							Reason {amStatus === 'Leave (Others)' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
+							<input value={amReason} onChange={(e) => setAmReason(e.target.value)} placeholder={amStatus === 'Leave (Others)' ? 'Specify' : 'Optional'} />
 						</label>
 					)}
 				</div>
@@ -563,8 +576,8 @@ function SubmitModal({
 					</label>
 					{pmFilled && pmStatus !== 'Present' && (
 						<label>
-							Reason {pmStatus === 'Others' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
-							<input value={pmReason} onChange={(e) => setPmReason(e.target.value)} placeholder={pmStatus === 'Others' ? 'Specify' : 'Optional'} />
+							Reason {pmStatus === 'Leave (Others)' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
+							<input value={pmReason} onChange={(e) => setPmReason(e.target.value)} placeholder={pmStatus === 'Leave (Others)' ? 'Specify' : 'Optional'} />
 						</label>
 					)}
 				</div>
