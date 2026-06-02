@@ -18,7 +18,8 @@ interface OpenCase {
 	created_at: string;
 }
 
-export function SickTab(_: { me: Me }) {
+export function SickTab({ me }: { me: Me }) {
+	const selfManaged = !!me.superior_telegram_id && me.superior_telegram_id === me.telegram_id;
 	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
@@ -48,7 +49,11 @@ export function SickTab(_: { me: Me }) {
 		try {
 			await api.post('/api/sick/report', { case_type });
 			await refresh();
-			WebApp.showAlert(`${case_type} submitted — awaiting approval.`);
+			WebApp.showAlert(
+				selfManaged
+					? `${case_type} logged (no approval needed). Update your status below.`
+					: `${case_type} submitted — awaiting approval.`,
+			);
 		} catch (e) {
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {

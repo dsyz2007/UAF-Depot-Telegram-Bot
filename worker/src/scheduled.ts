@@ -228,7 +228,7 @@ function fmtStatus(s: string | null): string {
 function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: string | null): string {
 	switch (kind) {
 		case 'evening_prev_am':
-			return `📋 Submit tomorrow's AM parade state (${targetDate}) in Depot App → 🪖 Parade. Editable anytime before 7am.`;
+			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade by 2359hrs.`;
 		case 'morning_am': {
 			// Show user's actual current AM/PM so they know if any update is
 			// needed at a glance.
@@ -243,7 +243,7 @@ function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: s
 		}
 		case 'noon_pm':
 			return pm !== null
-				? `🕛 Today's PM is "${pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.`
+				? `🕛 Today's PM Status is labelled "${pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.`
 				: `🕛 Today's PM parade state is not set. Update in Depot App → 🪖 Parade.`;
 	}
 }

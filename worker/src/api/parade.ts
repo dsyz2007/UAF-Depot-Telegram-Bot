@@ -1,7 +1,9 @@
 import { json, type AuthedContext } from './router';
-import { PARADE_STATUSES, type ParadeStatus } from '../types';
+import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, isSelfManaged, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage } from '../tg';
-import { isWorkingDay, sgtToday } from '../holidays';
+import { isWorkingDay, sgtToday, dayOfWeekSgt } from '../holidays';
+
+const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
 const AM_CUTOFF_MIN = 7 * 60; // 07:00 SGT
 const PM_CUTOFF_MIN = 13 * 60; // 13:00 SGT
@@ -149,8 +151,8 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				return json({ error: 'bad_status' }, { status: 400 });
 			}
 			const reason = e.reason?.trim() || null;
-			if ((e.status as ParadeStatus) === 'Leave (Others)' && !reason) {
-				return json({ error: 'reason_required_for_others', period: e.period }, { status: 400 });
+			if (REASON_REQUIRED.has(e.status) && !reason) {
+				return json({ error: 'reason_required', status: e.status, period: e.period }, { status: 400 });
 			}
 			clean.push({ period: e.period, status: e.status, reason });
 		}
@@ -158,10 +160,37 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			return json({ error: 'no_period_filled' }, { status: 400 });
 		}
 
-		const dates = expandRange(body.startdate, body.enddate);
+		const allDates = expandRange(body.startdate, body.enddate);
+
+		// Skip weekend days (Sat/Sun) in the range — no parade state on weekends
+		// unless a working_day_override forces that specific day to working.
+		const weekendDates = allDates.filter((d) => {
+			const dow = dayOfWeekSgt(d);
+			return dow === 0 || dow === 6;
+		});
+		let forcedWorkingWeekends = new Set<string>();
+		if (weekendDates.length > 0) {
+			const placeholders = weekendDates.map(() => '?').join(',');
+			const { results } = await env.depot_db
+				.prepare(
+					`SELECT override_date FROM working_day_overrides
+					 WHERE is_working_day = 1 AND override_date IN (${placeholders})`,
+				)
+				.bind(...weekendDates)
+				.all<{ override_date: string }>();
+			forcedWorkingWeekends = new Set((results ?? []).map((r) => r.override_date));
+		}
+		const dates = allDates.filter((d) => {
+			const dow = dayOfWeekSgt(d);
+			const isWeekend = dow === 0 || dow === 6;
+			return !isWeekend || forcedWorkingWeekends.has(d);
+		});
+		const skippedWeekends = allDates.length - dates.length;
+
 		const today = sgtToday();
 		const minutesNow = sgtMinutesIntoDay();
-		const todayIsWorking = await isWorkingDay(env, today);
+		// Self-managed users bypass the late-change approval gate entirely.
+		const todayIsWorking = isSelfManaged(user) ? false : await isWorkingDay(env, today);
 
 		// Classify each (date, period) entry into one of three buckets:
 		//   • on-time / future / non-working / past  → apply immediately
@@ -268,6 +297,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			applied: directOps.length,
 			pending: pendingPayloads.length,
 			pending_ids: pendingIds,
+			skipped_weekends: skippedWeekends,
 		});
 	}
 

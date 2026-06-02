@@ -87,6 +87,23 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	'Leave (Others)': 'Leave (Others)',
 };
 
+// Statuses that require a reason when submitting parade state.
+export const REASON_REQUIRED_STATUSES: readonly ParadeStatus[] = [
+	'Course',
+	'AO',
+	'MA',
+	'MC',
+	'RSO',
+	'RSI',
+	'Leave (Others)',
+];
+
+// A user whose superior is themselves is "self-managed" — they bypass every
+// approval step (off requests, off credits, sick reports, late parade changes).
+export function isSelfManaged(u: { telegram_id: string; superior_telegram_id: string | null }): boolean {
+	return !!u.superior_telegram_id && u.superior_telegram_id === u.telegram_id;
+}
+
 export function dayCountInclusive(startdate: string, enddate: string): number {
 	const a = new Date(`${startdate}T00:00:00Z`).getTime();
 	const b = new Date(`${enddate}T00:00:00Z`).getTime();

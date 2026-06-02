@@ -1,6 +1,6 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
-import { dayCountInclusive } from '../types';
+import { dayCountInclusive, isSelfManaged } from '../types';
 
 interface SummaryRow {
 	id: number;
@@ -133,6 +133,22 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			);
 		}
 
+		// Self-managed users (superior == themselves) skip approval — the off
+		// is recorded as approved immediately and credits deducted.
+		if (isSelfManaged(user)) {
+			await env.depot_db.batch([
+				env.depot_db
+					.prepare(
+						`INSERT INTO off_requests
+						   (user_id, requested_by_user_id, startdate, enddate, reason, off_status, approved_by, approved_date)
+						 VALUES (?, ?, ?, ?, ?, 'approved', ?, datetime('now'))`,
+					)
+					.bind(user.id, user.id, body.startdate, body.enddate, body.reason.trim(), user.id),
+				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id),
+			]);
+			return json({ ok: true, auto_approved: true, days_requested: days, balance_after: user.off_credits - days });
+		}
+
 		const ins = await env.depot_db
 			.prepare(
 				`INSERT INTO off_requests
@@ -196,6 +212,31 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// Admins can credit only their direct reports; superadmins anyone; anyone can self-credit.
 		if (!isSelf && user.user_role === 'admin' && staff.superior_telegram_id !== user.telegram_id) {
 			return json({ error: 'not_your_staff' }, { status: 403 });
+		}
+
+		// If the recipient is self-managed (their superior is themselves), there's
+		// no distinct approver — add the credits immediately.
+		if (isSelfManaged(staff)) {
+			await env.depot_db.batch([
+				env.depot_db
+					.prepare(
+						`INSERT INTO off_credit_grants (user_id, granted_by, num_days, reason, status, superior_user_id, approved_at)
+						 VALUES (?, ?, ?, ?, 'approved', ?, datetime('now'))`,
+					)
+					.bind(staff.id, user.id, body.num_days, body.reason.trim(), staff.id),
+				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(body.num_days, staff.id),
+			]);
+			const bal = await env.depot_db
+				.prepare(`SELECT off_credits FROM users WHERE id = ?`)
+				.bind(staff.id)
+				.first<{ off_credits: number }>();
+			if (staff.telegram_id !== user.telegram_id) {
+				await tgSendMessage(env.BOT_TOKEN, {
+					chat_id: staff.telegram_id,
+					text: `🪙 ${user.full_name} credited you +${body.num_days} off day(s). Balance: ${bal?.off_credits ?? '?'}.`,
+				});
+			}
+			return json({ ok: true, auto_approved: true, balance: bal?.off_credits });
 		}
 
 		const ins = await env.depot_db

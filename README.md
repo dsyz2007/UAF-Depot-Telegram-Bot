@@ -50,7 +50,7 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 
 | Tab | What they can do |
 |---|---|
-| 🪖 Parade | Submit/edit own AM and/or PM parade status for any date range (default today, single day; range optional). View the month calendar with their own AM/PM chips. View everyone's submitted entries for the selected day. |
+| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others). View the month calendar with their own AM/PM chips, and everyone's entries (grouped by department) for the selected day. |
 | 📅 Off | See their own off-credit balance. Request an off (start/end + reason). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). View everyone's approved-off count + per-user detail. |
 | 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; plus Location and Approximate Time). Attach the MC by sending the photo/PDF directly to the bot in chat. |
 
@@ -65,6 +65,17 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 | (Telegram DMs) | Receives approval DMs with inline `[Approve] / [Reject]` buttons for: off requests from direct reports, off-credit grant proposals where they are the recipient's superior, sick reports from direct reports, and late parade-state change requests from direct reports. |
 
 Restriction: admins cannot grant the `superadmin` role; cannot delete users; cannot revert someone else's approval (only their own).
+
+### Self-managed users (superior = themselves)
+
+If a user's **Superior's Telegram ID equals their own telegram_id**, they are *self-managed* and bypass **every** approval step — there is no one above them to approve. Concretely:
+- **Off requests** auto-approve instantly (credits still deducted).
+- **Off credits** they grant to themselves are added instantly.
+- **RSI / RSO** is logged as approved immediately — no superior DM, no update reminders, no MC required.
+- **Late parade-state changes** (today AM after 07:00 / PM after 13:00) apply directly with no approval gate.
+- MC documents they send are stored but not forwarded (no distinct superior).
+
+Set this up by entering the user's own telegram_id as their Superior's Telegram ID in the Edit-user modal. Typically used for the most senior account(s).
 
 ### superadmin (everything `admin` can do, plus)
 
@@ -140,9 +151,9 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 
 | Trigger (SGT) | Recipient | Message | Buttons |
 |---|---|---|---|
-| 21:00 prev day, tomorrow AM empty | each missing user | `📋 Submit tomorrow's AM parade state ({date}) in Depot App → 🪖 Parade. Editable anytime before 7am.` | `[🪖 Open Parade page]` |
+| 21:00 prev day, tomorrow AM empty | each missing user | `📋 Submit tomorrow's parade state ({date}) in Depot App → 🪖 Parade by 2359hrs.` | `[🪖 Open Parade page]` |
 | 05:30 same day | every user | `☀ Today ({date}) parade state:` / `  AM: {status or "— not set —"}` / `  PM: {status or "— not set —"}` / `Update in Depot App → 🪖 Parade if anything's changed. Otherwise ignore this.` | `[🪖 Open Parade page]` |
-| 12:00, PM filled | every user | `🕛 Today's PM is "{pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.` | `[🪖 Open Parade page]` |
+| 12:00, PM filled | every user | `🕛 Today's PM Status is labelled "{pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.` | `[🪖 Open Parade page]` |
 | 12:00, PM not filled | every user | `🕛 Today's PM parade state is not set. Update in Depot App → 🪖 Parade.` | `[🪖 Open Parade page]` |
 | 07:00, AM still empty | each missing user's superior (one consolidated DM) | `🚩 AM parade state still unknown at 07:00 ({date}):` / `• {Name}` … | — |
 | 13:00, PM still empty | each missing user's superior (one consolidated DM) | `🚩 PM parade state still unknown at 13:00 ({date}):` / `• {Name}` … | — |
@@ -195,7 +206,7 @@ Edit-lock cutoffs: today's AM after **07:00**, today's PM after **13:00** (worki
 2. Users are grouped by department (DHQ, DMSP, DCS, STG — C1+C2, STG — C3+C4, Others, Unassigned). Pending users (those who only sent `/start` but haven't been set up) appear at the top.
 3. Tap a user row → the **Edit user** modal opens with these fields:
    - **Full name** — what shows everywhere
-   - **Personnel type** — `NSF` or `Regular` (renders as a small badge on the user row)
+   - **Personnel type** — `NSF` / `NSF Officer` / `Regular` (renders as a small badge on the user row)
    - **Department** — DHQ / DMSP / DCS / STG / Others
    - **STG sub-department** — only appears when Department = STG. Choose `C1+C2` or `C3+C4`
    - **Role** — `user` / `admin` / `superadmin` (superadmin option only shown if you are one)

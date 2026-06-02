@@ -1,5 +1,6 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
+import { isSelfManaged } from '../types';
 
 interface OpenCase {
 	id: number;
@@ -56,6 +57,21 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.bind(user.id)
 			.first<{ id: number }>();
 		if (open) return json({ error: 'already_open', id: open.id }, { status: 409 });
+
+		// Self-managed users skip the superior-approval step: the case is logged
+		// as approved immediately, no DM, no reminders, no MC requirement.
+		if (isSelfManaged(user)) {
+			const ins = await env.depot_db
+				.prepare(
+					`INSERT INTO sick_cases (user_id, case_type, reportsick_status, superior_user_id, approved_at)
+					 VALUES (?, ?, 'approved', ?, datetime('now'))
+					 RETURNING id`,
+				)
+				.bind(user.id, body.case_type, user.id)
+				.first<{ id: number }>();
+			if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
+			return json({ ok: true, id: ins.id, auto_approved: true });
+		}
 
 		const ins = await env.depot_db
 			.prepare(

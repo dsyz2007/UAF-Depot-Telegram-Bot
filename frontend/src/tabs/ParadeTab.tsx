@@ -71,7 +71,7 @@ const COLORS: Record<string, string> = {
 	AO: '#795548',
 	MA: '#26c6da',
 	MC: '#f44336',
-	RSO: '#e53935',
+	RSO: '#c62828',
 	RSI: '#c62828',
 	OFF: '#9e9e9e',
 	LL: '#03a9f4',
@@ -119,6 +119,9 @@ function periodByTimeSgt(): 'AM' | 'PM' {
 
 // All non-Present statuses, in the order the report lists them.
 const NON_PRESENT_STATUSES = ['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Leave (Others)'] as const;
+
+// Statuses that make the reason field compulsory in the submit modal.
+const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'Leave (Others)']);
 
 function isNsfish(t: string | null): boolean {
 	return t === 'NSF' || t === 'NSF Officer';
@@ -483,28 +486,52 @@ function SubmitModal({
 }) {
 	const [startdate, setStartdate] = useState(initialDate);
 	const [enddate, setEnddate] = useState(initialDate);
+	// 'fd' = full-day same status for both AM & PM; 'diff' = separate AM / PM.
+	const [mode, setMode] = useState<'fd' | 'diff'>('fd');
+	const [fdStatus, setFdStatus] = useState<Status | typeof NONE>(NONE);
+	const [fdReason, setFdReason] = useState('');
 	const [amStatus, setAmStatus] = useState<Status | typeof NONE>(NONE);
 	const [amReason, setAmReason] = useState('');
 	const [pmStatus, setPmStatus] = useState<Status | typeof NONE>(NONE);
 	const [pmReason, setPmReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
+	const reasonNeeded = (s: Status | typeof NONE) => s !== NONE && REASON_REQUIRED.has(s);
+
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
 	const inRange = !!startdate && !!enddate && startdate >= minIso && enddate <= maxIso;
-	const amFilled = amStatus !== NONE;
-	const pmFilled = pmStatus !== NONE;
-	const amReasonOk = amStatus !== 'Leave (Others)' || amReason.trim().length > 0;
-	const pmReasonOk = pmStatus !== 'Leave (Others)' || pmReason.trim().length > 0;
-	const atLeastOne = amFilled || pmFilled;
-	const canSave = datesValid && inRange && atLeastOne && amReasonOk && pmReasonOk;
+
+	// Build the period entries from whichever mode is active.
+	const entries: { period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
+	let reasonOk = true;
+	if (mode === 'fd') {
+		if (fdStatus !== NONE) {
+			const r = fdStatus === 'Present' ? null : fdReason.trim() || null;
+			if (reasonNeeded(fdStatus) && !r) reasonOk = false;
+			entries.push({ period: 'AM', status: fdStatus, reason: r });
+			entries.push({ period: 'PM', status: fdStatus, reason: r });
+		}
+	} else {
+		if (amStatus !== NONE) {
+			const r = amStatus === 'Present' ? null : amReason.trim() || null;
+			if (reasonNeeded(amStatus) && !r) reasonOk = false;
+			entries.push({ period: 'AM', status: amStatus, reason: r });
+		}
+		if (pmStatus !== NONE) {
+			const r = pmStatus === 'Present' ? null : pmReason.trim() || null;
+			if (reasonNeeded(pmStatus) && !r) reasonOk = false;
+			entries.push({ period: 'PM', status: pmStatus, reason: r });
+		}
+	}
+	const atLeastOne = entries.length > 0;
+	const canSave = datesValid && inRange && atLeastOne && reasonOk;
 
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
 	else if (!inRange) hint = `Dates must be within ${minIso} → ${maxIso} (±2 months from this month).`;
-	else if (!atLeastOne) hint = 'Set at least one of AM / PM status.';
-	else if (amFilled && !amReasonOk) hint = 'AM reason is required when AM status = Others.';
-	else if (pmFilled && !pmReasonOk) hint = 'PM reason is required when PM status = Others.';
+	else if (!atLeastOne) hint = mode === 'fd' ? 'Pick a status.' : 'Set at least one of AM / PM status.';
+	else if (!reasonOk) hint = 'A reason is required for that status.';
 
 	const dayCount = datesValid
 		? Math.floor(
@@ -514,26 +541,28 @@ function SubmitModal({
 
 	async function submit() {
 		if (!canSave) return;
-		const entries: { period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
-		// Present never carries a reason.
-		if (amFilled) entries.push({ period: 'AM', status: amStatus, reason: amStatus === 'Present' ? null : amReason.trim() || null });
-		if (pmFilled) entries.push({ period: 'PM', status: pmStatus, reason: pmStatus === 'Present' ? null : pmReason.trim() || null });
-
 		setBusy(true);
 		try {
-			const res = await api.post<{ applied: number; pending: number }>('/api/parade/submit', { startdate, enddate, entries });
+			const res = await api.post<{ applied: number; pending: number; skipped_weekends: number }>(
+				'/api/parade/submit',
+				{ startdate, enddate, entries },
+			);
 			await onDone();
 			onClose();
-			const parts = entries.map((e) => `${e.period}: ${e.status}`).join(' · ');
+			const parts =
+				mode === 'fd'
+					? `Full day: ${entries[0].status}`
+					: entries.map((e) => `${e.period}: ${e.status}`).join(' · ');
 			const range = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
 			let msg = `✅ ${parts}\nfor ${range}`;
 			if (res.pending > 0) {
-				// Late non-Present change (today AM after 07:00 / PM after 13:00
-				// on a working day) → goes through superior approval first.
 				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:00 / PM after 13:00, non-Present only).`;
 			}
+			if (res.skipped_weekends > 0) {
+				msg += `\n\n🟦 ${res.skipped_weekends} weekend day(s) skipped (no parade state on weekends).`;
+			}
 			if (res.applied === 0 && res.pending === 0) {
-				msg = '⚠ Nothing saved.';
+				msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were weekends.' : '⚠ Nothing saved.';
 			}
 			WebApp.showAlert(msg);
 		} catch (e) {
@@ -542,45 +571,69 @@ function SubmitModal({
 		}
 	}
 
+	const statusField = (
+		value: Status | typeof NONE,
+		setValue: (s: Status | typeof NONE) => void,
+		reason: string,
+		setReason: (s: string) => void,
+	) => (
+		<>
+			<label>Status
+				<select value={value} onChange={(e) => setValue(e.target.value as Status | typeof NONE)}>
+					<option value={NONE}>— leave unchanged —</option>
+					{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
+				</select>
+			</label>
+			{value !== NONE && value !== 'Present' && (
+				<label>
+					Reason {reasonNeeded(value) ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
+					<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder={reasonNeeded(value) ? 'Specify' : 'Optional'} />
+				</label>
+			)}
+		</>
+	);
+
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Submit / Edit Parade Status</h3>
 
-				<label>Start date<input type="date" value={startdate} min={minIso} max={maxIso} onChange={(e) => setStartdate(e.target.value)} /></label>
-				<label>End date<input type="date" value={enddate} min={minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
+				<label>Start date<input
+					type="date"
+					value={startdate}
+					min={minIso}
+					max={maxIso}
+					onChange={(e) => {
+						const v = e.target.value;
+						setStartdate(v);
+						// Snap end date to start if it's empty or now before start.
+						if (!enddate || enddate < v) setEnddate(v);
+					}}
+				/></label>
+				<label>End date<input type="date" value={enddate} min={startdate || minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
 
-				<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
-					<b>🌅 AM</b>
-					<label>Status
-						<select value={amStatus} onChange={(e) => setAmStatus(e.target.value as Status | typeof NONE)}>
-							<option value={NONE}>— leave unchanged —</option>
-							{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
-						</select>
-					</label>
-					{amFilled && amStatus !== 'Present' && (
-						<label>
-							Reason {amStatus === 'Leave (Others)' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
-							<input value={amReason} onChange={(e) => setAmReason(e.target.value)} placeholder={amStatus === 'Leave (Others)' ? 'Specify' : 'Optional'} />
-						</label>
-					)}
+				<div className="seg" style={{ marginBottom: 10 }}>
+					<button className={mode === 'fd' ? 'active' : ''} onClick={() => setMode('fd')}>FD Same Status</button>
+					<button className={mode === 'diff' ? 'active' : ''} onClick={() => setMode('diff')}>Diff AM, PM Status</button>
 				</div>
 
-				<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
-					<b>🌇 PM</b>
-					<label>Status
-						<select value={pmStatus} onChange={(e) => setPmStatus(e.target.value as Status | typeof NONE)}>
-							<option value={NONE}>— leave unchanged —</option>
-							{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
-						</select>
-					</label>
-					{pmFilled && pmStatus !== 'Present' && (
-						<label>
-							Reason {pmStatus === 'Leave (Others)' ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
-							<input value={pmReason} onChange={(e) => setPmReason(e.target.value)} placeholder={pmStatus === 'Leave (Others)' ? 'Specify' : 'Optional'} />
-						</label>
-					)}
-				</div>
+				{mode === 'fd' ? (
+					<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
+						<b>📅 Full Day (AM + PM)</b>
+						{statusField(fdStatus, setFdStatus, fdReason, setFdReason)}
+					</div>
+				) : (
+					<>
+						<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
+							<b>🌅 AM</b>
+							{statusField(amStatus, setAmStatus, amReason, setAmReason)}
+						</div>
+						<div className="card" style={{ background: 'var(--tg-theme-bg-color, #fff)', border: '1px solid var(--tg-theme-section-separator-color, #ddd)' }}>
+							<b>🌇 PM</b>
+							{statusField(pmStatus, setPmStatus, pmReason, setPmReason)}
+						</div>
+					</>
+				)}
 
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
 
