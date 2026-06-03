@@ -77,6 +77,14 @@ If a user's **Superior's Telegram ID equals their own telegram_id**, they are *s
 
 Set this up by entering the user's own telegram_id as their Superior's Telegram ID in the Edit-user modal. Typically used for the most senior account(s).
 
+### Approval routing & the no-superior fallback
+
+Every approvable request (off, off-credit, sick, late parade-state change) is routed to the requester's **superior** — the user whose telegram_id is stored in the requester's `superior_telegram_id`.
+
+If a user has **no superior set** (and is not self-managed), the request DM falls back to the **first superadmin** (`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1` — lowest user id, so the choice is deterministic). This guarantees no orphaned request silently goes unapproved. Those requests also surface in the Approvals inbox because superadmins see **all** pending items there.
+
+Edge note: for a no-superior request, the app→chat message-edit sync keys on the requester's (null) `superior_telegram_id`, so if the fallback superadmin actions it from the **app** the chat DM's buttons won't auto-clear. Harmless — the inline button handler is idempotent ("Already approved"). This only affects users with no superior set; everyone with a superior is fully synced both ways.
+
 ### superadmin (everything `admin` can do, plus)
 
 | Tab | Extras |
@@ -92,7 +100,7 @@ Set this up by entering the user's own telegram_id as their Superior's Telegram 
 
 ## Bot message catalog
 
-Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline button; buttons labelled "Open … page" deep-link to `WEBAPP_URL?tab=parade|sick|off`. "(edited)" means the original DM is rewritten in place by `editMessageText` so the buttons disappear once acted on.
+Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline button; buttons labelled "Open … page" deep-link to `WEBAPP_URL?tab=parade|sick|off`. "(edited)" means the original DM is rewritten in place by `editMessageText` so the buttons disappear once acted on. Wherever the recipient is **superior**, it means the requester's superior — falling back to the **first superadmin** if the requester has no superior set (see [Approval routing & the no-superior fallback](#approval-routing--the-no-superior-fallback)).
 
 ### Onboarding (`/start`)
 
