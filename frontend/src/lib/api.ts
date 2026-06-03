@@ -73,6 +73,7 @@ export interface Me {
 	sub_department: StgSubDepartment | null;
 	personnel_type: PersonnelType | null;
 	off_credits: number;
+	is_approver: boolean;
 	pending: boolean;
 }
 

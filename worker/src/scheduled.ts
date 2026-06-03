@@ -2,7 +2,7 @@
 //
 // Cloudflare free tier caps us at 5 cron triggers. Schedule:
 //   */5 * * * *      → every 5 min        drain reminders queue
-//   0 13 * * *       → 21:00 prev day      AM-empty nudge for tomorrow (if working day)
+//   0 10 * * *       → 18:00 prev day      parade-state nudge for tomorrow (if working day)
 //   30 21 * * *      → 05:30 same day      AM update nudge (everyone, with reassurance)
 //   0 5,23 * * *     → 07:00 SGT (23:00 UTC, AM flag) and 13:00 SGT (05:00 UTC, PM flag)
 //   0 4 * * *        → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
@@ -51,7 +51,7 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 		case '*/5 * * * *':
 			await drainReminders(env);
 			return;
-		case '0 13 * * *':
+		case '0 10 * * *':
 			await paradeNudge(env, 'evening_prev_am');
 			return;
 		case '30 21 * * *':
@@ -228,7 +228,7 @@ function fmtStatus(s: string | null): string {
 function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: string | null): string {
 	switch (kind) {
 		case 'evening_prev_am':
-			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade by 2359hrs.`;
+			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade by 2359.`;
 		case 'morning_am': {
 			// Show user's actual current AM/PM so they know if any update is
 			// needed at a glance.

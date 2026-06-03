@@ -208,7 +208,6 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 		);
 		const pendingPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
-		const lateInformPayloads: { date: string; period: 'AM' | 'PM'; status: string }[] = [];
 
 		for (const d of dates) {
 			for (const e of clean) {
@@ -218,12 +217,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					((e.period === 'AM' && minutesNow >= AM_CUTOFF_MIN) ||
 						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
 				if (isLate && e.status !== 'Present') {
-					// Needs superior approval.
+					// Late non-Present → needs superior approval.
 					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
 				} else {
-					// Apply now. If late but Present, also FYI the superior.
+					// Apply now. Late Present applies silently (no superior FYI).
 					directOps.push(upsertStmt.bind(user.id, d, e.period, e.status, e.reason));
-					if (isLate) lateInformPayloads.push({ date: d, period: e.period, status: e.status });
 				}
 			}
 		}
@@ -233,17 +231,6 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		}
 
 		const superiorTid = user.superior_telegram_id ?? (await firstAdminTidForParade(env));
-
-		// FYI DMs for late "Present" submissions — informational, no buttons.
-		if (superiorTid) {
-			for (const li of lateInformPayloads) {
-				const cutoff = li.period === 'AM' ? '07:00' : '13:00';
-				await tgSendMessage(env.BOT_TOKEN, {
-					chat_id: superiorTid,
-					text: `ℹ️ ${user.full_name} submitted ${li.period} parade state late (after ${cutoff}) as Present — no action needed.`,
-				});
-			}
-		}
 
 		// Stage pending requests — supersede any previous pending for the same
 		// (user, date, period) so the superior only ever sees the latest one.
@@ -268,6 +255,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			if (!ins) continue;
 			pendingIds.push(ins.id);
 
+			// Per-request DM with inline buttons (also actionable from the inbox).
 			if (superiorTid) {
 				const cutoff = p.period === 'AM' ? '07:00' : '13:00';
 				const msg = await tgSendMessage(env.BOT_TOKEN, {
@@ -379,9 +367,10 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 }
 
 // Fallback approver when the user has no superior_telegram_id set — pick any admin.
+// Fallback approver when a user has no superior set — the first superadmin.
 async function firstAdminTidForParade(env: Env): Promise<string | null> {
 	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role IN ('admin','superadmin') LIMIT 1`)
+		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
 		.first<{ telegram_id: string }>();
 	return a?.telegram_id ?? null;
 }

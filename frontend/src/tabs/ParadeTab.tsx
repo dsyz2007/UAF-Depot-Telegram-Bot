@@ -48,7 +48,27 @@ function renderStatusCell(entry: { parade_status: string | null; reason: string 
 	);
 }
 
-const STATUSES = ['Present', 'Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Leave (Others)'] as const;
+const STATUSES = [
+	'Present',
+	'Course',
+	'AO',
+	'MA',
+	'MC',
+	'RSO',
+	'RSI',
+	'OFF',
+	'LL',
+	'OL',
+	'Incoming Opr',
+	'Outgoing Opr',
+	'Incoming ADS',
+	'Outgoing ADS',
+	'Incoming DS',
+	'Outgoing DS',
+	'Incoming DO',
+	'Outgoing DO',
+	'Leave (Others)',
+] as const;
 type Status = (typeof STATUSES)[number];
 
 const STATUS_LABELS: Record<Status, string> = {
@@ -62,6 +82,14 @@ const STATUS_LABELS: Record<Status, string> = {
 	OFF: 'OFF',
 	LL: 'LL (Local Leave)',
 	OL: 'OL (Overseas Leave)',
+	'Incoming Opr': 'Incoming Opr (Incoming Operator)',
+	'Outgoing Opr': 'Outgoing Opr (Outgoing Operator)',
+	'Incoming ADS': 'Incoming ADS',
+	'Outgoing ADS': 'Outgoing ADS',
+	'Incoming DS': 'Incoming DS',
+	'Outgoing DS': 'Outgoing DS',
+	'Incoming DO': 'Incoming DO',
+	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
 };
 
@@ -76,6 +104,14 @@ const COLORS: Record<string, string> = {
 	OFF: '#9e9e9e',
 	LL: '#03a9f4',
 	OL: '#00897b',
+	'Incoming Opr': '#1e88e5',
+	'Outgoing Opr': '#3949ab',
+	'Incoming ADS': '#00acc1',
+	'Outgoing ADS': '#00838f',
+	'Incoming DS': '#7cb342',
+	'Outgoing DS': '#558b2f',
+	'Incoming DO': '#fb8c00',
+	'Outgoing DO': '#ef6c00',
 	'Leave (Others)': '#9c27b0',
 };
 
@@ -118,7 +154,26 @@ function periodByTimeSgt(): 'AM' | 'PM' {
 }
 
 // All non-Present statuses, in the order the report lists them.
-const NON_PRESENT_STATUSES = ['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OFF', 'LL', 'OL', 'Leave (Others)'] as const;
+const NON_PRESENT_STATUSES = [
+	'Course',
+	'AO',
+	'MA',
+	'MC',
+	'RSO',
+	'RSI',
+	'OFF',
+	'LL',
+	'OL',
+	'Incoming Opr',
+	'Outgoing Opr',
+	'Incoming ADS',
+	'Outgoing ADS',
+	'Incoming DS',
+	'Outgoing DS',
+	'Incoming DO',
+	'Outgoing DO',
+	'Leave (Others)',
+] as const;
 
 // Statuses that make the reason field compulsory in the submit modal.
 const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'Leave (Others)']);
@@ -241,6 +296,9 @@ export function ParadeTab({ me }: { me: Me }) {
 	const [selectedDate, setSelectedDate] = useState<Date>(initial);
 	const [showSubmit, setShowSubmit] = useState(false);
 	const [copyModalText, setCopyModalText] = useState<string | null>(null);
+	// "Everyone's status" is collapsed by default — its /api/parade/day fetch
+	// only fires when expanded, so most users never pay that read cost.
+	const [showEveryone, setShowEveryone] = useState(false);
 
 	// Fetch only the current user's entries for the visible month (~60 rows max).
 	function refreshMyMonth() {
@@ -268,15 +326,17 @@ export function ParadeTab({ me }: { me: Me }) {
 	}
 
 	async function refresh(): Promise<void> {
-		await Promise.all([refreshMyMonth(), refreshDay()]);
+		// Only refetch everyone's data if that panel is open.
+		await Promise.all([refreshMyMonth(), showEveryone ? refreshDay() : Promise.resolve()]);
 	}
 
 	useEffect(() => {
 		refreshMyMonth();
 	}, [month]);
 	useEffect(() => {
-		refreshDay();
-	}, [selectedDate]);
+		if (showEveryone) refreshDay();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [selectedDate, showEveryone]);
 
 	const myToday = myMonthByDate.get(ymdKey(selectedDate));
 
@@ -374,10 +434,15 @@ export function ParadeTab({ me }: { me: Me }) {
 			</div>
 
 			<div style={{ marginTop: 16 }}>
-				<div className="card-row">
-					<h4 style={{ margin: 0 }}>Everyone — {ymdKey(selectedDate)}</h4>
+				{/* Full-width buttons so the action is obvious (the old inline
+				    "Show" link was too easy to miss in the cramped header). */}
+				<div className="actions">
+					<button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowEveryone((v) => !v)}>
+						{showEveryone ? '▲ Hide everyone' : `👥 Show everyone's status (${ymdKey(selectedDate)})`}
+					</button>
 					<button
-						className="btn-link"
+						className="btn btn-secondary"
+						style={{ flex: 1 }}
 						onClick={async () => {
 							const period = periodByTimeSgt();
 							try {
@@ -393,7 +458,7 @@ export function ParadeTab({ me }: { me: Me }) {
 						📋 View state
 					</button>
 				</div>
-				{dayDetails.length === 0 ? (
+				{!showEveryone ? null : dayDetails.length === 0 ? (
 					<p className="muted">No active users.</p>
 				) : (
 					(() => {

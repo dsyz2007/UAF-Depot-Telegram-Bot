@@ -15,6 +15,7 @@ import { handleParade } from './parade';
 import { handleAdmin } from './admin';
 import { handleMe } from './me';
 import { handleToday } from './today';
+import { handleApprovals } from './approvals';
 
 export interface AuthedContext {
 	url: URL;
@@ -58,6 +59,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 
 	if (path === '/api/me') return handleMe(actx);
 	if (path === '/api/today') return handleToday(actx);
+	if (path.startsWith('/api/approvals')) return handleApprovals(actx);
 	if (path.startsWith('/api/off')) return handleOff(actx);
 	if (path.startsWith('/api/sick')) return handleSick(actx);
 	if (path.startsWith('/api/parade')) return handleParade(actx);

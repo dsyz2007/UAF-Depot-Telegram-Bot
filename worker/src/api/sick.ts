@@ -83,6 +83,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
+		// Per-request DM with inline buttons (also actionable from the inbox).
 		const superiorTid = user.superior_telegram_id ?? (await firstAdminTid(env));
 		if (superiorTid) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
@@ -295,9 +296,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	return json({ error: 'not_found' }, { status: 404 });
 }
 
+// Fallback approver when a user has no superior set — the first superadmin.
 async function firstAdminTid(env: Env): Promise<string | null> {
 	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role IN ('admin','superadmin') LIMIT 1`)
+		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
 		.first<{ telegram_id: string }>();
 	return a?.telegram_id ?? null;
 }

@@ -160,6 +160,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
+		// Per-request DM with inline buttons. (Superiors can also action it from
+		// the Approvals inbox in-app; the two stay in sync.)
 		const superiorTid = await resolveSuperiorTid(env, user.superior_telegram_id);
 		if (superiorTid) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
@@ -249,7 +251,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// The approver is the recipient's superior (fallback: any admin).
+		// Per-request DM with inline buttons to the recipient's superior.
 		const approverTid = staff.superior_telegram_id ?? (await firstAdminTid(env));
 		const whoLine = isSelf ? `${staff.full_name} (self-credit)` : `${user.full_name} → ${staff.full_name}`;
 		if (approverTid) {
@@ -405,9 +407,10 @@ async function resolveSuperiorTid(env: Env, superiorTid: string | null): Promise
 	return firstAdminTid(env);
 }
 
+// Fallback approver when a user has no superior set — the first superadmin.
 async function firstAdminTid(env: Env): Promise<string | null> {
 	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role IN ('admin','superadmin') LIMIT 1`)
+		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
 		.first<{ telegram_id: string }>();
 	return a?.telegram_id ?? null;
 }

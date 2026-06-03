@@ -56,6 +56,14 @@ export type ParadeStatus =
 	| 'OFF'
 	| 'LL'
 	| 'OL'
+	| 'Incoming Opr'
+	| 'Outgoing Opr'
+	| 'Incoming ADS'
+	| 'Outgoing ADS'
+	| 'Incoming DS'
+	| 'Outgoing DS'
+	| 'Incoming DO'
+	| 'Outgoing DO'
 	| 'Leave (Others)';
 
 export const PARADE_STATUSES: readonly ParadeStatus[] = [
@@ -69,6 +77,14 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'OFF',
 	'LL',
 	'OL',
+	'Incoming Opr',
+	'Outgoing Opr',
+	'Incoming ADS',
+	'Outgoing ADS',
+	'Incoming DS',
+	'Outgoing DS',
+	'Incoming DO',
+	'Outgoing DO',
 	'Leave (Others)',
 ];
 
@@ -84,6 +100,14 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	OFF: 'OFF',
 	LL: 'LL (Local Leave)',
 	OL: 'OL (Overseas Leave)',
+	'Incoming Opr': 'Incoming Opr (Incoming Operator)',
+	'Outgoing Opr': 'Outgoing Opr (Outgoing Operator)',
+	'Incoming ADS': 'Incoming ADS',
+	'Outgoing ADS': 'Outgoing ADS',
+	'Incoming DS': 'Incoming DS',
+	'Outgoing DS': 'Outgoing DS',
+	'Incoming DO': 'Incoming DO',
+	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
 };
 

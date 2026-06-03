@@ -42,23 +42,26 @@ export default function App() {
 	}
 
 	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
+	// Today tab (which hosts the Approvals inbox) is shown to anyone who
+	// approves for someone — admins/superadmins plus user-role superiors.
+	const showToday = isAdminish || me.is_approver;
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
 		{ key: 'parade', label: '🪖 Parade', show: true },
 		{ key: 'off', label: '📅 Off', show: true },
 		{ key: 'sick', label: '🤒 Sick', show: true },
-		{ key: 'today', label: '📊 Today', show: isAdminish },
+		{ key: 'today', label: '📊 Today', show: showToday },
 		{ key: 'admin', label: '⚙ Admin', show: isAdminish },
 	];
 
 	return (
 		<div className="app">
 			<header className="appbar">
-				<span className="brand">Depot</span>
+				<span className="brand">CTAB UAF</span>
 				<span className="username">{me.full_name} · {roleLabel(me.user_role)}</span>
 			</header>
 
 			<main className="content">
-				{tab === 'today' && isAdminish && <TodayTab me={me} />}
+				{tab === 'today' && showToday && <TodayTab me={me} />}
 				{tab === 'off' && <OffTab me={me} />}
 				{tab === 'sick' && <SickTab me={me} />}
 				{tab === 'parade' && <ParadeTab me={me} />}
