@@ -1,7 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, isSelfManaged, type ParadeStatus } from '../types';
-import { tgSendDocument, tgSendMessage } from '../tg';
-import { isWorkingDay, sgtToday, dayOfWeekSgt } from '../holidays';
+import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
+import { isWorkingDay, sgtToday, sgtDateAddDays, dayOfWeekSgt } from '../holidays';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
@@ -280,12 +280,75 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			}
 		}
 
+		// ── Edit the most-recent parade nudge (if any) in place, so the user's
+		// update is reflected without sending another notification. Only today /
+		// tomorrow are ever nudged, so only those can have a tracked message.
+		const tomorrow = sgtDateAddDays(today, 1);
+		const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
+		for (const d of editableDates) {
+			const tracked = await env.depot_db
+				.prepare(`SELECT chat_id, message_id FROM parade_nudge_messages WHERE user_id = ? AND target_date = ?`)
+				.bind(user.id, d)
+				.first<{ chat_id: string; message_id: string }>();
+			if (!tracked) continue;
+			const cur = await env.depot_db
+				.prepare(
+					`SELECT MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am,
+					        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm
+					 FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ?`,
+				)
+				.bind(user.id, d)
+				.first<{ am: string | null; pm: string | null }>();
+			const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
+			// Keep the "Open Parade page" button so they can re-edit from the DM.
+			await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
+				inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
+			});
+		}
+
+		// ── Auto-route: if the user marked OFF / RSI / RSO but never applied for
+		// it, flag the frontend to bounce them to the Off / Sick apply form. The
+		// parade entry itself still saved normally above. Only when something was
+		// actually saved (a weekend-only range that got fully skipped shouldn't
+		// route anywhere).
+		const savedSomething = directOps.length > 0 || pendingPayloads.length > 0;
+		let suggestOff = false;
+		if (savedSomething && clean.some((e) => e.status === 'OFF')) {
+			const existing = await env.depot_db
+				.prepare(
+					`SELECT 1 FROM off_requests
+					 WHERE user_id = ? AND off_status IN ('pending','approved')
+					   AND startdate <= ? AND enddate >= ? LIMIT 1`,
+				)
+				.bind(user.id, body.enddate, body.startdate)
+				.first();
+			suggestOff = !existing;
+		}
+		let suggestSick: 'RSI' | 'RSO' | null = null;
+		for (const t of ['RSI', 'RSO'] as const) {
+			if (!savedSomething || !clean.some((e) => e.status === t)) continue;
+			const existing = await env.depot_db
+				.prepare(
+					`SELECT 1 FROM sick_cases
+					 WHERE user_id = ? AND case_type = ?
+					   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
+				)
+				.bind(user.id, t)
+				.first();
+			if (!existing) {
+				suggestSick = t;
+				break;
+			}
+		}
+
 		return json({
 			ok: true,
 			applied: directOps.length,
 			pending: pendingPayloads.length,
 			pending_ids: pendingIds,
 			skipped_weekends: skippedWeekends,
+			suggest_off: suggestOff,
+			suggest_sick: suggestSick,
 		});
 	}
 

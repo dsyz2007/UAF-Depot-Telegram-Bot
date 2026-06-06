@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
 import { api, confirmDialog, type Me } from '../lib/api';
 
@@ -18,9 +18,18 @@ interface OpenCase {
 	created_at: string;
 }
 
-export function SickTab({ me }: { me: Me }) {
+export function SickTab({
+	me,
+	initialSick,
+	onConsumed,
+}: {
+	me: Me;
+	initialSick?: 'RSI' | 'RSO' | null;
+	onConsumed?: () => void;
+}) {
 	const selfManaged = !!me.superior_telegram_id && me.superior_telegram_id === me.telegram_id;
 	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
+	const [pendingReport, setPendingReport] = useState<'RSI' | 'RSO' | null>(null);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [mcDays, setMcDays] = useState<number | ''>('');
@@ -43,6 +52,33 @@ export function SickTab({ me }: { me: Me }) {
 	useEffect(() => {
 		refresh();
 	}, []);
+
+	// When routed here from the Parade tab (user marked RSI/RSO without
+	// reporting), stash the type; act on it once the open-case state has loaded.
+	const routeHandled = useRef(false);
+	useEffect(() => {
+		if (initialSick && !routeHandled.current) {
+			routeHandled.current = true;
+			setPendingReport(initialSick);
+			onConsumed?.();
+		}
+		if (!initialSick) routeHandled.current = false;
+	}, [initialSick, onConsumed]);
+
+	useEffect(() => {
+		if (!pendingReport || open === undefined) return;
+		const type = pendingReport;
+		setPendingReport(null);
+		(async () => {
+			if (open) {
+				WebApp.showAlert(`You already have an open ${open.case_type} case — no new report needed.`);
+				return;
+			}
+			const ok = await confirmDialog(`Report ${type} now? Your superior will be notified.`);
+			if (ok) await report(type);
+		})();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [pendingReport, open]);
 
 	async function report(case_type: 'RSI' | 'RSO') {
 		setBusy(true);

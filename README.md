@@ -50,7 +50,7 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 
 | Tab | What they can do |
 |---|---|
-| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others). Weekend days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Duty tags available: Incoming/Outgoing Opr, ADS, DS, DO. |
+| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others). Weekend days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Duty tags available: Incoming/Outgoing Opr, ADS, DS, DO. **Auto-route:** if you mark **OFF / RSI / RSO** without having applied for it, the status still saves, then the app jumps you to the 📅 Off page (Request Off modal pre-filled with the dates) or the 🤒 Sick page (confirm to report RSI/RSO) so you formally apply. Skipped if you already have a matching pending/approved off or open sick case. |
 | 📅 Off | See their own off-credit balance. Request an off (start/end + reason). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). View everyone's approved-off count + per-user detail. |
 | 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; plus Location and Approximate Time). Attach the MC by sending the photo/PDF directly to the bot in chat. |
 
@@ -161,9 +161,13 @@ Every per-request DM above is mirrored in the **✅ Approvals inbox** (Today tab
 
 ### Parade-state reminders & flags (working days only)
 
+**Skip-when-done:** all three nudges below (6pm / 5:30am / 12pm) are skipped for any user who has *already filled both AM and PM* for the target day — there's nothing left to remind them about. (Previously only the 6pm nudge filtered, and only on AM.)
+
+**Edit-in-place, no extra ping:** when a user updates their parade state in the app, the bot **edits their most-recent nudge DM for that date** to show the new AM/PM (`✅ Parade state for {date} updated: AM: … / PM: …`, keeping the Open Parade button) instead of sending a fresh notification. The `parade_nudge_messages` table tracks which message to edit.
+
 | Trigger (SGT) | Recipient | Message | Buttons |
 |---|---|---|---|
-| 18:00 prev day, tomorrow AM empty | each missing user | `📋 Submit tomorrow's parade state ({date}) in Depot App → 🪖 Parade by 2359.` | `[🪖 Open Parade page]` |
+| 18:00 prev day, tomorrow AM or PM empty | each missing user | `📋 Submit tomorrow's parade state ({date}) in Depot App → 🪖 Parade by 2359.` | `[🪖 Open Parade page]` |
 | 05:30 same day | every user | `☀ Today ({date}) parade state:` / `  AM: {status or "— not set —"}` / `  PM: {status or "— not set —"}` / `Update in Depot App → 🪖 Parade if anything's changed. Otherwise ignore this.` | `[🪖 Open Parade page]` |
 | 12:00, PM filled | every user | `🕛 Today's PM Status is labelled "{pm}". Update in Depot App → 🪖 Parade if anything's changed; otherwise ignore.` | `[🪖 Open Parade page]` |
 | 12:00, PM not filled | every user | `🕛 Today's PM parade state is not set. Update in Depot App → 🪖 Parade.` | `[🪖 Open Parade page]` |
@@ -532,6 +536,7 @@ Always apply in numeric order on both local and remote.
 | `008_mc_file_and_location.sql` | Adds `sick_cases.mc_file_id` + `mc_file_type` (Telegram MC attachment reference — bytes stay on Telegram) and `location` + `approx_time` (replace the old medicine field in the update form; `medicine_prescribed` column left unused). |
 | `009_rename_others_status.sql` | Remap parade status value `Others → Leave (Others)` in `parade_state_entries` and pending `parade_change_requests`. |
 | `010_approval_notify.sql` | Adds `users.last_approval_notify_at`. (Was for a throttled digest; the design switched to per-request DMs + the in-app Approvals inbox, so this column is currently unused but harmless — left in place.) |
+| `011_parade_nudge_messages.sql` | New `parade_nudge_messages` table — tracks the most-recent parade reminder DM per `(user, target_date)` so an in-app status update can edit that message in place (showing the new AM/PM) instead of sending another notification. Pruned daily once the date is past. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

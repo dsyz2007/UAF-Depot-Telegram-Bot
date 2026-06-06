@@ -156,15 +156,8 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 	// Skip entirely if target date is non-working (weekend, confirmed PH, override)
 	if (!(await isWorkingDay(env, targetDate))) return;
 
-	const period: 'AM' | 'PM' = kind === 'noon_pm' ? 'PM' : 'AM';
-
-	// Who should we nudge?
-	//   evening_prev_am  → only users with NO entry for tomorrow AM
-	//   morning_am       → all users (reassure if already filled)
-	//   noon_pm          → all users (reassure if already filled)
-	let rows: { user: UserRow; hasEntry: boolean }[] = [];
-	// All three nudges now share a single AM/PM-aware fetch so the 5:30am
-	// reminder can tell the user their actual current status.
+	// All three nudges share a single AM/PM-aware fetch so the message can show
+	// the user's actual current status, and so we can skip anyone already done.
 	const { results: statusRows } = await env.depot_db
 		.prepare(
 			`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
@@ -180,45 +173,48 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 		.all<UserRow & { am_status: string | null; pm_status: string | null }>();
 
 	type EnrichedRow = { user: UserRow; amStatus: string | null; pmStatus: string | null };
-	let enriched: EnrichedRow[] = [];
 
-	if (kind === 'evening_prev_am') {
-		// Only users with no AM entry for tomorrow.
-		enriched = (statusRows ?? [])
-			.filter((u) => u.am_status === null)
-			.map((u) => ({
-				user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
-				amStatus: u.am_status,
-				pmStatus: u.pm_status,
-			}));
-	} else if (kind === 'morning_am') {
-		// 5:30am: nudge everyone, message includes their AM/PM current values.
-		enriched = (statusRows ?? []).map((u) => ({
+	// Skip anyone who already has BOTH AM and PM filled for the target date —
+	// they have nothing left to update. Applies to all three nudges (previously
+	// only the 6pm one filtered, and only on AM).
+	const enriched: EnrichedRow[] = (statusRows ?? [])
+		.filter((u) => u.am_status === null || u.pm_status === null)
+		.map((u) => ({
 			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
 			amStatus: u.am_status,
 			pmStatus: u.pm_status,
 		}));
-	} else {
-		// noon_pm: nudge everyone, message focuses on PM.
-		enriched = (statusRows ?? []).map((u) => ({
-			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
-			amStatus: u.am_status,
-			pmStatus: u.pm_status,
-		}));
-	}
 
 	if (!enriched.length) return;
 
-	const sends = enriched.map((e) =>
-		tgSendMessage(env.BOT_TOKEN, {
-			chat_id: e.user.telegram_id,
-			text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
-			// Deep-link the calendar to the exact date this reminder is about
-			// (tomorrow for the 9pm nudge, today for the others).
-			reply_markup: webAppButton(env, 'parade', targetDate),
-		}),
+	// Send, capturing each message_id so a later in-app parade-state update can
+	// edit the most-recent nudge in place (see parade.ts /submit) rather than
+	// sending another notification.
+	const settled = await Promise.allSettled(
+		enriched.map((e) =>
+			tgSendMessage(env.BOT_TOKEN, {
+				chat_id: e.user.telegram_id,
+				text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
+				// Deep-link the calendar to the exact date this reminder is about
+				// (tomorrow for the 9pm nudge, today for the others).
+				reply_markup: webAppButton(env, 'parade', targetDate),
+			}),
+		),
 	);
-	await Promise.allSettled(sends);
+
+	const upsertStmt = env.depot_db.prepare(
+		`INSERT INTO parade_nudge_messages (user_id, target_date, chat_id, message_id, updated_at)
+		 VALUES (?, ?, ?, ?, datetime('now'))
+		 ON CONFLICT(user_id, target_date)
+		 DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, updated_at = datetime('now')`,
+	);
+	const upserts: ReturnType<typeof env.depot_db.prepare>[] = [];
+	settled.forEach((s, i) => {
+		if (s.status === 'fulfilled' && s.value?.message_id) {
+			upserts.push(upsertStmt.bind(enriched[i].user.id, targetDate, enriched[i].user.telegram_id, String(s.value.message_id)));
+		}
+	});
+	if (upserts.length) await env.depot_db.batch(upserts);
 }
 
 function fmtStatus(s: string | null): string {
@@ -336,11 +332,13 @@ async function runOrdReminders(env: Env): Promise<void> {
 }
 
 async function runParadePrune(env: Env): Promise<void> {
-	const cutoff = sgtDateAddDays(sgtToday(), -5);
-	await env.depot_db
-		.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < ?`)
-		.bind(cutoff)
-		.run();
+	const today = sgtToday();
+	const cutoff = sgtDateAddDays(today, -5);
+	await env.depot_db.batch([
+		env.depot_db.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < ?`).bind(cutoff),
+		// Nudge-message rows only matter for today/tomorrow; drop anything past.
+		env.depot_db.prepare(`DELETE FROM parade_nudge_messages WHERE target_date < ?`).bind(today),
+	]);
 }
 
 async function runHolidayRefresh(env: Env): Promise<void> {

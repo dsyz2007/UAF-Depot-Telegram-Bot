@@ -56,6 +56,13 @@ export const api = {
 export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'STG' | 'Others';
 export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'STG', 'Others'];
 
+// Cross-tab navigation request: the Parade tab raises one of these when a user
+// marks OFF / RSI / RSO without having applied, so App can switch to the Off /
+// Sick tab and open the matching apply form.
+export type RouteAction =
+	| { kind: 'off'; start: string; end: string }
+	| { kind: 'sick'; sickType: 'RSI' | 'RSO' };
+
 export type StgSubDepartment = 'C1+C2' | 'C3+C4';
 export const STG_SUB_DEPARTMENTS: readonly StgSubDepartment[] = ['C1+C2', 'C3+C4'];
 

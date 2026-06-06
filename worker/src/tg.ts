@@ -28,18 +28,20 @@ export async function tgEditMessageText(
 	chatId: number | string,
 	messageId: number | string,
 	text: string,
+	replyMarkup?: unknown,
 ): Promise<void> {
 	await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
-		// Empty inline_keyboard removes any Approve/Reject buttons on the edited
-		// message so they can't be tapped after the item is already resolved.
+		// Default (no replyMarkup) clears the inline keyboard — removes any
+		// Approve/Reject buttons once an item is resolved. Pass a replyMarkup to
+		// keep a button (e.g. the parade nudge keeps its "Open Parade page").
 		body: JSON.stringify({
 			chat_id: chatId,
 			message_id: messageId,
 			text,
 			parse_mode: 'HTML',
-			reply_markup: { inline_keyboard: [] },
+			reply_markup: replyMarkup ?? { inline_keyboard: [] },
 		}),
 	});
 }

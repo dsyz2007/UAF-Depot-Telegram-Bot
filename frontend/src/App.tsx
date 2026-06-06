@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api, type Me } from './lib/api';
+import { api, type Me, type RouteAction } from './lib/api';
 import { OffTab } from './tabs/OffTab';
 import { SickTab } from './tabs/SickTab';
 import { ParadeTab } from './tabs/ParadeTab';
@@ -21,6 +21,14 @@ export default function App() {
 		}
 		return 'parade';
 	});
+	// Set by the Parade tab when a user marks OFF/RSI/RSO without applying; the
+	// destination tab consumes it (opens the apply form) then clears it.
+	const [routeAction, setRouteAction] = useState<RouteAction | null>(null);
+
+	function handleRoute(action: RouteAction) {
+		setRouteAction(action);
+		setTab(action.kind === 'off' ? 'off' : 'sick');
+	}
 
 	useEffect(() => {
 		api
@@ -62,9 +70,21 @@ export default function App() {
 
 			<main className="content">
 				{tab === 'today' && showToday && <TodayTab me={me} />}
-				{tab === 'off' && <OffTab me={me} />}
-				{tab === 'sick' && <SickTab me={me} />}
-				{tab === 'parade' && <ParadeTab me={me} />}
+				{tab === 'off' && (
+					<OffTab
+						me={me}
+						initialOff={routeAction?.kind === 'off' ? { start: routeAction.start, end: routeAction.end } : null}
+						onConsumed={() => setRouteAction(null)}
+					/>
+				)}
+				{tab === 'sick' && (
+					<SickTab
+						me={me}
+						initialSick={routeAction?.kind === 'sick' ? routeAction.sickType : null}
+						onConsumed={() => setRouteAction(null)}
+					/>
+				)}
+				{tab === 'parade' && <ParadeTab me={me} onRoute={handleRoute} />}
 				{tab === 'admin' && isAdminish && <AdminTab me={me} />}
 			</main>
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
 import WebApp from '@twa-dev/sdk';
-import { api, type Me } from '../lib/api';
+import { api, type Me, type RouteAction } from '../lib/api';
 
 interface Entry {
 	user_id: number;
@@ -286,7 +286,7 @@ function initialDate(minIso: string, maxIso: string): Date {
 	return t;
 }
 
-export function ParadeTab({ me }: { me: Me }) {
+export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteAction) => void }) {
 	const bounds = useMemo(() => calendarBounds(), []);
 	const initial = useMemo(() => initialDate(bounds.minIso, bounds.maxIso), [bounds]);
 	const [month, setMonth] = useState<Date>(initial);
@@ -522,6 +522,7 @@ export function ParadeTab({ me }: { me: Me }) {
 					maxIso={bounds.maxIso}
 					onClose={() => setShowSubmit(false)}
 					onDone={refresh}
+					onRoute={onRoute}
 				/>
 			)}
 
@@ -542,12 +543,14 @@ function SubmitModal({
 	maxIso,
 	onClose,
 	onDone,
+	onRoute,
 }: {
 	initialDate: string;
 	minIso: string;
 	maxIso: string;
 	onClose: () => void;
 	onDone: () => Promise<void>;
+	onRoute: (action: RouteAction) => void;
 }) {
 	const [startdate, setStartdate] = useState(initialDate);
 	const [enddate, setEnddate] = useState(initialDate);
@@ -608,10 +611,13 @@ function SubmitModal({
 		if (!canSave) return;
 		setBusy(true);
 		try {
-			const res = await api.post<{ applied: number; pending: number; skipped_weekends: number }>(
-				'/api/parade/submit',
-				{ startdate, enddate, entries },
-			);
+			const res = await api.post<{
+				applied: number;
+				pending: number;
+				skipped_weekends: number;
+				suggest_off?: boolean;
+				suggest_sick?: 'RSI' | 'RSO' | null;
+			}>('/api/parade/submit', { startdate, enddate, entries });
 			await onDone();
 			onClose();
 			const parts =
@@ -629,7 +635,17 @@ function SubmitModal({
 			if (res.applied === 0 && res.pending === 0) {
 				msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were weekends.' : '⚠ Nothing saved.';
 			}
-			WebApp.showAlert(msg);
+			// If the user marked OFF / RSI / RSO without having applied, route them
+			// to the matching apply form (prioritise Off when both are flagged).
+			if (res.suggest_off) {
+				WebApp.showAlert(`${msg}\n\n📅 You marked OFF but haven't applied — opening the Off page to request it.`);
+				onRoute({ kind: 'off', start: startdate, end: enddate });
+			} else if (res.suggest_sick) {
+				WebApp.showAlert(`${msg}\n\n🤒 You marked ${res.suggest_sick} but haven't reported it — opening the Sick page.`);
+				onRoute({ kind: 'sick', sickType: res.suggest_sick });
+			} else {
+				WebApp.showAlert(msg);
+			}
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);

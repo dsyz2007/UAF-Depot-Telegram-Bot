@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
 import { api, confirmDialog, type Me } from '../lib/api';
 
@@ -52,7 +52,15 @@ function dayCount(start: string, end: string): number {
 	return Math.floor((b - a) / 86_400_000) + 1;
 }
 
-export function OffTab({ me }: { me: Me }) {
+export function OffTab({
+	me,
+	initialOff,
+	onConsumed,
+}: {
+	me: Me;
+	initialOff?: { start: string; end: string } | null;
+	onConsumed?: () => void;
+}) {
 	const [summary, setSummary] = useState<SummaryRow[]>([]);
 	const [detailUser, setDetailUser] = useState<SummaryRow | null>(null);
 	const [details, setDetails] = useState<DetailRow[]>([]);
@@ -60,7 +68,22 @@ export function OffTab({ me }: { me: Me }) {
 	const [grants, setGrants] = useState<GrantRow[]>([]);
 	const [credits, setCredits] = useState<number>(me.off_credits);
 	const [showRequest, setShowRequest] = useState(false);
+	const [reqPrefill, setReqPrefill] = useState<{ start: string; end: string } | null>(null);
 	const [showGive, setShowGive] = useState(false);
+
+	// When routed here from the Parade tab (user marked OFF without applying),
+	// open the Request Off modal prefilled with the dates. The ref guards
+	// against re-opening on every re-render while the action is still set.
+	const routeHandled = useRef(false);
+	useEffect(() => {
+		if (initialOff && !routeHandled.current) {
+			routeHandled.current = true;
+			setReqPrefill(initialOff);
+			setShowRequest(true);
+			onConsumed?.();
+		}
+		if (!initialOff) routeHandled.current = false;
+	}, [initialOff, onConsumed]);
 
 	function loadSummary() {
 		return api.get<SummaryRow[]>('/api/off/summary').then(setSummary);
@@ -235,7 +258,16 @@ export function OffTab({ me }: { me: Me }) {
 			))}
 
 			{showRequest && (
-				<RequestOffModal balance={credits} onClose={() => setShowRequest(false)} onDone={refreshAll} />
+				<RequestOffModal
+					balance={credits}
+					initialStart={reqPrefill?.start}
+					initialEnd={reqPrefill?.end}
+					onClose={() => {
+						setShowRequest(false);
+						setReqPrefill(null);
+					}}
+					onDone={refreshAll}
+				/>
 			)}
 			{showGive && (
 				<CreditOffModal me={me} onClose={() => setShowGive(false)} onDone={refreshAll} />
@@ -246,15 +278,19 @@ export function OffTab({ me }: { me: Me }) {
 
 function RequestOffModal({
 	balance,
+	initialStart,
+	initialEnd,
 	onClose,
 	onDone,
 }: {
 	balance: number;
+	initialStart?: string;
+	initialEnd?: string;
 	onClose: () => void;
 	onDone: () => Promise<void>;
 }) {
-	const [startdate, setStart] = useState('');
-	const [enddate, setEnd] = useState('');
+	const [startdate, setStart] = useState(initialStart ?? '');
+	const [enddate, setEnd] = useState(initialEnd ?? '');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
