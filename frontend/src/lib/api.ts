@@ -75,6 +75,7 @@ export interface Me {
 	full_name: string;
 	user_role: 'user' | 'admin' | 'superadmin';
 	superior_telegram_id: string | null;
+	superior_telegram_id_2: string | null;
 	ord_date: string | null;
 	department: Department | null;
 	sub_department: StgSubDepartment | null;

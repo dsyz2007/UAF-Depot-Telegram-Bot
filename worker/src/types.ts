@@ -27,6 +27,8 @@ export interface DbUser {
 	full_name: string;
 	user_role: UserRole;
 	superior_telegram_id: string | null;
+	// Optional second superior — either superior can approve this user's requests.
+	superior_telegram_id_2: string | null;
 	ord_date: string | null;
 	department: Department | null;
 	sub_department: StgSubDepartment | null;
@@ -56,6 +58,8 @@ export type ParadeStatus =
 	| 'OFF'
 	| 'LL'
 	| 'OL'
+	| 'Leave (Others)'
+	| 'Others'
 	| 'Incoming Opr'
 	| 'Outgoing Opr'
 	| 'Incoming ADS'
@@ -63,9 +67,10 @@ export type ParadeStatus =
 	| 'Incoming DS'
 	| 'Outgoing DS'
 	| 'Incoming DO'
-	| 'Outgoing DO'
-	| 'Leave (Others)';
+	| 'Outgoing DO';
 
+// Order: the two "Others" sit just above the Incoming/Outgoing duty block and
+// below everything else.
 export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Present',
 	'Course',
@@ -77,6 +82,8 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'OFF',
 	'LL',
 	'OL',
+	'Leave (Others)',
+	'Others',
 	'Incoming Opr',
 	'Outgoing Opr',
 	'Incoming ADS',
@@ -85,7 +92,6 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Outgoing DS',
 	'Incoming DO',
 	'Outgoing DO',
-	'Leave (Others)',
 ];
 
 // Long-form labels for the legend / dropdown tooltips.
@@ -109,6 +115,7 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	'Incoming DO': 'Incoming DO',
 	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
+	Others: 'Others',
 };
 
 // Statuses that require a reason when submitting parade state.
@@ -120,12 +127,19 @@ export const REASON_REQUIRED_STATUSES: readonly ParadeStatus[] = [
 	'RSO',
 	'RSI',
 	'Leave (Others)',
+	'Others',
 ];
 
-// A user whose superior is themselves is "self-managed" — they bypass every
-// approval step (off requests, off credits, sick reports, late parade changes).
-export function isSelfManaged(u: { telegram_id: string; superior_telegram_id: string | null }): boolean {
-	return !!u.superior_telegram_id && u.superior_telegram_id === u.telegram_id;
+// A user is "self-managed" — bypassing every approval step — when they have at
+// least one superior set and ALL of their superiors are themselves. If a real
+// (other) second superior exists, that superior can approve, so NOT self-managed.
+export function isSelfManaged(u: {
+	telegram_id: string;
+	superior_telegram_id: string | null;
+	superior_telegram_id_2?: string | null;
+}): boolean {
+	const sups = [u.superior_telegram_id, u.superior_telegram_id_2 ?? null].filter((t): t is string => !!t);
+	return sups.length > 0 && sups.every((t) => t === u.telegram_id);
 }
 
 export function dayCountInclusive(startdate: string, enddate: string): number {

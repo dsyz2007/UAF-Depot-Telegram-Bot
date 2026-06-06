@@ -1,6 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive, isSelfManaged } from '../types';
+import { approverTidsFor } from '../superiors';
 
 interface SummaryRow {
 	id: number;
@@ -160,12 +161,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// Per-request DM with inline buttons. (Superiors can also action it from
-		// the Approvals inbox in-app; the two stay in sync.)
-		const superiorTid = await resolveSuperiorTid(env, user.superior_telegram_id);
-		if (superiorTid) {
+		// Per-request DM with inline buttons — sent to EACH of the user's
+		// superiors (either may approve). The inbox sync edits the primary
+		// superior's stored message; the others are idempotent if tapped later.
+		const approverTids = await approverTidsFor(env, user);
+		let firstMsgId: string | undefined;
+		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: superiorTid,
+				chat_id: tid,
 				text: `🟡 <b>Off request</b>\n${user.full_name}: ${body.startdate} → ${body.enddate} (${days} day${days === 1 ? '' : 's'})\nBalance after approval: ${user.off_credits - days}\nReason: ${body.reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
@@ -178,12 +181,13 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 					],
 				},
 			});
-			if (msg?.message_id) {
-				await env.depot_db
-					.prepare('UPDATE off_requests SET superior_message_id = ? WHERE id = ?')
-					.bind(String(msg.message_id), ins.id)
-					.run();
-			}
+			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+		}
+		if (firstMsgId) {
+			await env.depot_db
+				.prepare('UPDATE off_requests SET superior_message_id = ? WHERE id = ?')
+				.bind(firstMsgId, ins.id)
+				.run();
 		}
 		return json({ ok: true, id: ins.id, days_requested: days, balance_after_approval: user.off_credits - days });
 	}
@@ -207,12 +211,24 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		}
 
 		const staff = await env.depot_db
-			.prepare('SELECT id, telegram_id, full_name, superior_telegram_id FROM users WHERE id = ?')
+			.prepare('SELECT id, telegram_id, full_name, superior_telegram_id, superior_telegram_id_2 FROM users WHERE id = ?')
 			.bind(targetId)
-			.first<{ id: number; telegram_id: string; full_name: string; superior_telegram_id: string | null }>();
+			.first<{
+				id: number;
+				telegram_id: string;
+				full_name: string;
+				superior_telegram_id: string | null;
+				superior_telegram_id_2: string | null;
+			}>();
 		if (!staff) return json({ error: 'staff_not_found' }, { status: 404 });
-		// Admins can credit only their direct reports; superadmins anyone; anyone can self-credit.
-		if (!isSelf && user.user_role === 'admin' && staff.superior_telegram_id !== user.telegram_id) {
+		// Admins can credit only their direct reports (either superior slot);
+		// superadmins anyone; anyone can self-credit.
+		if (
+			!isSelf &&
+			user.user_role === 'admin' &&
+			staff.superior_telegram_id !== user.telegram_id &&
+			staff.superior_telegram_id_2 !== user.telegram_id
+		) {
 			return json({ error: 'not_your_staff' }, { status: 403 });
 		}
 
@@ -251,12 +267,13 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// Per-request DM with inline buttons to the recipient's superior.
-		const approverTid = staff.superior_telegram_id ?? (await firstAdminTid(env));
+		// Per-request DM with inline buttons to EACH of the recipient's superiors.
+		const approverTids = await approverTidsFor(env, staff);
 		const whoLine = isSelf ? `${staff.full_name} (self-credit)` : `${user.full_name} → ${staff.full_name}`;
-		if (approverTid) {
+		let firstMsgId: string | undefined;
+		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: approverTid,
+				chat_id: tid,
 				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${body.num_days} day(s)\nReason: ${body.reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
@@ -268,16 +285,17 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 					],
 				},
 			});
-			if (msg?.message_id) {
-				await env.depot_db
-					.prepare('UPDATE off_credit_grants SET approval_message_id = ? WHERE id = ?')
-					.bind(String(msg.message_id), ins.id)
-					.run();
-			}
+			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+		}
+		if (firstMsgId) {
+			await env.depot_db
+				.prepare('UPDATE off_credit_grants SET approval_message_id = ? WHERE id = ?')
+				.bind(firstMsgId, ins.id)
+				.run();
 		}
 		// Notify the recipient ONLY when they didn't initiate it themselves and
-		// they aren't the approver (avoids duplicate messages to one person).
-		if (staff.telegram_id !== user.telegram_id && staff.telegram_id !== approverTid) {
+		// they aren't one of the approvers (avoids duplicate messages to a person).
+		if (staff.telegram_id !== user.telegram_id && !approverTids.includes(staff.telegram_id)) {
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: staff.telegram_id,
 				text: `🪙 ${user.full_name} proposed crediting you ${body.num_days} off day(s) — pending superior approval. Reason: ${body.reason}`,
@@ -309,13 +327,15 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.bind(user.id, body.id)
 			.run();
 
-		const superiorTid = await resolveSuperiorTid(env, user.superior_telegram_id);
-		if (superiorTid) {
-			await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: superiorTid,
-				text: `🚫 ${user.full_name} cancelled their off request (${row.startdate} → ${row.enddate}).`,
-			});
-		}
+		const approverTids = await approverTidsFor(env, user);
+		await Promise.allSettled(
+			approverTids.map((tid) =>
+				tgSendMessage(env.BOT_TOKEN, {
+					chat_id: tid,
+					text: `🚫 ${user.full_name} cancelled their off request (${row.startdate} → ${row.enddate}).`,
+				}),
+			),
+		);
 		return json({ ok: true });
 	}
 
@@ -389,10 +409,10 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			const { results } = await env.depot_db
 				.prepare(
 					`SELECT id, full_name, off_credits, department FROM users
-					 WHERE superior_telegram_id = ? AND full_name NOT LIKE 'PENDING:%'
+					 WHERE (superior_telegram_id = ? OR superior_telegram_id_2 = ?) AND full_name NOT LIKE 'PENDING:%'
 					 ORDER BY full_name`,
 				)
-				.bind(user.telegram_id)
+				.bind(user.telegram_id, user.telegram_id)
 				.all<{ id: number; full_name: string; off_credits: number; department: string | null }>();
 			return json(results ?? []);
 		}
@@ -400,17 +420,4 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });
-}
-
-async function resolveSuperiorTid(env: Env, superiorTid: string | null): Promise<string | null> {
-	if (superiorTid) return superiorTid;
-	return firstAdminTid(env);
-}
-
-// Fallback approver when a user has no superior set — the first superadmin.
-async function firstAdminTid(env: Env): Promise<string | null> {
-	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
-		.first<{ telegram_id: string }>();
-	return a?.telegram_id ?? null;
 }

@@ -36,7 +36,7 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 	if (request.method === 'GET' && sub === '/users') {
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, ord_date,
+				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, superior_telegram_id_2, ord_date,
 				        department, sub_department, personnel_type, off_credits, created_at
 				 FROM users ORDER BY full_name LIKE 'PENDING:%' DESC, full_name`,
 			)
@@ -50,6 +50,7 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 			full_name?: string;
 			user_role?: 'user' | 'admin' | 'superadmin';
 			superior_telegram_id?: string | null;
+			superior_telegram_id_2?: string | null;
 			ord_date?: string | null;
 			department?: string | null;
 			sub_department?: string | null;
@@ -82,13 +83,14 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 
 		await env.depot_db
 			.prepare(
-				`UPDATE users SET full_name = ?, user_role = ?, superior_telegram_id = ?,
+				`UPDATE users SET full_name = ?, user_role = ?, superior_telegram_id = ?, superior_telegram_id_2 = ?,
 				   ord_date = ?, department = ?, sub_department = ?, personnel_type = ? WHERE id = ?`,
 			)
 			.bind(
 				body.full_name.trim(),
 				targetRole,
 				body.superior_telegram_id?.trim() || null,
+				body.superior_telegram_id_2?.trim() || null,
 				ordDate,
 				departmentValue,
 				subDepartmentValue,
@@ -98,7 +100,7 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 			.run();
 		const updated = await env.depot_db
 			.prepare(
-				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, ord_date,
+				`SELECT id, telegram_id, full_name, user_role, superior_telegram_id, superior_telegram_id_2, ord_date,
 				        department, sub_department, personnel_type, off_credits, created_at
 				 FROM users WHERE id = ?`,
 			)
@@ -229,7 +231,24 @@ export async function handleAdmin(actx: AuthedContext): Promise<Response> {
 			)
 			.bind(body.override_date, isWorking, body.reason?.trim() || null, user.id)
 			.run();
-		return json({ ok: true });
+		// Forcing a day non-working makes it behave like a weekend: wipe every
+		// user's parade state for that date and drop any pending late-changes.
+		let clearedEntries = 0;
+		if (isWorking === 0) {
+			const del = await env.depot_db
+				.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date = ?`)
+				.bind(body.override_date)
+				.run();
+			clearedEntries = del.meta.changes ?? 0;
+			await env.depot_db
+				.prepare(
+					`UPDATE parade_change_requests SET status = 'cancelled'
+					 WHERE parade_state_date = ? AND status = 'pending'`,
+				)
+				.bind(body.override_date)
+				.run();
+		}
+		return json({ ok: true, cleared_entries: clearedEntries });
 	}
 
 	if (request.method === 'DELETE' && sub === '/overrides') {

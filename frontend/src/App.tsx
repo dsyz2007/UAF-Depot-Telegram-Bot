@@ -64,7 +64,7 @@ export default function App() {
 	return (
 		<div className="app">
 			<header className="appbar">
-				<span className="brand">CTAB UAF</span>
+				<span className="brand">UAF App</span>
 				<span className="username">{me.full_name} · {roleLabel(me.user_role)}</span>
 			</header>
 

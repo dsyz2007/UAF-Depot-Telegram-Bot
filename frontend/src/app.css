@@ -61,8 +61,8 @@ h4 {
 	justify-content: space-between;
 	align-items: center;
 	padding: 14px 18px;
-	/* Muted slate bar — calm, not distracting. */
-	background: linear-gradient(120deg, #3b4252, #434c5e);
+	/* Teal → indigo: a bit of life without being loud. */
+	background: linear-gradient(120deg, #0f766e, #2563eb);
 	color: #fff;
 	box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }

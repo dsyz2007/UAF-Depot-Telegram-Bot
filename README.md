@@ -12,7 +12,7 @@ Three core features today:
 Two helper features:
 
 - **Public-holiday awareness** for the reminders, sourced from nager.date with a confirm-before-trust workflow and superadmin overrides.
-- **ORD reminders** to superadmins at T-30 and T-0 days, with a Delete User button on the day-of message.
+- **ORD reminders** to superadmins on the ORD day, with a Delete User button on that message.
 
 ---
 
@@ -50,7 +50,8 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 
 | Tab | What they can do |
 |---|---|
-| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others). Weekend days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Duty tags available: Incoming/Outgoing Opr, ADS, DS, DO. **Auto-route:** if you mark **OFF / RSI / RSO** without having applied for it, the status still saves, then the app jumps you to the 📅 Off page (Request Off modal pre-filled with the dates) or the 🤒 Sick page (confirm to report RSI/RSO) so you formally apply. Skipped if you already have a matching pending/approved off or open sick case. |
+| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others) / Others. Weekend **and force-non-working** days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Status tags: Present, Course, AO, MA, MC, RSO, RSI, OFF, LL, OL, **Leave (Others)**, **Others**, then the duty block Incoming/Outgoing Opr/ADS/DS/DO (all coloured like Present, since they count as present on the ground). **Auto-route:** if you mark **OFF / RSI / RSO** without having applied for it, the status still saves, then the app jumps you to the 📅 Off page (Request Off modal pre-filled with the dates) or the 🤒 Sick page (confirm to report RSI/RSO) so you formally apply. Skipped if you already have a matching pending/approved off or open sick case. |
+| 🪖 Parade · **View state** | The strength report folds everyone on an **Incoming/Outgoing duty into the Present count**; the duty tags are not listed separately in the per-status breakdown. |
 | 📅 Off | See their own off-credit balance. Request an off (start/end + reason). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). View everyone's approved-off count + per-user detail. |
 | 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; plus Location and Approximate Time). Attach the MC by sending the photo/PDF directly to the bot in chat. |
 
@@ -68,7 +69,7 @@ Restriction: admins cannot grant the `superadmin` role; cannot delete users; can
 
 ### Self-managed users (superior = themselves)
 
-If a user's **Superior's Telegram ID equals their own telegram_id**, they are *self-managed* and bypass **every** approval step — there is no one above them to approve. Concretely:
+If **all** of a user's set superiors are themselves (e.g. Superior's Telegram ID = their own, and no real second superior), they are *self-managed* and bypass **every** approval step — there is no one above them to approve. (If a real second superior exists, that superior can approve, so they are not self-managed.) Concretely:
 - **Off requests** auto-approve instantly (credits still deducted).
 - **Off credits** they grant to themselves are added instantly.
 - **RSI / RSO** is logged as approved immediately — no superior DM, no update reminders, no MC required.
@@ -77,11 +78,13 @@ If a user's **Superior's Telegram ID equals their own telegram_id**, they are *s
 
 Set this up by entering the user's own telegram_id as their Superior's Telegram ID in the Edit-user modal. Typically used for the most senior account(s).
 
-### Approval routing & the no-superior fallback
+### Approval routing, two superiors & the no-superior fallback
 
-Every approvable request (off, off-credit, sick, late parade-state change) is routed to the requester's **superior** — the user whose telegram_id is stored in the requester's `superior_telegram_id`.
+Each user may have **up to two superiors** (`superior_telegram_id` + `superior_telegram_id_2`). Every approvable request (off, off-credit, sick, late parade-state change) is DM'd to **both** superiors, and **either one** can approve — from the chat buttons or the in-app Approvals inbox. The first to act wins; the other's chat buttons become idempotent (tapping them shows "Already approved/rejected"). The inbox shows the item to both superiors and removes it for both once actioned. The in-app→chat sync edits the **primary** superior's stored message.
 
 If a user has **no superior set** (and is not self-managed), the request DM falls back to the **first superadmin** (`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1` — lowest user id, so the choice is deterministic). This guarantees no orphaned request silently goes unapproved. Those requests also surface in the Approvals inbox because superadmins see **all** pending items there.
+
+A user is **self-managed** (bypasses all approvals) only when they have at least one superior set and *all* their set superiors are themselves. If a real second superior exists, that superior can approve — so they are not self-managed.
 
 Edge note: for a no-superior request, the app→chat message-edit sync keys on the requester's (null) `superior_telegram_id`, so if the fallback superadmin actions it from the **app** the chat DM's buttons won't auto-clear. Harmless — the inline button handler is idempotent ("Already approved"). This only affects users with no superior set; everyone with a superior is fully synced both ways.
 
@@ -94,7 +97,7 @@ Edge note: for a no-superior request, the app→chat message-edit sync keys on t
 | ⚙ Admin → Overrides | Can `+ Add override` (force a date to working or non-working) and remove existing overrides. |
 | ⚙ Admin → Holidays | Can **🔄 Force refresh now** (re-fetches nager.date and stages a confirm flow), **✅ Confirm / ❌ Reject** pending holiday changes, **+ Add holiday** manually (e.g. ad-hoc Polling Day), and **Remove** confirmed holidays. |
 | 🪖 Parade | Same single-date **Export CSV** as admin (no extra parade powers beyond admin). |
-| (Telegram DMs) | Receives **ORD reminders** at T-30 days and on-the-day (the day-of message includes a 🗑 Delete user button). Receives **public-holiday change** notifications from the daily nager.date diff, with `[Confirm] / [Reject] / [Treat as working day]` inline buttons. |
+| (Telegram DMs) | Receives an **ORD reminder** on the user's ORD day (with a 🗑 Delete user button). Receives **public-holiday change** notifications from the daily nager.date diff, with `[Confirm] / [Reject] / [Treat as working day]` inline buttons. |
 
 ---
 
@@ -199,9 +202,10 @@ Edit-lock cutoffs: today's AM after **07:00**, today's PM after **13:00** (worki
 
 ### ORD reminders (daily 12:00 SGT)
 
+Only a **same-day** reminder is sent (the T-30 heads-up was removed).
+
 | Trigger | Recipient | Message | Buttons |
 |---|---|---|---|
-| User with `ord_date = today + 30 days` | every superadmin | `⏳ ORD heads-up (30 days): {name} ORDs on {ord_date}.` | — |
 | User with `ord_date = today` | every superadmin | `🎉 ORD today: {name}. Use the button below to remove from the depot bot.` | `[🗑 Delete user]` |
 | Delete tapped (edited) | superadmin's DM | `🗑 {name} removed from depot bot (by {actor}).` | — |
 | After deletion | other superadmins | `🗑 {actor} removed {name} from the depot bot.` | — |
@@ -227,7 +231,8 @@ Edit-lock cutoffs: today's AM after **07:00**, today's PM after **13:00** (worki
    - **STG sub-department** — only appears when Department = STG. Choose `C1+C2` or `C3+C4`
    - **Role** — `user` / `admin` / `superadmin` (superadmin option only shown if you are one)
    - **Superior's Telegram ID** — the numeric ID of who approves this user's off / sick / credit-grant requests
-   - **ORD date** — used by the 08:00 SGT cron to DM all superadmins at T-30 and T-0 days
+   - **2nd Superior's Telegram ID** (optional) — a second approver; **either** superior can approve, and both receive the request DM and see it in their Approvals inbox
+   - **ORD date** — used by the daily cron to DM all superadmins on the user's ORD day
 4. **Save** persists the edit and updates the screen immediately.
 5. **🗑 Delete user** (superadmin only, not visible for your own row) — confirms first, hard-deletes the user. Their historical rows in off_requests / sick_cases / parade_state_entries are orphaned (left in place, queries LEFT JOIN so they show as "?").
 
@@ -257,6 +262,12 @@ Use this for weekend exercises, makeup days, or when MOM's holiday designation d
 3. Optionally enter a reason. Save.
 
 Override precedence: `working_day_overrides` > `public_holidays` > weekend rule.
+
+**Force non-working wipes that day's parade state.** When a superadmin force-sets a date to non-working, every user's parade entries for that date are deleted and any pending late-change requests for it are cancelled — the day is then treated exactly like a weekend (parade submissions for it are skipped).
+
+### Update a staff member's parade state (superior / superadmin)
+
+A superior can correct their own staff's parade state; a superadmin can edit anyone's. Open **🪖 Parade**, select the date, expand **👥 Show everyone's status**, and tap the **✏️** next to a person you're allowed to edit. The modal is locked to that single date and applies immediately (no approval gate — you're the approver).
 
 ### Revert an off approval
 
@@ -537,6 +548,7 @@ Always apply in numeric order on both local and remote.
 | `009_rename_others_status.sql` | Remap parade status value `Others → Leave (Others)` in `parade_state_entries` and pending `parade_change_requests`. |
 | `010_approval_notify.sql` | Adds `users.last_approval_notify_at`. (Was for a throttled digest; the design switched to per-request DMs + the in-app Approvals inbox, so this column is currently unused but harmless — left in place.) |
 | `011_parade_nudge_messages.sql` | New `parade_nudge_messages` table — tracks the most-recent parade reminder DM per `(user, target_date)` so an in-app status update can edit that message in place (showing the new AM/PM) instead of sending another notification. Pruned daily once the date is past. |
+| `012_second_superior.sql` | Adds `users.superior_telegram_id_2` — a user may have up to **two** superiors; either one can approve their off / sick / off-credit / late-parade requests. Additive column. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

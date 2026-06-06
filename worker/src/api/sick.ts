@@ -1,6 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { isSelfManaged } from '../types';
+import { approverTidsFor } from '../superiors';
 
 interface OpenCase {
 	id: number;
@@ -83,11 +84,12 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// Per-request DM with inline buttons (also actionable from the inbox).
-		const superiorTid = user.superior_telegram_id ?? (await firstAdminTid(env));
-		if (superiorTid) {
+		// Per-request DM with inline buttons to EACH superior (either may approve).
+		const approverTids = await approverTidsFor(env, user);
+		let firstMsgId: string | undefined;
+		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: superiorTid,
+				chat_id: tid,
 				text: `🟡 <b>${body.case_type}</b> request from ${user.full_name}.`,
 				parse_mode: 'HTML',
 				reply_markup: {
@@ -99,12 +101,13 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 					],
 				},
 			});
-			if (msg?.message_id) {
-				await env.depot_db
-					.prepare('UPDATE sick_cases SET approval_message_id = ? WHERE id = ?')
-					.bind(String(msg.message_id), ins.id)
-					.run();
-			}
+			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+		}
+		if (firstMsgId) {
+			await env.depot_db
+				.prepare('UPDATE sick_cases SET approval_message_id = ? WHERE id = ?')
+				.bind(firstMsgId, ins.id)
+				.run();
 		}
 		return json({ ok: true, id: ins.id });
 	}
@@ -220,13 +223,15 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.bind(user.id, body.id)
 			.run();
 
-		const superiorTid = user.superior_telegram_id ?? (await firstAdminTid(env));
-		if (superiorTid) {
-			await tgSendMessage(env.BOT_TOKEN, {
-				chat_id: superiorTid,
-				text: `🚫 ${user.full_name} cancelled their ${row.case_type} request.`,
-			});
-		}
+		const approverTids = await approverTidsFor(env, user);
+		await Promise.allSettled(
+			approverTids.map((tid) =>
+				tgSendMessage(env.BOT_TOKEN, {
+					chat_id: tid,
+					text: `🚫 ${user.full_name} cancelled their ${row.case_type} request.`,
+				}),
+			),
+		);
 		return json({ ok: true });
 	}
 
@@ -294,12 +299,4 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });
-}
-
-// Fallback approver when a user has no superior set — the first superadmin.
-async function firstAdminTid(env: Env): Promise<string | null> {
-	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
-		.first<{ telegram_id: string }>();
-	return a?.telegram_id ?? null;
 }

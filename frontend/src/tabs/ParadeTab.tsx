@@ -59,6 +59,8 @@ const STATUSES = [
 	'OFF',
 	'LL',
 	'OL',
+	'Leave (Others)',
+	'Others',
 	'Incoming Opr',
 	'Outgoing Opr',
 	'Incoming ADS',
@@ -67,9 +69,24 @@ const STATUSES = [
 	'Outgoing DS',
 	'Incoming DO',
 	'Outgoing DO',
-	'Leave (Others)',
 ] as const;
 type Status = (typeof STATUSES)[number];
+
+// Incoming/Outgoing duty statuses count as "present" for the strength tally
+// and are hidden from the per-status breakdown in the View-state report.
+const DUTY_PRESENT_STATUSES = new Set<string>([
+	'Incoming Opr',
+	'Outgoing Opr',
+	'Incoming ADS',
+	'Outgoing ADS',
+	'Incoming DS',
+	'Outgoing DS',
+	'Incoming DO',
+	'Outgoing DO',
+]);
+function isPresentish(status: string | null): boolean {
+	return status === 'Present' || (status !== null && DUTY_PRESENT_STATUSES.has(status));
+}
 
 const STATUS_LABELS: Record<Status, string> = {
 	Present: 'Present',
@@ -91,10 +108,12 @@ const STATUS_LABELS: Record<Status, string> = {
 	'Incoming DO': 'Incoming DO',
 	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
+	Others: 'Others',
 };
 
+const PRESENT_COLOR = '#4caf50';
 const COLORS: Record<string, string> = {
-	Present: '#4caf50',
+	Present: PRESENT_COLOR,
 	Course: '#ff9800',
 	AO: '#795548',
 	MA: '#26c6da',
@@ -104,15 +123,18 @@ const COLORS: Record<string, string> = {
 	OFF: '#9e9e9e',
 	LL: '#03a9f4',
 	OL: '#00897b',
-	'Incoming Opr': '#1e88e5',
-	'Outgoing Opr': '#3949ab',
-	'Incoming ADS': '#00acc1',
-	'Outgoing ADS': '#00838f',
-	'Incoming DS': '#7cb342',
-	'Outgoing DS': '#558b2f',
-	'Incoming DO': '#fb8c00',
-	'Outgoing DO': '#ef6c00',
 	'Leave (Others)': '#9c27b0',
+	Others: '#607d8b',
+	// Duty (Incoming/Outgoing) statuses share the Present colour — they count
+	// as present on the ground.
+	'Incoming Opr': PRESENT_COLOR,
+	'Outgoing Opr': PRESENT_COLOR,
+	'Incoming ADS': PRESENT_COLOR,
+	'Outgoing ADS': PRESENT_COLOR,
+	'Incoming DS': PRESENT_COLOR,
+	'Outgoing DS': PRESENT_COLOR,
+	'Incoming DO': PRESENT_COLOR,
+	'Outgoing DO': PRESENT_COLOR,
 };
 
 // IMPORTANT: use local-time components, NOT toISOString — DayPicker gives us
@@ -153,7 +175,8 @@ function periodByTimeSgt(): 'AM' | 'PM' {
 	return minutesIntoDay < 11 * 60 + 30 ? 'AM' : 'PM';
 }
 
-// All non-Present statuses, in the order the report lists them.
+// Statuses shown in the View-state per-status breakdown. Incoming/Outgoing duty
+// statuses are intentionally excluded — they're folded into the Present count.
 const NON_PRESENT_STATUSES = [
 	'Course',
 	'AO',
@@ -164,19 +187,12 @@ const NON_PRESENT_STATUSES = [
 	'OFF',
 	'LL',
 	'OL',
-	'Incoming Opr',
-	'Outgoing Opr',
-	'Incoming ADS',
-	'Outgoing ADS',
-	'Incoming DS',
-	'Outgoing DS',
-	'Incoming DO',
-	'Outgoing DO',
 	'Leave (Others)',
+	'Others',
 ] as const;
 
 // Statuses that make the reason field compulsory in the submit modal.
-const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'Leave (Others)']);
+const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'Leave (Others)', 'Others']);
 
 function isNsfish(t: string | null): boolean {
 	return t === 'NSF' || t === 'NSF Officer';
@@ -185,7 +201,8 @@ function isNsfish(t: string | null): boolean {
 function countSplit(rows: StrengthRow[]) {
 	const nsf = rows.filter((r) => isNsfish(r.personnel_type));
 	const reg = rows.filter((r) => r.personnel_type === 'Regular');
-	const present = (arr: StrengthRow[]) => arr.filter((r) => r.status === 'Present').length;
+	// Present = literal Present + anyone on an Incoming/Outgoing duty.
+	const present = (arr: StrengthRow[]) => arr.filter((r) => isPresentish(r.status)).length;
 	return { nsf, reg, nsfPresent: present(nsf), regPresent: present(reg) };
 }
 
@@ -218,16 +235,17 @@ function buildStrengthReport(users: StrengthRow[], period: 'AM' | 'PM'): string 
 		lines.push('');
 	}
 
-	// Total
+	// Total — Present folds in everyone on an Incoming/Outgoing duty.
 	const totalRegistered = users.length;
-	const totalPresent = users.filter((u) => u.status === 'Present').length;
+	const totalPresent = users.filter((u) => isPresentish(u.status)).length;
 	lines.push(`Total Strength: ${totalPresent}/${totalRegistered}`);
 	lines.push('');
 
-	// List all non-present Regulars + NSF Officers (one per row).
+	// List all genuinely-absent Regulars + NSF Officers (one per row). Duty
+	// statuses count as present, so they're excluded here too.
 	const listed = users.filter(
 		(u) =>
-			u.status !== 'Present' &&
+			!isPresentish(u.status) &&
 			(u.personnel_type === 'Regular' || u.personnel_type === 'NSF Officer'),
 	);
 	for (const u of listed) {
@@ -299,6 +317,11 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 	// "Everyone's status" is collapsed by default — its /api/parade/day fetch
 	// only fires when expanded, so most users never pay that read cost.
 	const [showEveryone, setShowEveryone] = useState(false);
+	// Who this caller may edit parade state for (superadmin → all; superiors →
+	// their reports). Drives the inline ✏️ buttons in the Everyone panel.
+	const [staffEdit, setStaffEdit] = useState<{ all: boolean; ids: Set<number> }>({ all: false, ids: new Set() });
+	const [editTarget, setEditTarget] = useState<{ id: number; name: string } | null>(null);
+	const canEditParade = (uid: number) => staffEdit.all || staffEdit.ids.has(uid);
 
 	// Fetch only the current user's entries for the visible month (~60 rows max).
 	function refreshMyMonth() {
@@ -330,6 +353,12 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 		await Promise.all([refreshMyMonth(), showEveryone ? refreshDay() : Promise.resolve()]);
 	}
 
+	useEffect(() => {
+		api
+			.get<{ all: boolean; ids: number[] }>('/api/parade/staff-ids')
+			.then((r) => setStaffEdit({ all: r.all, ids: new Set(r.ids) }))
+			.catch(() => {});
+	}, []);
 	useEffect(() => {
 		refreshMyMonth();
 	}, [month]);
@@ -479,9 +508,9 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 									// with AM/PM cells side-by-side. Users with no entries for
 									// this date come back as a single row with period=null —
 									// we still register them so they show up as "—/—".
-									const byUser = new Map<number, { full_name: string; AM?: Entry; PM?: Entry }>();
+									const byUser = new Map<number, { id: number; full_name: string; AM?: Entry; PM?: Entry }>();
 									for (const e of list) {
-										const cur = byUser.get(e.user_id) ?? { full_name: e.full_name };
+										const cur = byUser.get(e.user_id) ?? { id: e.user_id, full_name: e.full_name };
 										if (e.period === 'AM') cur.AM = e;
 										else if (e.period === 'PM') cur.PM = e;
 										byUser.set(e.user_id, cur);
@@ -498,8 +527,23 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 												</thead>
 												<tbody>
 													{users.map((u) => (
-														<tr key={u.full_name}>
-															<td>{u.full_name}</td>
+														<tr key={u.id}>
+															<td>
+																{u.full_name}
+																{canEditParade(u.id) && (
+																	<button
+																		className="btn-link"
+																		style={{ marginLeft: 6 }}
+																		title="Edit this person's state for the selected date"
+																		onClick={() => {
+																			setEditTarget({ id: u.id, name: u.full_name });
+																			setShowSubmit(true);
+																		}}
+																	>
+																		✏️
+																	</button>
+																)}
+															</td>
 															<td>{renderStatusCell(u.AM)}</td>
 															<td>{renderStatusCell(u.PM)}</td>
 														</tr>
@@ -520,7 +564,11 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 					initialDate={ymdKey(selectedDate)}
 					minIso={bounds.minIso}
 					maxIso={bounds.maxIso}
-					onClose={() => setShowSubmit(false)}
+					target={editTarget}
+					onClose={() => {
+						setShowSubmit(false);
+						setEditTarget(null);
+					}}
 					onDone={refresh}
 					onRoute={onRoute}
 				/>
@@ -541,6 +589,7 @@ function SubmitModal({
 	initialDate,
 	minIso,
 	maxIso,
+	target,
 	onClose,
 	onDone,
 	onRoute,
@@ -548,6 +597,9 @@ function SubmitModal({
 	initialDate: string;
 	minIso: string;
 	maxIso: string;
+	// When set, a superior/superadmin is editing this person's state for the
+	// single `initialDate` (no range, no auto-routing).
+	target?: { id: number; name: string } | null;
 	onClose: () => void;
 	onDone: () => Promise<void>;
 	onRoute: (action: RouteAction) => void;
@@ -611,13 +663,15 @@ function SubmitModal({
 		if (!canSave) return;
 		setBusy(true);
 		try {
+			const payload: Record<string, unknown> = { startdate, enddate, entries };
+			if (target) payload.user_id = target.id;
 			const res = await api.post<{
 				applied: number;
 				pending: number;
 				skipped_weekends: number;
 				suggest_off?: boolean;
 				suggest_sick?: 'RSI' | 'RSO' | null;
-			}>('/api/parade/submit', { startdate, enddate, entries });
+			}>('/api/parade/submit', payload);
 			await onDone();
 			onClose();
 			const parts =
@@ -625,22 +679,22 @@ function SubmitModal({
 					? `Full day: ${entries[0].status}`
 					: entries.map((e) => `${e.period}: ${e.status}`).join(' · ');
 			const range = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
-			let msg = `✅ ${parts}\nfor ${range}`;
+			let msg = target ? `✅ Updated ${target.name}\n${parts}\nfor ${range}` : `✅ ${parts}\nfor ${range}`;
 			if (res.pending > 0) {
 				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:00 / PM after 13:00, non-Present only).`;
 			}
 			if (res.skipped_weekends > 0) {
-				msg += `\n\n🟦 ${res.skipped_weekends} weekend day(s) skipped (no parade state on weekends).`;
+				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
 			}
 			if (res.applied === 0 && res.pending === 0) {
-				msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were weekends.' : '⚠ Nothing saved.';
+				msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
 			}
-			// If the user marked OFF / RSI / RSO without having applied, route them
-			// to the matching apply form (prioritise Off when both are flagged).
-			if (res.suggest_off) {
+			// Self-edits may auto-route to the Off / Sick apply form when the user
+			// marked OFF / RSI / RSO without applying. Staff edits never route.
+			if (!target && res.suggest_off) {
 				WebApp.showAlert(`${msg}\n\n📅 You marked OFF but haven't applied — opening the Off page to request it.`);
 				onRoute({ kind: 'off', start: startdate, end: enddate });
-			} else if (res.suggest_sick) {
+			} else if (!target && res.suggest_sick) {
 				WebApp.showAlert(`${msg}\n\n🤒 You marked ${res.suggest_sick} but haven't reported it — opening the Sick page.`);
 				onRoute({ kind: 'sick', sickType: res.suggest_sick });
 			} else {
@@ -677,21 +731,29 @@ function SubmitModal({
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3>Submit / Edit Parade Status</h3>
+				<h3>{target ? `Edit ${target.name}` : 'Submit / Edit Parade Status'}</h3>
 
-				<label>Start date<input
-					type="date"
-					value={startdate}
-					min={minIso}
-					max={maxIso}
-					onChange={(e) => {
-						const v = e.target.value;
-						setStartdate(v);
-						// Snap end date to start if it's empty or now before start.
-						if (!enddate || enddate < v) setEnddate(v);
-					}}
-				/></label>
-				<label>End date<input type="date" value={enddate} min={startdate || minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
+				{target ? (
+					<div className="muted" style={{ marginBottom: 8 }}>
+						Editing <b>{target.name}</b>'s state for <b>{initialDate}</b> (applies immediately).
+					</div>
+				) : (
+					<>
+						<label>Start date<input
+							type="date"
+							value={startdate}
+							min={minIso}
+							max={maxIso}
+							onChange={(e) => {
+								const v = e.target.value;
+								setStartdate(v);
+								// Snap end date to start if it's empty or now before start.
+								if (!enddate || enddate < v) setEnddate(v);
+							}}
+						/></label>
+						<label>End date<input type="date" value={enddate} min={startdate || minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
+					</>
+				)}
 
 				<div className="seg" style={{ marginBottom: 10 }}>
 					<button className={mode === 'fd' ? 'active' : ''} onClick={() => setMode('fd')}>FD Same Status</button>

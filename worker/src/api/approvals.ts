@@ -63,10 +63,12 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/approvals'.length);
 
-	// Items where I'm the approver. Superadmins see all pending items.
+	// Items where I'm one of the approvers. Superadmins see all pending items.
 	const meTid = user.telegram_id;
-	const superClause = isSuperadmin(user.user_role) ? '' : 'AND u.superior_telegram_id = ?';
-	const bindTid = (stmt: D1PreparedStatement) => (isSuperadmin(user.user_role) ? stmt : stmt.bind(meTid));
+	const superClause = isSuperadmin(user.user_role)
+		? ''
+		: 'AND (u.superior_telegram_id = ? OR u.superior_telegram_id_2 = ?)';
+	const bindTid = (stmt: D1PreparedStatement) => (isSuperadmin(user.user_role) ? stmt : stmt.bind(meTid, meTid));
 
 	if (request.method === 'GET' && (sub === '' || sub === '/')) {
 		const offs = await bindTid(
@@ -153,7 +155,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.superior_message_id,
-				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id, u.off_credits
+				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id, u.superior_telegram_id_2, u.off_credits
 				 FROM off_requests o JOIN users u ON u.id = o.user_id WHERE o.id = ?`,
 			)
 			.bind(id)
@@ -167,10 +169,11 @@ async function applyAction(
 				full_name: string;
 				requester_tid: string;
 				superior_telegram_id: string | null;
+				superior_telegram_id_2: string | null;
 				off_credits: number;
 			}>();
 		if (!row || row.off_status !== 'pending') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id) return false;
+		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
 		const range = `${row.startdate} → ${row.enddate}`;
 
 		if (action === 'reject') {
@@ -205,7 +208,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.approval_message_id,
-				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id
+				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id, u.superior_telegram_id_2
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
 			.bind(id)
@@ -218,9 +221,10 @@ async function applyAction(
 				full_name: string;
 				requester_tid: string;
 				superior_telegram_id: string | null;
+				superior_telegram_id_2: string | null;
 			}>();
 		if (!row || row.reportsick_status !== 'pending_superior') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id) return false;
+		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
 
 		if (action === 'reject') {
 			await env.depot_db
@@ -261,7 +265,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status, g.granted_by, g.approval_message_id,
-				        u.telegram_id AS staff_tid, u.full_name AS staff_name, u.superior_telegram_id,
+				        u.telegram_id AS staff_tid, u.full_name AS staff_name, u.superior_telegram_id, u.superior_telegram_id_2,
 				        gr.telegram_id AS granter_tid
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
 				 JOIN users gr ON gr.id = g.granted_by WHERE g.id = ?`,
@@ -277,10 +281,11 @@ async function applyAction(
 				staff_tid: string;
 				staff_name: string;
 				superior_telegram_id: string | null;
+				superior_telegram_id_2: string | null;
 				granter_tid: string;
 			}>();
 		if (!row || row.status !== 'pending_superior') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id) return false;
+		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
 
 		if (action === 'reject') {
 			await env.depot_db
@@ -317,7 +322,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT p.id, p.user_id, p.parade_state_date, p.period, p.new_status, p.new_reason, p.status, p.approval_message_id,
-				        u.full_name, u.telegram_id AS user_tid, u.superior_telegram_id
+				        u.full_name, u.telegram_id AS user_tid, u.superior_telegram_id, u.superior_telegram_id_2
 				 FROM parade_change_requests p JOIN users u ON u.id = p.user_id WHERE p.id = ?`,
 			)
 			.bind(id)
@@ -333,9 +338,10 @@ async function applyAction(
 				full_name: string;
 				user_tid: string;
 				superior_telegram_id: string | null;
+				superior_telegram_id_2: string | null;
 			}>();
 		if (!row || row.status !== 'pending') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id) return false;
+		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
 
 		if (action === 'reject') {
 			await env.depot_db

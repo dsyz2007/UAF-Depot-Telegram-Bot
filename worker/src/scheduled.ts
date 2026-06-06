@@ -255,7 +255,7 @@ async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 
 	const { results } = await env.depot_db
 		.prepare(
-			`SELECT u.telegram_id, u.full_name, u.superior_telegram_id
+			`SELECT u.telegram_id, u.full_name, u.superior_telegram_id, u.superior_telegram_id_2
 			 FROM users u
 			 WHERE u.full_name NOT LIKE 'PENDING:%'
 			   AND NOT EXISTS (
@@ -264,17 +264,20 @@ async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 			   )`,
 		)
 		.bind(today, period)
-		.all<{ telegram_id: string; full_name: string; superior_telegram_id: string | null }>();
+		.all<{ telegram_id: string; full_name: string; superior_telegram_id: string | null; superior_telegram_id_2: string | null }>();
 	const missing = results ?? [];
 	if (!missing.length) return;
 
-	// Group by superior_telegram_id so each superior gets one consolidated DM.
+	// Group by superior so each superior gets one consolidated DM. A user with
+	// two superiors flags both of them.
 	const groups = new Map<string, string[]>();
 	for (const r of missing) {
-		if (!r.superior_telegram_id) continue;
-		const arr = groups.get(r.superior_telegram_id) ?? [];
-		arr.push(r.full_name);
-		groups.set(r.superior_telegram_id, arr);
+		const sups = [...new Set([r.superior_telegram_id, r.superior_telegram_id_2].filter(Boolean) as string[])];
+		for (const tid of sups) {
+			const arr = groups.get(tid) ?? [];
+			arr.push(r.full_name);
+			groups.set(tid, arr);
+		}
 	}
 
 	const cutoff = period === 'AM' ? '07:00' : '13:00';
@@ -290,17 +293,13 @@ async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 
 async function runOrdReminders(env: Env): Promise<void> {
 	const today = sgtToday();
-	const in30 = sgtDateAddDays(today, 30);
 
 	const { results: superadmins } = await env.depot_db
 		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin'`)
 		.all<{ telegram_id: string }>();
 	if (!superadmins?.length) return;
 
-	const { results: thirty } = await env.depot_db
-		.prepare(`SELECT id, full_name, ord_date FROM users WHERE ord_date = ?`)
-		.bind(in30)
-		.all<{ id: number; full_name: string; ord_date: string }>();
+	// Same-day ORD only (the 30-day heads-up was dropped per request).
 	const { results: today_ord } = await env.depot_db
 		.prepare(`SELECT id, full_name, ord_date FROM users WHERE ord_date = ?`)
 		.bind(today)
@@ -308,14 +307,6 @@ async function runOrdReminders(env: Env): Promise<void> {
 
 	const sends: Promise<unknown>[] = [];
 	for (const sa of superadmins) {
-		for (const u of thirty ?? []) {
-			sends.push(
-				tgSendMessage(env.BOT_TOKEN, {
-					chat_id: sa.telegram_id,
-					text: `⏳ ORD heads-up (30 days): ${u.full_name} ORDs on ${u.ord_date}.`,
-				}),
-			);
-		}
 		for (const u of today_ord ?? []) {
 			sends.push(
 				tgSendMessage(env.BOT_TOKEN, {

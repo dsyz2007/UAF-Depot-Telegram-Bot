@@ -2,6 +2,7 @@ import { json, type AuthedContext } from './router';
 import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, isSelfManaged, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
 import { isWorkingDay, sgtToday, sgtDateAddDays, dayOfWeekSgt } from '../holidays';
+import { approverTidsFor } from '../superiors';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
@@ -108,6 +109,21 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		return json(results ?? []);
 	}
 
+	// Which users the caller may edit parade state for (drives the inline Edit
+	// buttons in the "Everyone" panel). Superadmin → everyone; otherwise the
+	// caller's direct reports via either superior slot.
+	if (request.method === 'GET' && sub === '/staff-ids') {
+		if (user.user_role === 'superadmin') return json({ all: true, ids: [] as number[] });
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT id FROM users
+				 WHERE (superior_telegram_id = ? OR superior_telegram_id_2 = ?) AND full_name NOT LIKE 'PENDING:%'`,
+			)
+			.bind(user.telegram_id, user.telegram_id)
+			.all<{ id: number }>();
+		return json({ all: false, ids: (results ?? []).map((r) => r.id) });
+	}
+
 	// Deprecated — keep until any cached old WebApp bundles roll over. New
 	// frontend uses /my-month + /day above instead.
 	if (request.method === 'GET' && sub === '/month') {
@@ -133,6 +149,8 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			startdate?: string;
 			enddate?: string;
 			entries?: { period?: string; status?: string; reason?: string | null }[];
+			// Optional: a superior/superadmin editing one of their staff's state.
+			user_id?: number;
 		};
 		if (!isValidDate(body.startdate) || !isValidDate(body.enddate)) {
 			return json({ error: 'bad_dates' }, { status: 400 });
@@ -160,37 +178,49 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			return json({ error: 'no_period_filled' }, { status: 400 });
 		}
 
+		// Target resolution. By default a user edits their own state. A superior
+		// (either slot) may edit their staff; a superadmin may edit anyone.
+		const editingSelf = !Number.isInteger(body.user_id) || body.user_id === user.id;
+		let target: { id: number; full_name: string } = { id: user.id, full_name: user.full_name };
+		if (!editingSelf) {
+			const t = await env.depot_db
+				.prepare('SELECT id, full_name, superior_telegram_id, superior_telegram_id_2 FROM users WHERE id = ?')
+				.bind(body.user_id)
+				.first<{ id: number; full_name: string; superior_telegram_id: string | null; superior_telegram_id_2: string | null }>();
+			if (!t) return json({ error: 'user_not_found' }, { status: 404 });
+			const isSuper = user.user_role === 'superadmin';
+			const isTheirSuperior =
+				t.superior_telegram_id === user.telegram_id || t.superior_telegram_id_2 === user.telegram_id;
+			if (!isSuper && !isTheirSuperior) return json({ error: 'forbidden' }, { status: 403 });
+			target = { id: t.id, full_name: t.full_name };
+		}
+
 		const allDates = expandRange(body.startdate, body.enddate);
 
-		// Skip weekend days (Sat/Sun) in the range — no parade state on weekends
-		// unless a working_day_override forces that specific day to working.
-		const weekendDates = allDates.filter((d) => {
-			const dow = dayOfWeekSgt(d);
-			return dow === 0 || dow === 6;
-		});
-		let forcedWorkingWeekends = new Set<string>();
-		if (weekendDates.length > 0) {
-			const placeholders = weekendDates.map(() => '?').join(',');
-			const { results } = await env.depot_db
-				.prepare(
-					`SELECT override_date FROM working_day_overrides
-					 WHERE is_working_day = 1 AND override_date IN (${placeholders})`,
-				)
-				.bind(...weekendDates)
-				.all<{ override_date: string }>();
-			forcedWorkingWeekends = new Set((results ?? []).map((r) => r.override_date));
-		}
+		// Working-day overrides covering the range. A forced non-working day is
+		// treated exactly like a weekend (skipped); a forced working day makes an
+		// otherwise-weekend date submittable. Override always wins.
+		const placeholders = allDates.map(() => '?').join(',');
+		const { results: ovRows } = await env.depot_db
+			.prepare(`SELECT override_date, is_working_day FROM working_day_overrides WHERE override_date IN (${placeholders})`)
+			.bind(...allDates)
+			.all<{ override_date: string; is_working_day: number }>();
+		const overrideMap = new Map((ovRows ?? []).map((r) => [r.override_date, r.is_working_day]));
+
 		const dates = allDates.filter((d) => {
+			const ov = overrideMap.get(d);
+			if (ov !== undefined) return ov === 1; // override wins over weekend rule
 			const dow = dayOfWeekSgt(d);
-			const isWeekend = dow === 0 || dow === 6;
-			return !isWeekend || forcedWorkingWeekends.has(d);
+			return !(dow === 0 || dow === 6); // skip weekends
 		});
 		const skippedWeekends = allDates.length - dates.length;
 
 		const today = sgtToday();
 		const minutesNow = sgtMinutesIntoDay();
-		// Self-managed users bypass the late-change approval gate entirely.
-		const todayIsWorking = isSelfManaged(user) ? false : await isWorkingDay(env, today);
+		// The late-change approval gate applies only to a user editing their OWN
+		// state and only when they're not self-managed. A superior/superadmin
+		// editing staff applies changes directly (they're the approver).
+		const todayIsWorking = editingSelf && !isSelfManaged(user) ? await isWorkingDay(env, today) : false;
 
 		// Classify each (date, period) entry into one of three buckets:
 		//   • on-time / future / non-working / past  → apply immediately
@@ -221,7 +251,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
 				} else {
 					// Apply now. Late Present applies silently (no superior FYI).
-					directOps.push(upsertStmt.bind(user.id, d, e.period, e.status, e.reason));
+					directOps.push(upsertStmt.bind(target.id, d, e.period, e.status, e.reason));
 				}
 			}
 		}
@@ -230,7 +260,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			await env.depot_db.batch(directOps);
 		}
 
-		const superiorTid = user.superior_telegram_id ?? (await firstAdminTidForParade(env));
+		const approverTids = pendingPayloads.length ? await approverTidsFor(env, user) : [];
 
 		// Stage pending requests — supersede any previous pending for the same
 		// (user, date, period) so the superior only ever sees the latest one.
@@ -255,11 +285,12 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			if (!ins) continue;
 			pendingIds.push(ins.id);
 
-			// Per-request DM with inline buttons (also actionable from the inbox).
-			if (superiorTid) {
-				const cutoff = p.period === 'AM' ? '07:00' : '13:00';
+			// Per-request DM with inline buttons to EACH superior (either may approve).
+			const cutoff = p.period === 'AM' ? '07:00' : '13:00';
+			let firstMsgId: string | undefined;
+			for (const tid of approverTids) {
 				const msg = await tgSendMessage(env.BOT_TOKEN, {
-					chat_id: superiorTid,
+					chat_id: tid,
 					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,
 					parse_mode: 'HTML',
 					reply_markup: {
@@ -271,73 +302,77 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 						],
 					},
 				});
-				if (msg?.message_id) {
-					await env.depot_db
-						.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`)
-						.bind(String(msg.message_id), ins.id)
-						.run();
-				}
+				if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+			}
+			if (firstMsgId) {
+				await env.depot_db
+					.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`)
+					.bind(firstMsgId, ins.id)
+					.run();
 			}
 		}
 
-		// ── Edit the most-recent parade nudge (if any) in place, so the user's
-		// update is reflected without sending another notification. Only today /
-		// tomorrow are ever nudged, so only those can have a tracked message.
-		const tomorrow = sgtDateAddDays(today, 1);
-		const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
-		for (const d of editableDates) {
-			const tracked = await env.depot_db
-				.prepare(`SELECT chat_id, message_id FROM parade_nudge_messages WHERE user_id = ? AND target_date = ?`)
-				.bind(user.id, d)
-				.first<{ chat_id: string; message_id: string }>();
-			if (!tracked) continue;
-			const cur = await env.depot_db
-				.prepare(
-					`SELECT MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am,
-					        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm
-					 FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ?`,
-				)
-				.bind(user.id, d)
-				.first<{ am: string | null; pm: string | null }>();
-			const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
-			// Keep the "Open Parade page" button so they can re-edit from the DM.
-			await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
-				inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
-			});
-		}
-
-		// ── Auto-route: if the user marked OFF / RSI / RSO but never applied for
-		// it, flag the frontend to bounce them to the Off / Sick apply form. The
-		// parade entry itself still saved normally above. Only when something was
-		// actually saved (a weekend-only range that got fully skipped shouldn't
-		// route anywhere).
-		const savedSomething = directOps.length > 0 || pendingPayloads.length > 0;
+		// The nudge-edit and auto-route below only make sense for a user editing
+		// their OWN state; a superior editing staff skips both.
 		let suggestOff = false;
-		if (savedSomething && clean.some((e) => e.status === 'OFF')) {
-			const existing = await env.depot_db
-				.prepare(
-					`SELECT 1 FROM off_requests
-					 WHERE user_id = ? AND off_status IN ('pending','approved')
-					   AND startdate <= ? AND enddate >= ? LIMIT 1`,
-				)
-				.bind(user.id, body.enddate, body.startdate)
-				.first();
-			suggestOff = !existing;
-		}
 		let suggestSick: 'RSI' | 'RSO' | null = null;
-		for (const t of ['RSI', 'RSO'] as const) {
-			if (!savedSomething || !clean.some((e) => e.status === t)) continue;
-			const existing = await env.depot_db
-				.prepare(
-					`SELECT 1 FROM sick_cases
-					 WHERE user_id = ? AND case_type = ?
-					   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
-				)
-				.bind(user.id, t)
-				.first();
-			if (!existing) {
-				suggestSick = t;
-				break;
+		if (editingSelf) {
+			// ── Edit the most-recent parade nudge (if any) in place, so the user's
+			// update is reflected without sending another notification. Only today /
+			// tomorrow are ever nudged, so only those can have a tracked message.
+			const tomorrow = sgtDateAddDays(today, 1);
+			const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
+			for (const d of editableDates) {
+				const tracked = await env.depot_db
+					.prepare(`SELECT chat_id, message_id FROM parade_nudge_messages WHERE user_id = ? AND target_date = ?`)
+					.bind(user.id, d)
+					.first<{ chat_id: string; message_id: string }>();
+				if (!tracked) continue;
+				const cur = await env.depot_db
+					.prepare(
+						`SELECT MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am,
+						        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm
+						 FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ?`,
+					)
+					.bind(user.id, d)
+					.first<{ am: string | null; pm: string | null }>();
+				const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
+				// Keep the "Open Parade page" button so they can re-edit from the DM.
+				await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
+					inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
+				});
+			}
+
+			// ── Auto-route: if the user marked OFF / RSI / RSO but never applied
+			// for it, flag the frontend to bounce them to the Off / Sick apply
+			// form. Only when something was actually saved (a weekend-only range
+			// that got fully skipped shouldn't route anywhere).
+			const savedSomething = directOps.length > 0 || pendingPayloads.length > 0;
+			if (savedSomething && clean.some((e) => e.status === 'OFF')) {
+				const existing = await env.depot_db
+					.prepare(
+						`SELECT 1 FROM off_requests
+						 WHERE user_id = ? AND off_status IN ('pending','approved')
+						   AND startdate <= ? AND enddate >= ? LIMIT 1`,
+					)
+					.bind(user.id, body.enddate, body.startdate)
+					.first();
+				suggestOff = !existing;
+			}
+			for (const t of ['RSI', 'RSO'] as const) {
+				if (!savedSomething || !clean.some((e) => e.status === t)) continue;
+				const existing = await env.depot_db
+					.prepare(
+						`SELECT 1 FROM sick_cases
+						 WHERE user_id = ? AND case_type = ?
+						   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
+					)
+					.bind(user.id, t)
+					.first();
+				if (!existing) {
+					suggestSick = t;
+					break;
+				}
 			}
 		}
 
@@ -349,6 +384,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			skipped_weekends: skippedWeekends,
 			suggest_off: suggestOff,
 			suggest_sick: suggestSick,
+			target_user_id: target.id,
 		});
 	}
 
@@ -427,13 +463,4 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });
-}
-
-// Fallback approver when the user has no superior_telegram_id set — pick any admin.
-// Fallback approver when a user has no superior set — the first superadmin.
-async function firstAdminTidForParade(env: Env): Promise<string | null> {
-	const a = await env.depot_db
-		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin' ORDER BY id LIMIT 1`)
-		.first<{ telegram_id: string }>();
-	return a?.telegram_id ?? null;
 }

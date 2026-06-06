@@ -19,6 +19,7 @@ interface AdminUser {
 	full_name: string;
 	user_role: 'user' | 'admin' | 'superadmin';
 	superior_telegram_id: string | null;
+	superior_telegram_id_2: string | null;
 	ord_date: string | null;
 	department: Department | null;
 	sub_department: StgSubDepartment | null;
@@ -209,6 +210,7 @@ function EditUserModal({
 	const [name, setName] = useState(stripped);
 	const [role, setRole] = useState<AdminUser['user_role']>(user.user_role);
 	const [supTid, setSupTid] = useState(user.superior_telegram_id ?? '');
+	const [supTid2, setSupTid2] = useState(user.superior_telegram_id_2 ?? '');
 	const [ordDate, setOrdDate] = useState(user.ord_date ?? '');
 	const [department, setDepartment] = useState<string>(user.department ?? '');
 	const [subDepartment, setSubDepartment] = useState<string>(user.sub_department ?? '');
@@ -231,6 +233,7 @@ function EditUserModal({
 				full_name: name,
 				user_role: role,
 				superior_telegram_id: supTid || null,
+				superior_telegram_id_2: supTid2 || null,
 				ord_date: ordDate || null,
 				department: department || null,
 				sub_department: department === 'STG' ? subDepartment || null : null,
@@ -293,6 +296,9 @@ function EditUserModal({
 				</label>
 				<label>Superior's Telegram ID (optional)
 					<input value={supTid} onChange={(e) => setSupTid(e.target.value)} placeholder="e.g. 123456789" />
+				</label>
+				<label>2nd Superior's Telegram ID (optional)
+					<input value={supTid2} onChange={(e) => setSupTid2(e.target.value)} placeholder="Either superior can approve" />
 				</label>
 				<label>ORD date (optional)
 					<input type="date" value={ordDate} onChange={(e) => setOrdDate(e.target.value)} />
