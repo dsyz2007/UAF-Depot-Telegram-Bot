@@ -320,27 +320,33 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			// ── Edit the most-recent parade nudge (if any) in place, so the user's
 			// update is reflected without sending another notification. Only today /
 			// tomorrow are ever nudged, so only those can have a tracked message.
-			const tomorrow = sgtDateAddDays(today, 1);
-			const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
-			for (const d of editableDates) {
-				const tracked = await env.depot_db
-					.prepare(`SELECT chat_id, message_id FROM parade_nudge_messages WHERE user_id = ? AND target_date = ?`)
-					.bind(user.id, d)
-					.first<{ chat_id: string; message_id: string }>();
-				if (!tracked) continue;
-				const cur = await env.depot_db
-					.prepare(
-						`SELECT MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am,
-						        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm
-						 FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ?`,
-					)
-					.bind(user.id, d)
-					.first<{ am: string | null; pm: string | null }>();
-				const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
-				// Keep the "Open Parade page" button so they can re-edit from the DM.
-				await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
-					inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
-				});
+			// Best-effort: never let a nudge-edit failure (e.g. migration 011 not
+			// applied yet, or a too-old Telegram message) break the save/route.
+			try {
+				const tomorrow = sgtDateAddDays(today, 1);
+				const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
+				for (const d of editableDates) {
+					const tracked = await env.depot_db
+						.prepare(`SELECT chat_id, message_id FROM parade_nudge_messages WHERE user_id = ? AND target_date = ?`)
+						.bind(user.id, d)
+						.first<{ chat_id: string; message_id: string }>();
+					if (!tracked) continue;
+					const cur = await env.depot_db
+						.prepare(
+							`SELECT MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am,
+							        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm
+							 FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ?`,
+						)
+						.bind(user.id, d)
+						.first<{ am: string | null; pm: string | null }>();
+					const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
+					// Keep the "Open Parade page" button so they can re-edit from the DM.
+					await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
+						inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
+					});
+				}
+			} catch (e) {
+				console.error('parade nudge-edit failed (non-fatal)', e);
 			}
 
 			// ── Auto-route: if the user marked OFF / RSI / RSO but never applied

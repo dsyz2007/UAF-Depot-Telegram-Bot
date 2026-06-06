@@ -19,10 +19,6 @@ interface OpenCase {
 	created_at: string;
 }
 
-function isAdminish(role: string): boolean {
-	return role === 'admin' || role === 'superadmin';
-}
-
 function isValidDate(s: unknown): s is string {
 	return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
@@ -235,9 +231,9 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true });
 	}
 
-	// Admin/superadmin reverts a sick approval/update.
+	// Revert a sick approval/update. Allowed for a superadmin (any case) or the
+	// superior who approved it (any role) — so user-role superiors can undo too.
 	if (request.method === 'POST' && sub === '/revert') {
-		if (!isAdminish(user.user_role)) return json({ error: 'forbidden' }, { status: 403 });
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 
@@ -267,7 +263,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		if (!['approved', 'updated', 'flagged'].includes(row.reportsick_status)) {
 			return json({ error: 'bad_state', state: row.reportsick_status }, { status: 409 });
 		}
-		if (user.user_role === 'admin' && row.superior_user_id !== user.id) {
+		if (user.user_role !== 'superadmin' && row.superior_user_id !== user.id) {
 			return json({ error: 'not_your_approval' }, { status: 403 });
 		}
 

@@ -59,7 +59,7 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 
 | Tab | Extras |
 |---|---|
-| 📊 Today | Visible (also shown to any non-admin who is someone's superior). Hosts the **✅ Approvals inbox** — all pending offs / sick / off-credits / late-parade-changes they approve, with per-item Approve/Reject and **Approve all** per type. Below that: who's on approved off today + open sick cases. |
+| 📊 Today | Visible (also shown to any non-admin who is someone's superior). Hosts the **✅ Approvals inbox** — all pending offs / sick / off-credits / late-parade-changes they approve, with per-item Approve/Reject and **Approve all** per type. Below it, **↩ Undo recent approvals** lists the sick cases + credit grants they approved in the last 14 days, each with an **Undo** (reverts the approval; for grants the credits are clawed back). Below that: who's on approved off today + open sick cases. |
 | 📅 Off | **Credit Off(s)** modal now offers a "Recipient" dropdown to credit one of their direct reports (still requires that staff's superior to approve). Can **↩ Revert** approvals they previously gave (credits refund automatically). |
 | 🪖 Parade | **Export CSV** for a single date (grouped by department, limited to the last 5 days) — file is delivered into your Telegram chat with the bot. Same capability as superadmin. |
 | ⚙ Admin | Visible. **Users**: edit name / department / STG sub-department / superior / ORD date / personnel type (NSF, NSF Officer, or Regular) for any user. **Overrides**: read-only view of working-day overrides. **Holidays**: read-only view of confirmed/pending public holidays. |
@@ -138,6 +138,7 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 | Approve → granter | granter | `✅ {approver} approved the off-credit for {recipient}: +N day(s).` | — |
 | Reject → recipient | recipient | `❌ Your off-credit request (N day[s]) was rejected by {approver}.` | — |
 | Reject → granter | granter | `❌ Your off-credit request for {recipient} (N day[s]) was rejected by {approver}.` | — |
+| Superior/superadmin **undoes** an approved grant | recipient + granter | `↩ Off-credit reverted by {actor}: −N day(s) from {recipient}.` (credits clawed back, floored at 0) | — |
 
 ### Sick (RSI / RSO)
 
@@ -153,7 +154,7 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 | +8h, status unset | superior | `🚩 {name} has not updated their {case_type} status after 8h.` | — |
 | User cancels pending | superior | `🚫 {name} cancelled their {case_type} request.` | — |
 | Personnel updates status | approving superior | `✅ {name} updated their {case_type}: {summary}` (summary includes MC days/dates + `loc:` / `time:` when given) | — |
-| Admin/superadmin reverts | requester + approver | `↩ {case_type} approval reverted by {actor} for {name}.` | — |
+| Superior/superadmin undoes (Today tab) | requester + approver | `↩ {case_type} approval reverted by {actor} for {name}.` (the approving superior — any role — or any superadmin) | — |
 | Personnel sends photo/PDF to the bot | the uploader | `📎 MC received and attached to your {case_type} case.` | — |
 | …with no active case | the uploader | `No active RSI/RSO case to attach this to. Report sick in the depot app first.` | — |
 | MC attached, superior is distinct | superior | the original photo/PDF, copied, captioned `📎 MC from {name} ({case_type}).` | — |
@@ -549,6 +550,7 @@ Always apply in numeric order on both local and remote.
 | `010_approval_notify.sql` | Adds `users.last_approval_notify_at`. (Was for a throttled digest; the design switched to per-request DMs + the in-app Approvals inbox, so this column is currently unused but harmless — left in place.) |
 | `011_parade_nudge_messages.sql` | New `parade_nudge_messages` table — tracks the most-recent parade reminder DM per `(user, target_date)` so an in-app status update can edit that message in place (showing the new AM/PM) instead of sending another notification. Pruned daily once the date is past. |
 | `012_second_superior.sql` | Adds `users.superior_telegram_id_2` — a user may have up to **two** superiors; either one can approve their off / sick / off-credit / late-parade requests. Additive column. |
+| `013_grant_reverted_status.sql` | Rebuilds `off_credit_grants` to add `'reverted'` to the status CHECK so an approved credit grant can be undone (credits clawed back). |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

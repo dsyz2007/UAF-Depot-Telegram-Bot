@@ -70,6 +70,8 @@ export function OffTab({
 	const [showRequest, setShowRequest] = useState(false);
 	const [reqPrefill, setReqPrefill] = useState<{ start: string; end: string } | null>(null);
 	const [showGive, setShowGive] = useState(false);
+	// Everyone's off library is hidden until explicitly shown (declutters the page).
+	const [showEveryone, setShowEveryone] = useState(false);
 
 	// When routed here from the Parade tab (user marked OFF without applying),
 	// open the Request Off modal prefilled with the dates. The ref guards
@@ -199,8 +201,7 @@ export function OffTab({
 		<div>
 			<div className="card" style={{ background: 'var(--depot-success)', color: '#fff' }}>
 				<div className="card-row">
-					<span>🪙 <b>{credits}</b> off credit{credits === 1 ? '' : 's'}</span>
-					<span style={{ fontSize: 12, opacity: 0.85 }}>Used when superior approves an off</span>
+					<span>🪙 Off Credit Balance: <b>{credits}</b></span>
 				</div>
 			</div>
 
@@ -244,18 +245,28 @@ export function OffTab({
 				</>
 			)}
 
-			<h4 className="section-title">Everyone</h4>
-			{summary.map((row) => (
-				<div key={row.id} className="row" onClick={() => setDetailUser(row)}>
-					<span>
-						{row.full_name}
-						{row.department && <span className="muted" style={{ marginLeft: 6 }}>· {row.department}</span>}
-					</span>
-					<span className="muted" style={{ fontSize: 13 }}>
-						🪙 {row.off_credits}
-					</span>
-				</div>
-			))}
+			{showEveryone &&
+				summary.map((row) => (
+					<div key={row.id} className="row" onClick={() => setDetailUser(row)}>
+						<span>
+							{row.full_name}
+							{row.department && <span className="muted" style={{ marginLeft: 6 }}>· {row.department}</span>}
+						</span>
+						<span className="muted" style={{ fontSize: 13 }}>
+							🪙 {row.off_credits}
+						</span>
+					</div>
+				))}
+
+			{/* Everyone's off library is collapsed by default — full-width toggle
+			    at the bottom so the page stays focused on your own off info. */}
+			<button
+				className="btn btn-secondary"
+				style={{ width: '100%', marginTop: 14 }}
+				onClick={() => setShowEveryone((v) => !v)}
+			>
+				{showEveryone ? '▲ Hide everyone' : `👥 Show Everyone (${summary.length})`}
+			</button>
 
 			{showRequest && (
 				<RequestOffModal

@@ -116,6 +116,44 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		});
 	}
 
+	// Recently-approved items the caller may UNDO: sick cases + credit grants
+	// they approved (superadmin sees all), within the last 14 days.
+	if (request.method === 'GET' && sub === '/recent') {
+		const isSuper = isSuperadmin(user.user_role);
+		const sickClause = isSuper ? '' : 'AND s.superior_user_id = ?';
+		const sickStmt = env.depot_db.prepare(
+			`SELECT s.id, u.full_name, s.case_type, s.reportsick_status, s.approved_at, s.updated_status
+			 FROM sick_cases s JOIN users u ON u.id = s.user_id
+			 WHERE s.reportsick_status IN ('approved','updated','flagged')
+			   AND s.approved_at >= datetime('now','-14 days') ${sickClause}
+			 ORDER BY s.approved_at DESC LIMIT 50`,
+		);
+		const sick = await (isSuper ? sickStmt : sickStmt.bind(user.id)).all<{
+			id: number;
+			full_name: string;
+			case_type: string;
+			reportsick_status: string;
+			approved_at: string | null;
+			updated_status: string | null;
+		}>();
+		const grantClause = isSuper ? '' : 'AND g.superior_user_id = ?';
+		const grantStmt = env.depot_db.prepare(
+			`SELECT g.id, u.full_name, g.num_days, g.reason, g.approved_at
+			 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
+			 WHERE g.status = 'approved'
+			   AND g.approved_at >= datetime('now','-14 days') ${grantClause}
+			 ORDER BY g.approved_at DESC LIMIT 50`,
+		);
+		const grants = await (isSuper ? grantStmt : grantStmt.bind(user.id)).all<{
+			id: number;
+			full_name: string;
+			num_days: number;
+			reason: string;
+			approved_at: string | null;
+		}>();
+		return json({ sick: sick.results ?? [], grants: grants.results ?? [] });
+	}
+
 	if (request.method === 'POST' && sub === '/act') {
 		const body = (await request.json()) as {
 			actions?: { type: 'off' | 'sick' | 'grant' | 'parade'; id: number; action: 'approve' | 'reject' }[];

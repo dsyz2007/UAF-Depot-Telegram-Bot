@@ -155,6 +155,74 @@ function ApprovalGroup({
 }
 // ───────────────────────────────────────────────────────────────────────────
 
+// ── Undo recently-approved sick cases + credit grants ──────────────────────
+interface RecentPayload {
+	sick: { id: number; full_name: string; case_type: string; reportsick_status: string; approved_at: string | null; updated_status: string | null }[];
+	grants: { id: number; full_name: string; num_days: number; reason: string; approved_at: string | null }[];
+}
+
+function RecentApprovals() {
+	const [data, setData] = useState<RecentPayload | null>(null);
+	const [busy, setBusy] = useState(false);
+
+	function refresh() {
+		return api.get<RecentPayload>('/api/approvals/recent').then(setData).catch(console.error);
+	}
+	useEffect(() => {
+		refresh();
+	}, []);
+
+	async function undo(kind: 'sick' | 'grant', id: number, label: string) {
+		const ok = await confirmDialog(`Undo this ${label}? This reverses the approval.`);
+		if (!ok) return;
+		setBusy(true);
+		try {
+			await api.post(kind === 'sick' ? '/api/sick/revert' : '/api/off/grant/revert', { id });
+			await refresh();
+			WebApp.showAlert('Reverted.');
+		} catch (e) {
+			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	if (!data) return null;
+	if (data.sick.length + data.grants.length === 0) return null;
+
+	return (
+		<div style={{ marginBottom: 18 }}>
+			<h3>↩ Undo recent approvals</h3>
+			<p className="muted" style={{ marginTop: -4 }}>Approvals you made in the last 14 days. Undoing a credit grant claws the credits back.</p>
+			{data.sick.map((s) => (
+				<div key={`s${s.id}`} className="card">
+					<div className="card-row">
+						<div style={{ minWidth: 0 }}>
+							<div>
+								{s.full_name} · {s.case_type} <span className="muted">({s.reportsick_status.replace(/_/g, ' ')})</span>
+							</div>
+							{s.updated_status && <div className="muted">{s.updated_status}</div>}
+						</div>
+						<button className="btn-link danger" disabled={busy} onClick={() => undo('sick', s.id, `${s.case_type} approval`)}>↩ Undo</button>
+					</div>
+				</div>
+			))}
+			{data.grants.map((g) => (
+				<div key={`g${g.id}`} className="card">
+					<div className="card-row">
+						<div style={{ minWidth: 0 }}>
+							<div>{g.full_name} · +{g.num_days} credit{g.num_days === 1 ? '' : 's'}</div>
+							{g.reason && <div className="muted">{g.reason}</div>}
+						</div>
+						<button className="btn-link danger" disabled={busy} onClick={() => undo('grant', g.id, 'credit grant')}>↩ Undo</button>
+					</div>
+				</div>
+			))}
+		</div>
+	);
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 interface OffRow {
 	id: number;
 	full_name: string;
@@ -208,6 +276,7 @@ export function TodayTab(_: { me: Me }) {
 	return (
 		<div>
 			<ApprovalsInbox />
+			<RecentApprovals />
 
 			<h3>📊 Today — {data.today}</h3>
 

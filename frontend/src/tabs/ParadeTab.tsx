@@ -99,8 +99,8 @@ const STATUS_LABELS: Record<Status, string> = {
 	OFF: 'OFF',
 	LL: 'LL (Local Leave)',
 	OL: 'OL (Overseas Leave)',
-	'Incoming Opr': 'Incoming Opr (Incoming Operator)',
-	'Outgoing Opr': 'Outgoing Opr (Outgoing Operator)',
+	'Incoming Opr': 'Incoming Opr',
+	'Outgoing Opr': 'Outgoing Opr',
 	'Incoming ADS': 'Incoming ADS',
 	'Outgoing ADS': 'Outgoing ADS',
 	'Incoming DS': 'Incoming DS',
@@ -691,12 +691,14 @@ function SubmitModal({
 			}
 			// Self-edits may auto-route to the Off / Sick apply form when the user
 			// marked OFF / RSI / RSO without applying. Staff edits never route.
+			// Navigate FIRST, then alert — Telegram's showAlert is modal/blocking
+			// on some clients, so doing it after guarantees the tab switch happens.
 			if (!target && res.suggest_off) {
-				WebApp.showAlert(`${msg}\n\n📅 You marked OFF but haven't applied — opening the Off page to request it.`);
 				onRoute({ kind: 'off', start: startdate, end: enddate });
+				WebApp.showAlert(`${msg}\n\n📅 You marked OFF but haven't applied — opening the Off page to request it.`);
 			} else if (!target && res.suggest_sick) {
-				WebApp.showAlert(`${msg}\n\n🤒 You marked ${res.suggest_sick} but haven't reported it — opening the Sick page.`);
 				onRoute({ kind: 'sick', sickType: res.suggest_sick });
+				WebApp.showAlert(`${msg}\n\n🤒 You marked ${res.suggest_sick} but haven't reported it — opening the Sick page.`);
 			} else {
 				WebApp.showAlert(msg);
 			}

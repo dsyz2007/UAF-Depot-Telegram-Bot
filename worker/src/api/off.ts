@@ -398,6 +398,52 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, days_refunded: days });
 	}
 
+	// -------- revert an APPROVED off-credit grant (claw back credits) ------
+	// Allowed for a superadmin (any) or the superior who approved it.
+	if (request.method === 'POST' && sub === '/grant/revert') {
+		const body = (await request.json()) as { id?: number };
+		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
+		const row = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, g.num_days, g.status, g.superior_user_id,
+				        u.telegram_id AS staff_tid, u.full_name AS staff_name,
+				        gr.telegram_id AS granter_tid
+				 FROM off_credit_grants g
+				 JOIN users u ON u.id = g.user_id
+				 LEFT JOIN users gr ON gr.id = g.granted_by
+				 WHERE g.id = ?`,
+			)
+			.bind(body.id)
+			.first<{
+				id: number;
+				user_id: number;
+				num_days: number;
+				status: string;
+				superior_user_id: number | null;
+				staff_tid: string;
+				staff_name: string;
+				granter_tid: string | null;
+			}>();
+		if (!row) return json({ error: 'not_found' }, { status: 404 });
+		if (row.status !== 'approved') return json({ error: 'not_approved' }, { status: 409 });
+		if (user.user_role !== 'superadmin' && row.superior_user_id !== user.id) {
+			return json({ error: 'not_your_approval' }, { status: 403 });
+		}
+		await env.depot_db.batch([
+			env.depot_db
+				.prepare(`UPDATE off_credit_grants SET status='reverted', cancelled_by=?, cancelled_at=datetime('now') WHERE id=?`)
+				.bind(user.id, body.id),
+			// MAX(0, …) so we never push the balance negative if they already spent it.
+			env.depot_db.prepare(`UPDATE users SET off_credits = MAX(0, off_credits - ?) WHERE id = ?`).bind(row.num_days, row.user_id),
+		]);
+		const msg = `↩ Off-credit reverted by ${user.full_name}: −${row.num_days} day(s) from ${row.staff_name}.`;
+		const sent = new Set<string>([user.telegram_id]);
+		const notify = (tid: string | null) =>
+			!tid || sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text: msg }));
+		await Promise.allSettled([notify(row.staff_tid), notify(row.granter_tid)]);
+		return json({ ok: true, days_clawed: row.num_days });
+	}
+
 	if (request.method === 'GET' && sub === '/staff') {
 		if (user.user_role === 'superadmin') {
 			const { results } = await env.depot_db
