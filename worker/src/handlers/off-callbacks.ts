@@ -67,56 +67,41 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
+		const days = dayCountInclusive(row.startdate, row.enddate);
+
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare(
-					`UPDATE off_requests SET off_status = 'rejected', approved_by = ?, approved_date = datetime('now') WHERE id = ?`,
-				)
-				.bind(superior.id, offId)
-				.run();
+			// Credits were reserved at request time — refund them on rejection.
+			await env.depot_db.batch([
+				env.depot_db
+					.prepare(`UPDATE off_requests SET off_status = 'rejected', approved_by = ?, approved_date = datetime('now') WHERE id = ?`)
+					.bind(superior.id, offId),
+				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
+			]);
 			await ctx.editMessageText(
 				`❌ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}) — rejected by ${superior.full_name}.`,
 			);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
-				text: `❌ Your off request (${row.startdate} → ${row.enddate}) has been rejected by ${superior.full_name}.`,
+				text: `❌ Your off request (${row.startdate} → ${row.enddate}) was rejected by ${superior.full_name}.\n🪙 ${days} credit(s) refunded.`,
 			});
 			return;
 		}
 
-		// Approve: deduct credits + record approval
-		const days = dayCountInclusive(row.startdate, row.enddate);
-		const balanceCheck = await env.depot_db
-			.prepare(`SELECT off_credits FROM users WHERE id = ?`)
-			.bind(row.user_id)
-			.first<{ off_credits: number }>();
-		if (!balanceCheck || balanceCheck.off_credits < days) {
-			await ctx.answerCallbackQuery({
-				text: `Insufficient credits — user has ${balanceCheck?.off_credits ?? 0}, needs ${days}.`,
-			});
-			return;
-		}
-
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(
-					`UPDATE off_requests SET off_status = 'approved', approved_by = ?, approved_date = datetime('now') WHERE id = ?`,
-				)
-				.bind(superior.id, offId),
-			env.depot_db
-				.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`)
-				.bind(days, row.user_id),
-		]);
+		// Approve: credits were already reserved at request time, so just record
+		// the approval (no further deduction).
+		await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status = 'approved', approved_by = ?, approved_date = datetime('now') WHERE id = ?`)
+			.bind(superior.id, offId)
+			.run();
 
 		await ctx.editMessageText(
 			`✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'}) — approved by ${superior.full_name}.`,
 		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
-		const remaining = balanceCheck.off_credits - days;
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your off (${row.startdate} → ${row.enddate}) approved by ${superior.full_name}.\n🪙 ${days} credit(s) used. Balance: ${remaining}.`,
+			text: `✅ Your off (${row.startdate} → ${row.enddate}) was approved by ${superior.full_name}.`,
 		});
 	});
 

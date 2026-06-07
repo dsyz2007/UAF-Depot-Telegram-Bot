@@ -67,10 +67,12 @@ export type ParadeStatus =
 	| 'Incoming DS'
 	| 'Outgoing DS'
 	| 'Incoming DO'
-	| 'Outgoing DO';
+	| 'Outgoing DO'
+	| 'NTM Swap-In'
+	| 'NTM Swap-Out';
 
 // Order: the two "Others" sit just above the Incoming/Outgoing duty block and
-// below everything else.
+// below everything else; the NTM Swap tags sit at the very end.
 export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Present',
 	'Course',
@@ -92,6 +94,8 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Outgoing DS',
 	'Incoming DO',
 	'Outgoing DO',
+	'NTM Swap-In',
+	'NTM Swap-Out',
 ];
 
 // Long-form labels for the legend / dropdown tooltips.
@@ -116,6 +120,8 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
 	Others: 'Others',
+	'NTM Swap-In': 'NTM Swap-In',
+	'NTM Swap-Out': 'NTM Swap-Out',
 };
 
 // Statuses that require a reason when submitting parade state.

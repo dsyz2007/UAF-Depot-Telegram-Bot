@@ -161,6 +161,11 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
+		// Reserve the credits NOW (at request time), not on approval — so a user
+		// can't queue several pending requests that together exceed their balance.
+		// Refunded if the request is rejected or cancelled.
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id).run();
+
 		// Per-request DM with inline buttons — sent to EACH of the user's
 		// superiors (either may approve). The inbox sync edits the primary
 		// superior's stored message; the others are idempotent if tapped later.
@@ -169,7 +174,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
-				text: `🟡 <b>Off request</b>\n${user.full_name}: ${body.startdate} → ${body.enddate} (${days} day${days === 1 ? '' : 's'})\nBalance after approval: ${user.off_credits - days}\nReason: ${body.reason}`,
+				text: `🟡 <b>Off request</b>\n${user.full_name}: ${body.startdate} → ${body.enddate} (${days} day${days === 1 ? '' : 's'})\nBalance (credits already reserved): ${user.off_credits - days}\nReason: ${body.reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
@@ -189,7 +194,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				.bind(firstMsgId, ins.id)
 				.run();
 		}
-		return json({ ok: true, id: ins.id, days_requested: days, balance_after_approval: user.off_credits - days });
+		return json({ ok: true, id: ins.id, days_requested: days, balance_after: user.off_credits - days });
 	}
 
 	// -------- credit offs (self or admin→staff, needs superior approval) --
@@ -319,13 +324,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (row.user_id !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
 		if (row.off_status !== 'pending') return json({ error: 'not_pending' }, { status: 409 });
 
-		await env.depot_db
-			.prepare(
-				`UPDATE off_requests SET off_status = 'cancelled',
-				   cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`,
-			)
-			.bind(user.id, body.id)
-			.run();
+		// Refund the credits reserved at request time.
+		const refundDays = dayCountInclusive(row.startdate, row.enddate);
+		await env.depot_db.batch([
+			env.depot_db
+				.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`)
+				.bind(user.id, body.id),
+			env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(refundDays, row.user_id),
+		]);
 
 		const approverTids = await approverTidsFor(env, user);
 		await Promise.allSettled(
@@ -339,9 +345,9 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true });
 	}
 
-	// -------- revert approval (admin/superadmin) -------------------------
+	// -------- revert an approved off (refund credits) --------------------
+	// Allowed for a superadmin (any) or the superior who approved it (any role).
 	if (request.method === 'POST' && sub === '/revert') {
-		if (!isAdminish(user.user_role)) return json({ error: 'forbidden' }, { status: 403 });
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
@@ -369,33 +375,25 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			}>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.off_status !== 'approved') return json({ error: 'not_approved' }, { status: 409 });
-		if (user.user_role === 'admin' && row.approved_by !== user.id) {
+		if (user.user_role !== 'superadmin' && row.approved_by !== user.id) {
 			return json({ error: 'not_your_approval' }, { status: 403 });
 		}
 
-		const days = dayCountInclusive(row.startdate, row.enddate);
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(
-					`UPDATE off_requests SET off_status = 'reverted',
-					   cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`,
-				)
-				.bind(user.id, body.id),
-			// Refund credits to the user
-			env.depot_db
-				.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`)
-				.bind(days, row.user_id),
-		]);
+		// Reopen as pending (back to the inbox). Credits were reserved at request
+		// time and stay reserved while pending — no refund here (they're only
+		// returned on reject/cancel).
+		await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status = 'pending', approved_by = NULL, approved_date = NULL WHERE id = ?`)
+			.bind(body.id)
+			.run();
 
-		const msg = `↩ Approval reverted by ${user.full_name}: off ${row.startdate} → ${row.enddate} for ${row.requester_name}. ${days} credit(s) refunded.`;
-		const sends: Promise<unknown>[] = [
-			tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg }),
-		];
+		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again.`;
+		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {
-			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: msg }));
+			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `↩ Off for ${row.requester_name} (${row.startdate} → ${row.enddate}) reverted to pending by ${user.full_name}.` }));
 		}
 		await Promise.allSettled(sends);
-		return json({ ok: true, days_refunded: days });
+		return json({ ok: true, reopened: true });
 	}
 
 	// -------- revert an APPROVED off-credit grant (claw back credits) ------
@@ -429,14 +427,15 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (user.user_role !== 'superadmin' && row.superior_user_id !== user.id) {
 			return json({ error: 'not_your_approval' }, { status: 403 });
 		}
+		// Reopen as pending (back to the inbox) and claw the credits back.
 		await env.depot_db.batch([
 			env.depot_db
-				.prepare(`UPDATE off_credit_grants SET status='reverted', cancelled_by=?, cancelled_at=datetime('now') WHERE id=?`)
-				.bind(user.id, body.id),
+				.prepare(`UPDATE off_credit_grants SET status='pending_superior', superior_user_id=NULL, approved_at=NULL WHERE id=?`)
+				.bind(body.id),
 			// MAX(0, …) so we never push the balance negative if they already spent it.
 			env.depot_db.prepare(`UPDATE users SET off_credits = MAX(0, off_credits - ?) WHERE id = ?`).bind(row.num_days, row.user_id),
 		]);
-		const msg = `↩ Off-credit reverted by ${user.full_name}: −${row.num_days} day(s) from ${row.staff_name}.`;
+		const msg = `↩ Off-credit reverted by ${user.full_name}: −${row.num_days} day(s) from ${row.staff_name} (pending approval again).`;
 		const sent = new Set<string>([user.telegram_id]);
 		const notify = (tid: string | null) =>
 			!tid || sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text: msg }));

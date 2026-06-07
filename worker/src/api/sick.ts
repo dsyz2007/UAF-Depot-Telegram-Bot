@@ -267,12 +267,13 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			return json({ error: 'not_your_approval' }, { status: 403 });
 		}
 
+		// Reopen as pending (back to the inbox) and clear the approval fields.
 		await env.depot_db
 			.prepare(
-				`UPDATE sick_cases SET reportsick_status = 'reverted',
-				   cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`,
+				`UPDATE sick_cases SET reportsick_status = 'pending_superior',
+				   superior_user_id = NULL, approved_at = NULL WHERE id = ?`,
 			)
-			.bind(user.id, body.id)
+			.bind(body.id)
 			.run();
 
 		await env.depot_db
@@ -283,15 +284,15 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.bind(body.id)
 			.run();
 
-		const msg = `↩ ${row.case_type} approval reverted by ${user.full_name} for ${row.requester_name}.`;
+		const msg = `↩ ${user.full_name} reverted your approved ${row.case_type} — it's pending approval again.`;
 		const sends: Promise<unknown>[] = [
 			tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg }),
 		];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {
-			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: msg }));
+			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `↩ ${row.case_type} for ${row.requester_name} reverted to pending by ${user.full_name}.` }));
 		}
 		await Promise.allSettled(sends);
-		return json({ ok: true });
+		return json({ ok: true, reopened: true });
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });

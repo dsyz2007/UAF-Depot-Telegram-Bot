@@ -120,6 +120,21 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 	// they approved (superadmin sees all), within the last 14 days.
 	if (request.method === 'GET' && sub === '/recent') {
 		const isSuper = isSuperadmin(user.user_role);
+		const offClause = isSuper ? '' : 'AND o.approved_by = ?';
+		const offStmt = env.depot_db.prepare(
+			`SELECT o.id, u.full_name, o.startdate, o.enddate, o.approved_date
+			 FROM off_requests o JOIN users u ON u.id = o.user_id
+			 WHERE o.off_status = 'approved'
+			   AND o.approved_date >= datetime('now','-14 days') ${offClause}
+			 ORDER BY o.approved_date DESC LIMIT 50`,
+		);
+		const offs = await (isSuper ? offStmt : offStmt.bind(user.id)).all<{
+			id: number;
+			full_name: string;
+			startdate: string;
+			enddate: string;
+			approved_date: string | null;
+		}>();
 		const sickClause = isSuper ? '' : 'AND s.superior_user_id = ?';
 		const sickStmt = env.depot_db.prepare(
 			`SELECT s.id, u.full_name, s.case_type, s.reportsick_status, s.approved_at, s.updated_status
@@ -151,7 +166,8 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			reason: string;
 			approved_at: string | null;
 		}>();
-		return json({ sick: sick.results ?? [], grants: grants.results ?? [] });
+		const offItems = (offs.results ?? []).map((o) => ({ ...o, days: dayCountInclusive(o.startdate, o.enddate) }));
+		return json({ offs: offItems, sick: sick.results ?? [], grants: grants.results ?? [] });
 	}
 
 	if (request.method === 'POST' && sub === '/act') {
@@ -213,30 +229,31 @@ async function applyAction(
 		if (!row || row.off_status !== 'pending') return false;
 		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
 		const range = `${row.startdate} → ${row.enddate}`;
+		const days = dayCountInclusive(row.startdate, row.enddate);
 
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare(`UPDATE off_requests SET off_status='rejected', approved_by=?, approved_date=datetime('now') WHERE id=?`)
-				.bind(approver.id, id)
-				.run();
+			// Credits were reserved at request time — refund them on rejection.
+			await env.depot_db.batch([
+				env.depot_db
+					.prepare(`UPDATE off_requests SET off_status='rejected', approved_by=?, approved_date=datetime('now') WHERE id=?`)
+					.bind(approver.id, id),
+				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
+			]);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
-				text: `❌ Your off request (${range}) has been rejected by ${approver.full_name}.`,
+				text: `❌ Your off request (${range}) was rejected by ${approver.full_name}.\n🪙 ${days} credit(s) refunded.`,
 			});
 			await syncChatMessage(env, row.superior_telegram_id, row.superior_message_id, `❌ ${row.full_name}'s off (${range}) — rejected by ${approver.full_name}.`);
 			return true;
 		}
-		const days = dayCountInclusive(row.startdate, row.enddate);
-		if (row.off_credits < days) return false; // insufficient credits — skip
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(`UPDATE off_requests SET off_status='approved', approved_by=?, approved_date=datetime('now') WHERE id=?`)
-				.bind(approver.id, id),
-			env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, row.user_id),
-		]);
+		// Approve: credits already reserved at request time — just record it.
+		await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status='approved', approved_by=?, approved_date=datetime('now') WHERE id=?`)
+			.bind(approver.id, id)
+			.run();
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your off (${range}) approved by ${approver.full_name}.\n🪙 ${days} credit(s) used. Balance: ${row.off_credits - days}.`,
+			text: `✅ Your off (${range}) was approved by ${approver.full_name}.`,
 		});
 		await syncChatMessage(env, row.superior_telegram_id, row.superior_message_id, `✅ ${row.full_name}'s off (${range}, ${days}d) — approved by ${approver.full_name}.`);
 		return true;

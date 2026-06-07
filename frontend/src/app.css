@@ -229,11 +229,98 @@ h4 {
 }
 
 .badge.status-pending_superior { background: var(--depot-warning); }
+.badge.status-pending { background: var(--depot-warning); }
 .badge.status-approved { background: var(--depot-success); }
 .badge.status-updated { background: var(--depot-info); }
 .badge.status-flagged { background: var(--depot-danger); }
+.badge.status-rejected { background: var(--depot-danger); }
 .badge.status-cancelled { background: #9e9e9e; }
 .badge.status-reverted { background: #9e9e9e; }
+
+/* --- Entry cards (off / sick / grant) ----------------------------------- */
+.entry-card {
+	background: var(--tg-theme-secondary-bg-color, #f7f7f7);
+	border-radius: var(--depot-radius);
+	padding: 11px 14px 11px 15px;
+	margin-bottom: 10px;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+	border-left: 4px solid var(--depot-info);
+}
+.entry-card.acc-pending,
+.entry-card.acc-pending_superior { border-left-color: var(--depot-warning); }
+.entry-card.acc-approved { border-left-color: var(--depot-success); }
+.entry-card.acc-rejected { border-left-color: var(--depot-danger); }
+.entry-card.acc-cancelled,
+.entry-card.acc-reverted { border-left-color: #9e9e9e; }
+/* Type-based accents (approvals inbox + undo list) */
+.entry-card.acc-off { border-left-color: #2563eb; }
+.entry-card.acc-sick { border-left-color: var(--depot-danger); }
+.entry-card.acc-grant { border-left-color: var(--depot-warning); }
+.entry-card.acc-parade { border-left-color: #0f766e; }
+
+/* Small uppercase type tag so request types are unmistakable at a glance. */
+.type-chip {
+	font-size: 10.5px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	padding: 2px 7px;
+	border-radius: 6px;
+	color: #fff;
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+.type-chip.off { background: #2563eb; }
+.type-chip.sick { background: var(--depot-danger); }
+.type-chip.grant { background: var(--depot-warning); }
+.type-chip.parade { background: #0f766e; }
+
+.entry-head {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+}
+.entry-title {
+	font-weight: 700;
+	font-size: 15px;
+}
+.entry-meta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 14px;
+	margin-top: 5px;
+	color: var(--tg-theme-hint-color, #888);
+	font-size: 12.5px;
+}
+.entry-reason {
+	margin-top: 7px;
+	font-size: 13.5px;
+	line-height: 1.35;
+	background: var(--tg-theme-bg-color, #fff);
+	border-radius: 8px;
+	padding: 6px 9px;
+}
+.entry-actions {
+	margin-top: 9px;
+	display: flex;
+	gap: 14px;
+}
+
+/* Spaced, bordered approve/reject buttons so they're hard to mis-tap. */
+.pill-btn {
+	background: transparent;
+	border: 1.5px solid #ccc;
+	border-radius: 10px;
+	padding: 7px 16px;
+	font-size: 16px;
+	line-height: 1;
+	cursor: pointer;
+	min-width: 50px;
+}
+.pill-btn:disabled { opacity: 0.5; }
+.pill-btn.approve { border-color: var(--depot-success); }
+.pill-btn.reject { border-color: var(--depot-danger); }
 
 .legend-chip {
 	color: #fff;

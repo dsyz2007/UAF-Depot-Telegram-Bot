@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
 import { api, confirmDialog, type Me } from '../lib/api';
+import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 // ── Approvals inbox ────────────────────────────────────────────────────────
 interface ApprovalsPayload {
@@ -26,6 +27,9 @@ function ApprovalsInbox() {
 	useEffect(() => {
 		refresh();
 	}, []);
+	// New requests arrive as Telegram DMs; sync the inbox when the superior
+	// returns to the app.
+	useFocusRefresh(refresh);
 
 	async function act(actions: ActionItem[], label: string) {
 		if (actions.length === 0) return;
@@ -57,7 +61,9 @@ function ApprovalsInbox() {
 				<>
 					{data.offs.length > 0 && (
 						<ApprovalGroup
-							title={`Offs (${data.offs.length})`}
+							title={`Off requests (${data.offs.length})`}
+							type="off"
+							chip="Off"
 							busy={busy}
 							onApproveAll={() => act(data.offs.map((o) => ({ type: 'off', id: o.id, action: 'approve' })), 'Approve all offs')}
 							rows={data.offs.map((o) => ({
@@ -71,7 +77,9 @@ function ApprovalsInbox() {
 					)}
 					{data.sick.length > 0 && (
 						<ApprovalGroup
-							title={`Sick (${data.sick.length})`}
+							title={`Sick — RSI/RSO (${data.sick.length})`}
+							type="sick"
+							chip="Sick"
 							busy={busy}
 							onApproveAll={() => act(data.sick.map((s) => ({ type: 'sick', id: s.id, action: 'approve' })), 'Approve all sick')}
 							rows={data.sick.map((s) => ({
@@ -85,12 +93,14 @@ function ApprovalsInbox() {
 					)}
 					{data.grants.length > 0 && (
 						<ApprovalGroup
-							title={`Off credits (${data.grants.length})`}
+							title={`Off-credit grants (${data.grants.length})`}
+							type="grant"
+							chip="Credit"
 							busy={busy}
 							onApproveAll={() => act(data.grants.map((g) => ({ type: 'grant', id: g.id, action: 'approve' })), 'Approve all credits')}
 							rows={data.grants.map((g) => ({
 								id: g.id,
-								main: `${g.full_name} · +${g.num_days}d`,
+								main: `${g.full_name} · +${g.num_days} credit${g.num_days === 1 ? '' : 's'}`,
 								sub: g.reason,
 								onApprove: () => act([{ type: 'grant', id: g.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'grant', id: g.id, action: 'reject' }], 'Reject'),
@@ -99,7 +109,9 @@ function ApprovalsInbox() {
 					)}
 					{data.parade.length > 0 && (
 						<ApprovalGroup
-							title={`Parade changes (${data.parade.length})`}
+							title={`Late parade changes (${data.parade.length})`}
+							type="parade"
+							chip="Parade"
 							busy={busy}
 							onApproveAll={() => act(data.parade.map((p) => ({ type: 'parade', id: p.id, action: 'approve' })), 'Approve all parade changes')}
 							rows={data.parade.map((p) => ({
@@ -119,17 +131,22 @@ function ApprovalsInbox() {
 
 function ApprovalGroup({
 	title,
+	type,
+	chip,
 	rows,
 	busy,
 	onApproveAll,
 }: {
 	title: string;
+	type: ApprovalType;
+	chip: string;
 	busy: boolean;
 	onApproveAll: () => void;
 	rows: { id: number; main: string; sub: string; onApprove: () => void; onReject: () => void }[];
 }) {
+	const accent = type === 'grant' ? 'acc-grant' : `acc-${type}`;
 	return (
-		<div style={{ marginTop: 12 }}>
+		<div style={{ marginTop: 14 }}>
 			<div className="card-row">
 				<h4 className="section-title" style={{ margin: 0 }}>{title}</h4>
 				{rows.length > 1 && (
@@ -137,17 +154,18 @@ function ApprovalGroup({
 				)}
 			</div>
 			{rows.map((r) => (
-				<div key={r.id} className="card">
-					<div className="card-row">
-						<div style={{ minWidth: 0 }}>
-							<div>{r.main}</div>
-							{r.sub && <div className="muted">{r.sub}</div>}
-						</div>
-						<div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-							<button className="btn-link" disabled={busy} onClick={r.onApprove}>✅</button>
-							<button className="btn-link danger" disabled={busy} onClick={r.onReject}>❌</button>
+				<div key={r.id} className={`entry-card ${accent}`}>
+					<div className="entry-head">
+						<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+							<span className={`type-chip ${type}`}>{chip}</span>
+							<span className="entry-title" style={{ fontSize: 14 }}>{r.main}</span>
+						</span>
+						<div style={{ display: 'flex', gap: 16, flexShrink: 0 }}>
+							<button className="pill-btn approve" disabled={busy} onClick={r.onApprove}>✅</button>
+							<button className="pill-btn reject" disabled={busy} onClick={r.onReject}>❌</button>
 						</div>
 					</div>
+					{r.sub && <div className="entry-meta"><span>{r.sub}</span></div>}
 				</div>
 			))}
 		</div>
@@ -157,6 +175,7 @@ function ApprovalGroup({
 
 // ── Undo recently-approved sick cases + credit grants ──────────────────────
 interface RecentPayload {
+	offs: { id: number; full_name: string; startdate: string; enddate: string; days: number; approved_date: string | null }[];
 	sick: { id: number; full_name: string; case_type: string; reportsick_status: string; approved_at: string | null; updated_status: string | null }[];
 	grants: { id: number; full_name: string; num_days: number; reason: string; approved_at: string | null }[];
 }
@@ -171,13 +190,15 @@ function RecentApprovals() {
 	useEffect(() => {
 		refresh();
 	}, []);
+	useFocusRefresh(refresh);
 
-	async function undo(kind: 'sick' | 'grant', id: number, label: string) {
+	async function undo(kind: 'off' | 'sick' | 'grant', id: number, label: string) {
 		const ok = await confirmDialog(`Undo this ${label}? This reverses the approval.`);
 		if (!ok) return;
 		setBusy(true);
 		try {
-			await api.post(kind === 'sick' ? '/api/sick/revert' : '/api/off/grant/revert', { id });
+			const path = kind === 'sick' ? '/api/sick/revert' : kind === 'grant' ? '/api/off/grant/revert' : '/api/off/revert';
+			await api.post(path, { id });
 			await refresh();
 			WebApp.showAlert('Reverted.');
 		} catch (e) {
@@ -188,34 +209,46 @@ function RecentApprovals() {
 	}
 
 	if (!data) return null;
-	if (data.sick.length + data.grants.length === 0) return null;
+	if (data.offs.length + data.sick.length + data.grants.length === 0) return null;
 
 	return (
 		<div style={{ marginBottom: 18 }}>
 			<h3>↩ Undo recent approvals</h3>
-			<p className="muted" style={{ marginTop: -4 }}>Approvals you made in the last 14 days. Undoing a credit grant claws the credits back.</p>
+			<p className="muted" style={{ marginTop: -4 }}>Approvals you made in the last 14 days. Undoing sends the request back to Pending approvals (credits are returned until it's approved again).</p>
+			{data.offs.map((o) => (
+				<div key={`o${o.id}`} className="entry-card acc-off">
+					<div className="entry-head">
+						<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+							<span className="type-chip off">Off</span>
+							<span className="entry-title" style={{ fontSize: 14 }}>{o.full_name}</span>
+						</span>
+						<button className="btn-link danger" disabled={busy} onClick={() => undo('off', o.id, 'off approval')}>↩ Undo</button>
+					</div>
+					<div className="entry-meta"><span>{o.startdate === o.enddate ? o.startdate : `${o.startdate} → ${o.enddate}`}</span><span>🗓 {o.days} day{o.days === 1 ? '' : 's'}</span></div>
+				</div>
+			))}
 			{data.sick.map((s) => (
-				<div key={`s${s.id}`} className="card">
-					<div className="card-row">
-						<div style={{ minWidth: 0 }}>
-							<div>
-								{s.full_name} · {s.case_type} <span className="muted">({s.reportsick_status.replace(/_/g, ' ')})</span>
-							</div>
-							{s.updated_status && <div className="muted">{s.updated_status}</div>}
-						</div>
+				<div key={`s${s.id}`} className="entry-card acc-sick">
+					<div className="entry-head">
+						<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+							<span className="type-chip sick">Sick</span>
+							<span className="entry-title" style={{ fontSize: 14 }}>{s.full_name} · {s.case_type}</span>
+						</span>
 						<button className="btn-link danger" disabled={busy} onClick={() => undo('sick', s.id, `${s.case_type} approval`)}>↩ Undo</button>
 					</div>
+					<div className="entry-meta"><span>{s.reportsick_status.replace(/_/g, ' ')}</span>{s.updated_status && <span>{s.updated_status}</span>}</div>
 				</div>
 			))}
 			{data.grants.map((g) => (
-				<div key={`g${g.id}`} className="card">
-					<div className="card-row">
-						<div style={{ minWidth: 0 }}>
-							<div>{g.full_name} · +{g.num_days} credit{g.num_days === 1 ? '' : 's'}</div>
-							{g.reason && <div className="muted">{g.reason}</div>}
-						</div>
+				<div key={`g${g.id}`} className="entry-card acc-grant">
+					<div className="entry-head">
+						<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+							<span className="type-chip grant">Credit</span>
+							<span className="entry-title" style={{ fontSize: 14 }}>{g.full_name} · +{g.num_days} credit{g.num_days === 1 ? '' : 's'}</span>
+						</span>
 						<button className="btn-link danger" disabled={busy} onClick={() => undo('grant', g.id, 'credit grant')}>↩ Undo</button>
 					</div>
+					{g.reason && <div className="entry-meta"><span>{g.reason}</span></div>}
 				</div>
 			))}
 		</div>
@@ -256,12 +289,16 @@ export function TodayTab(_: { me: Me }) {
 	const [data, setData] = useState<TodayPayload | null>(null);
 	const [error, setError] = useState<string | null>(null);
 
-	useEffect(() => {
-		api
+	function loadToday() {
+		return api
 			.get<TodayPayload>('/api/today')
 			.then(setData)
 			.catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+	}
+	useEffect(() => {
+		loadToday();
 	}, []);
+	useFocusRefresh(loadToday);
 
 	if (error) {
 		return (

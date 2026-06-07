@@ -3,6 +3,7 @@ import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
 import WebApp from '@twa-dev/sdk';
 import { api, type Me, type RouteAction } from '../lib/api';
+import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface Entry {
 	user_id: number;
@@ -69,6 +70,8 @@ const STATUSES = [
 	'Outgoing DS',
 	'Incoming DO',
 	'Outgoing DO',
+	'NTM Swap-In',
+	'NTM Swap-Out',
 ] as const;
 type Status = (typeof STATUSES)[number];
 
@@ -83,6 +86,8 @@ const DUTY_PRESENT_STATUSES = new Set<string>([
 	'Outgoing DS',
 	'Incoming DO',
 	'Outgoing DO',
+	'NTM Swap-In',
+	'NTM Swap-Out',
 ]);
 function isPresentish(status: string | null): boolean {
 	return status === 'Present' || (status !== null && DUTY_PRESENT_STATUSES.has(status));
@@ -109,6 +114,8 @@ const STATUS_LABELS: Record<Status, string> = {
 	'Outgoing DO': 'Outgoing DO',
 	'Leave (Others)': 'Leave (Others)',
 	Others: 'Others',
+	'NTM Swap-In': 'NTM Swap-In',
+	'NTM Swap-Out': 'NTM Swap-Out',
 };
 
 const PRESENT_COLOR = '#4caf50';
@@ -135,6 +142,8 @@ const COLORS: Record<string, string> = {
 	'Outgoing DS': PRESENT_COLOR,
 	'Incoming DO': PRESENT_COLOR,
 	'Outgoing DO': PRESENT_COLOR,
+	'NTM Swap-In': PRESENT_COLOR,
+	'NTM Swap-Out': PRESENT_COLOR,
 };
 
 // IMPORTANT: use local-time components, NOT toISOString — DayPicker gives us
@@ -366,6 +375,8 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 		if (showEveryone) refreshDay();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [selectedDate, showEveryone]);
+	// Sync when the user returns to the app (e.g. a late-change was approved).
+	useFocusRefresh(refresh);
 
 	const myToday = myMonthByDate.get(ymdKey(selectedDate));
 

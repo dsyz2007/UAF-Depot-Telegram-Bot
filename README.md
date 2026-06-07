@@ -36,9 +36,13 @@ Cron triggers (in `wrangler.jsonc`):
 | `0 10 * * *` | 18:00 prev day | nudge users with no AM entry for tomorrow (working days only) |
 | `30 21 * * *` | 05:30 same day | general parade-state nudge (reassures if already filled) |
 | `0 5,23 * * *` | 07:00 / 13:00 same day | AM-empty / PM-empty flag to superior (working days only) — same expression fires twice; handler routes by scheduled hour |
-| `0 4 * * *` | 12:00 same day | PM parade-state nudge + nager.date holiday refresh + ORD scan + parade-state pruning |
+| `0 4 * * *` | 12:00 same day | PM parade-state nudge + nager.date holiday refresh + ORD scan + pruning (parade entries >5 days; **off requests & sick cases ended >2 months ago**) |
 
 (Cloudflare free tier caps at 5 cron triggers per worker. The dual-fire `0 5,23` expression hits both AM and PM late-flag times with a single trigger.)
+
+### Live updates (no polling)
+
+The WebApp refreshes **on focus** — whenever it becomes visible again (you reopen it or tab back in), each tab re-fetches its own data via `useFocusRefresh`. There is **no timer-based polling**, so there's no steady request cost. Combined with the bot's Telegram DMs (which are the instant alert) and the fact that your own actions update the UI from their response, this covers approvals landing while you're away: you get the DM, tap back in, and the screen is already in sync. (A true server-push that updates an *idle, foregrounded* screen the instant someone else acts would need WebSockets/Durable Objects — a paid add-on — so it's intentionally not used.)
 
 ---
 
@@ -50,16 +54,16 @@ There are three roles: **`user`**, **`admin`**, **`superadmin`**. The first user
 
 | Tab | What they can do |
 |---|---|
-| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others) / Others. Weekend **and force-non-working** days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Status tags: Present, Course, AO, MA, MC, RSO, RSI, OFF, LL, OL, **Leave (Others)**, **Others**, then the duty block Incoming/Outgoing Opr/ADS/DS/DO (all coloured like Present, since they count as present on the ground). **Auto-route:** if you mark **OFF / RSI / RSO** without having applied for it, the status still saves, then the app jumps you to the 📅 Off page (Request Off modal pre-filled with the dates) or the 🤒 Sick page (confirm to report RSI/RSO) so you formally apply. Skipped if you already have a matching pending/approved off or open sick case. |
+| 🪖 Parade | Submit/edit own parade status for any date range — toggle **FD Same Status** (one status for the whole day) or **Diff AM, PM Status**. A reason is compulsory for Course / AO / MA / MC / RSO / RSI / Leave (Others) / Others. Weekend **and force-non-working** days in a range are skipped unless force-working. View the month calendar with their own AM/PM chips; "Everyone's status" for the selected day is a collapsible panel (lazy-loads on Show). Status tags: Present, Course, AO, MA, MC, RSO, RSI, OFF, LL, OL, **Leave (Others)**, **Others**, then the duty block Incoming/Outgoing Opr/ADS/DS/DO, and finally **NTM Swap-In / NTM Swap-Out** — the duty block and the NTM Swap tags are all coloured like Present and count toward the Present total (since they're present on the ground). **Auto-route:** if you mark **OFF / RSI / RSO** without having applied for it, the status still saves, then the app jumps you to the 📅 Off page (Request Off modal pre-filled with the dates) or the 🤒 Sick page (confirm to report RSI/RSO) so you formally apply. Skipped if you already have a matching pending/approved off or open sick case. |
 | 🪖 Parade · **View state** | The strength report folds everyone on an **Incoming/Outgoing duty into the Present count**; the duty tags are not listed separately in the per-status breakdown. |
-| 📅 Off | See their own off-credit balance. Request an off (start/end + reason). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). View everyone's approved-off count + per-user detail. |
+| 📅 Off | See their **Off Credit Balance**. Request an off (start/end + reason) — **credits are reserved the moment you submit** (so several pending requests can't collectively overspend); they're **refunded if the request is rejected or cancelled**, and simply confirmed on approval (no second deduction). Cancel their own pending off requests. **Credit Off(s)** — propose extra credits for themselves (requires their superior's approval). "My recent requests" shows the latest 3 with a **Show more** toggle (history is kept ~2 months). Everyone's off library is hidden behind a **👥 Show Everyone** button at the bottom. |
 | 🤒 Sick | Report sick (RSI in-camp / RSO outside). Cancel a pending sick report. Once approved, fill the structured MC form (number of days; if ≥1, MC start + end dates; plus Location and Approximate Time). Attach the MC by sending the photo/PDF directly to the bot in chat. |
 
 ### admin (everything `user` can do, plus)
 
 | Tab | Extras |
 |---|---|
-| 📊 Today | Visible (also shown to any non-admin who is someone's superior). Hosts the **✅ Approvals inbox** — all pending offs / sick / off-credits / late-parade-changes they approve, with per-item Approve/Reject and **Approve all** per type. Below it, **↩ Undo recent approvals** lists the sick cases + credit grants they approved in the last 14 days, each with an **Undo** (reverts the approval; for grants the credits are clawed back). Below that: who's on approved off today + open sick cases. |
+| 📊 Today | Visible (also shown to any non-admin who is someone's superior). Hosts the **✅ Approvals inbox** — all pending offs / sick / off-credits / late-parade-changes they approve, with per-item Approve/Reject and **Approve all** per type. Each row carries a colour-coded **type tag** (Off / Sick / Credit / Parade) and a coloured accent stripe so the different request types aren't confused, and the ✅/❌ buttons are spaced apart to avoid mis-taps. Below it, **↩ Undo recent approvals** lists the **offs / sick cases / credit grants** they approved in the last 14 days, each with an **Undo** — which **sends the request back to Pending approvals** (off & grant credits are returned until it's approved again). Below that: who's on approved off today + open sick cases. |
 | 📅 Off | **Credit Off(s)** modal now offers a "Recipient" dropdown to credit one of their direct reports (still requires that staff's superior to approve). Can **↩ Revert** approvals they previously gave (credits refund automatically). |
 | 🪖 Parade | **Export CSV** for a single date (grouped by department, limited to the last 5 days) — file is delivered into your Telegram chat with the bot. Same capability as superadmin. |
 | ⚙ Admin | Visible. **Users**: edit name / department / STG sub-department / superior / ORD date / personnel type (NSF, NSF Officer, or Regular) for any user. **Overrides**: read-only view of working-day overrides. **Holidays**: read-only view of confirmed/pending public holidays. |
@@ -118,13 +122,13 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 
 | Trigger | Recipient | Message | Buttons |
 |---|---|---|---|
-| User submits off request | superior | `🟡 Off request` / `{name}: {start} → {end} (N day[s])` / `Balance after approval: {bal}` / `Reason: {reason}` | `[✅ Approve] [❌ Reject]` `[📅 Open Off page]` |
+| User submits off request (credits reserved now) | superior | `🟡 Off request` / `{name}: {start} → {end} (N day[s])` / `Balance (credits already reserved): {bal}` / `Reason: {reason}` | `[✅ Approve] [❌ Reject]` `[📅 Open Off page]` |
 | Approve (edited, chat or app) | superior's DM | `✅ {name}'s off ({start} → {end}, N day[s]) — approved by {superior}.` | — |
 | Reject (edited) | superior's DM | `❌ {name}'s off ({start} → {end}) — rejected by {superior}.` | — |
-| Approve result | requester | `✅ Your off ({start} → {end}) approved by {superior}.` / `🪙 N credit(s) used. Balance: M.` | — |
-| Reject result | requester | `❌ Your off request ({start} → {end}) has been rejected by {superior}.` | — |
+| Approve result | requester | `✅ Your off ({start} → {end}) was approved by {superior}.` (credits already reserved at request — no second deduction) | — |
+| Reject result | requester | `❌ Your off request ({start} → {end}) was rejected by {superior}.` / `🪙 N credit(s) refunded.` | — |
 | User cancels pending | superior | `🚫 {name} cancelled their off request ({start} → {end}).` | — |
-| Admin/superadmin reverts | requester + original approver | `↩ Approval reverted by {actor}: off {start} → {end} for {name}. N credit(s) refunded.` | — |
+| Superior/superadmin undoes (Today tab or Off detail) | requester (+ approver FYI) | `↩ {actor} reverted your approved off ({start} → {end}) — it's pending approval again. N credit(s) returned for now.` (reopens in the inbox) | — |
 
 ### Off-credit grant
 
@@ -138,7 +142,7 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 | Approve → granter | granter | `✅ {approver} approved the off-credit for {recipient}: +N day(s).` | — |
 | Reject → recipient | recipient | `❌ Your off-credit request (N day[s]) was rejected by {approver}.` | — |
 | Reject → granter | granter | `❌ Your off-credit request for {recipient} (N day[s]) was rejected by {approver}.` | — |
-| Superior/superadmin **undoes** an approved grant | recipient + granter | `↩ Off-credit reverted by {actor}: −N day(s) from {recipient}.` (credits clawed back, floored at 0) | — |
+| Superior/superadmin **undoes** an approved grant | recipient + granter | `↩ Off-credit reverted by {actor}: −N day(s) from {recipient} (pending approval again).` (credits clawed back, floored at 0; reopens in the inbox) | — |
 
 ### Sick (RSI / RSO)
 
@@ -154,7 +158,7 @@ Every message the bot can send. `{braces}` are placeholders. `[Button]` = inline
 | +8h, status unset | superior | `🚩 {name} has not updated their {case_type} status after 8h.` | — |
 | User cancels pending | superior | `🚫 {name} cancelled their {case_type} request.` | — |
 | Personnel updates status | approving superior | `✅ {name} updated their {case_type}: {summary}` (summary includes MC days/dates + `loc:` / `time:` when given) | — |
-| Superior/superadmin undoes (Today tab) | requester + approver | `↩ {case_type} approval reverted by {actor} for {name}.` (the approving superior — any role — or any superadmin) | — |
+| Superior/superadmin undoes (Today tab) | requester (+ approver FYI) | `↩ {actor} reverted your approved {case_type} — it's pending approval again.` (the approving superior — any role — or any superadmin; reopens in the inbox) | — |
 | Personnel sends photo/PDF to the bot | the uploader | `📎 MC received and attached to your {case_type} case.` | — |
 | …with no active case | the uploader | `No active RSI/RSO case to attach this to. Report sick in the depot app first.` | — |
 | MC attached, superior is distinct | superior | the original photo/PDF, copied, captioned `📎 MC from {name} ({case_type}).` | — |
@@ -550,7 +554,7 @@ Always apply in numeric order on both local and remote.
 | `010_approval_notify.sql` | Adds `users.last_approval_notify_at`. (Was for a throttled digest; the design switched to per-request DMs + the in-app Approvals inbox, so this column is currently unused but harmless — left in place.) |
 | `011_parade_nudge_messages.sql` | New `parade_nudge_messages` table — tracks the most-recent parade reminder DM per `(user, target_date)` so an in-app status update can edit that message in place (showing the new AM/PM) instead of sending another notification. Pruned daily once the date is past. |
 | `012_second_superior.sql` | Adds `users.superior_telegram_id_2` — a user may have up to **two** superiors; either one can approve their off / sick / off-credit / late-parade requests. Additive column. |
-| `013_grant_reverted_status.sql` | Rebuilds `off_credit_grants` to add `'reverted'` to the status CHECK so an approved credit grant can be undone (credits clawed back). |
+| `013_grant_reverted_status.sql` | Rebuilds `off_credit_grants` to add `'reverted'` to the status CHECK. **Now optional/unused** — undoing an approval reopens the item as *pending* (back to the inbox) rather than marking it `reverted`, so this migration is not required. Harmless if already applied. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.
@@ -582,7 +586,7 @@ When you write a migration:
 | Workers requests | 100,000 / day | ~5,000 / day | 20× |
 | D1 reads | 5,000,000 / day | ~30,000 / day | 150× |
 | D1 writes | 100,000 / day | ~2,000 / day | 50× |
-| D1 storage | 5 GB | < 50 MB after years (parade entries auto-prune after 5 days) | trivial |
+| D1 storage | 5 GB | < 50 MB after years (parade entries prune after 5 days; off requests & sick cases prune ~2 months after they end) | trivial |
 | Cron triggers | unlimited (counted in 100k requests) | ~290 / day | trivial |
 | Workers Assets | unlimited | static React build (~100 KB gzip) | — |
 | Outbound fetch (nager.date, Telegram API) | unmetered | trivial | — |

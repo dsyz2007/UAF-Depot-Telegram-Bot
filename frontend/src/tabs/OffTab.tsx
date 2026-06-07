@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
 import { api, confirmDialog, type Me } from '../lib/api';
+import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface SummaryRow {
 	id: number;
@@ -72,6 +73,8 @@ export function OffTab({
 	const [showGive, setShowGive] = useState(false);
 	// Everyone's off library is hidden until explicitly shown (declutters the page).
 	const [showEveryone, setShowEveryone] = useState(false);
+	// "My recent requests" shows only the latest 3 until expanded.
+	const [showAllMine, setShowAllMine] = useState(false);
 
 	// When routed here from the Parade tab (user marked OFF without applying),
 	// open the Request Off modal prefilled with the dates. The ref guards
@@ -104,6 +107,10 @@ export function OffTab({
 		loadSummary().catch(console.error);
 		loadMine().catch(console.error);
 		loadGrants().catch(console.error);
+		// Re-fetch the live balance on every mount (e.g. switching back to this
+		// tab) — the `credits` state otherwise starts from the stale app-load
+		// value and self-managed auto-approvals wouldn't show until reopening.
+		loadMyCredits().catch(console.error);
 	}, []);
 
 	useEffect(() => {
@@ -119,6 +126,11 @@ export function OffTab({
 		}
 	}
 
+	// Sync when the user returns to the app (e.g. after a superior's approval DM).
+	useFocusRefresh(() => {
+		void Promise.all([loadMine(), loadGrants(), loadMyCredits()]);
+	});
+
 	async function cancelMine(id: number) {
 		const ok = await confirmDialog('Cancel this off request?');
 		if (!ok) return;
@@ -131,12 +143,12 @@ export function OffTab({
 		}
 	}
 	async function revertApproval(id: number) {
-		const ok = await confirmDialog('Revert this approval? Credits will be refunded.');
+		const ok = await confirmDialog('Revert this approval back to pending? Credits are returned until it is approved again.');
 		if (!ok) return;
 		try {
 			await api.post('/api/off/revert', { id });
 			await refreshAll();
-			WebApp.showAlert('Approval reverted, credits refunded.');
+			WebApp.showAlert('Reverted — back to pending approval.');
 		} catch (e) {
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -214,12 +226,13 @@ export function OffTab({
 				<>
 					<h4 className="section-title">Pending credit grants ({pendingGrants.length})</h4>
 					{pendingGrants.map((g) => (
-						<div key={g.id} className="card">
-							<div className="card-row">
-								<span><b>+{g.num_days} credit{g.num_days === 1 ? '' : 's'}</b> from {g.granted_by_name ?? '?'}</span>
+						<div key={g.id} className="entry-card acc-pending">
+							<div className="entry-head">
+								<span className="entry-title">🪙 +{g.num_days} credit{g.num_days === 1 ? '' : 's'}</span>
 								<span className="badge status-pending_superior">pending</span>
 							</div>
-							<div className="muted">{g.reason}</div>
+							<div className="entry-meta"><span>from {g.granted_by_name ?? '?'}</span></div>
+							{g.reason && <div className="entry-reason">{g.reason}</div>}
 						</div>
 					))}
 				</>
@@ -228,20 +241,32 @@ export function OffTab({
 			{mine.length > 0 && (
 				<>
 					<h4 className="section-title">My recent requests</h4>
-					{mine.map((m) => (
-						<div key={m.id} className="card">
-							<div className="card-row">
-								<span>
-									<b>{fmtDates(m)}</b> · {m.off_status}
-									{' · '}<span className="muted">{dayCount(m.startdate, m.enddate)} day(s)</span>
-								</span>
+					{(showAllMine ? mine : mine.slice(0, 3)).map((m) => {
+						const days = dayCount(m.startdate, m.enddate);
+						return (
+							<div key={m.id} className={`entry-card acc-${m.off_status}`}>
+								<div className="entry-head">
+									<span className="entry-title">📅 {fmtDates(m)}</span>
+									<span className={`badge status-${m.off_status}`}>{m.off_status}</span>
+								</div>
+								<div className="entry-meta">
+									<span>🗓 {days} day{days === 1 ? '' : 's'}</span>
+									{m.approved_by_name && <span>✓ {m.approved_by_name}</span>}
+								</div>
+								{m.reason && <div className="entry-reason">{m.reason}</div>}
 								{m.off_status === 'pending' && (
-									<button className="btn-link danger" onClick={() => cancelMine(m.id)}>🗑 Cancel</button>
+									<div className="entry-actions">
+										<button className="btn-link danger" onClick={() => cancelMine(m.id)}>🗑 Cancel</button>
+									</div>
 								)}
 							</div>
-							<div className="muted">{m.reason}</div>
-						</div>
-					))}
+						);
+					})}
+					{mine.length > 3 && (
+						<button className="btn-link" onClick={() => setShowAllMine((v) => !v)}>
+							{showAllMine ? '▲ Show less' : `▾ Show more (${mine.length - 3})`}
+						</button>
+					)}
 				</>
 			)}
 
@@ -317,10 +342,14 @@ function RequestOffModal({
 	async function submit() {
 		setBusy(true);
 		try {
-			await api.post('/api/off/request', { startdate, enddate, reason });
+			const res = await api.post<{ auto_approved?: boolean; balance_after?: number }>('/api/off/request', { startdate, enddate, reason });
 			await onDone();
 			onClose();
-			WebApp.showAlert(`Submitted — awaiting approval (${days} credit${days === 1 ? '' : 's'} will be deducted on approval).`);
+			WebApp.showAlert(
+				res.auto_approved
+					? `✅ Off applied (no approval needed). ${days} credit${days === 1 ? '' : 's'} used${res.balance_after != null ? `. Balance: ${res.balance_after}` : ''}.`
+					: `Submitted — awaiting approval. ${days} credit${days === 1 ? '' : 's'} reserved now (refunded if rejected or cancelled).`,
+			);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -370,10 +399,14 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 			// Omit staff_id to default to self on the server.
 			const payload: Record<string, unknown> = { num_days: Number(numDays), reason };
 			if (canCreditOthers && staffId !== '') payload.staff_id = staffId;
-			await api.post('/api/off/grant', payload);
+			const res = await api.post<{ auto_approved?: boolean; balance?: number }>('/api/off/grant', payload);
 			await onDone();
 			onClose();
-			WebApp.showAlert(`Submitted — ${numDays} off credit(s) pending superior approval.`);
+			WebApp.showAlert(
+				res.auto_approved
+					? `✅ ${numDays} off credit(s) added (no approval needed)${res.balance != null ? `. Balance: ${res.balance}` : ''}.`
+					: `Submitted — ${numDays} off credit(s) pending superior approval.`,
+			);
 		} catch (e) {
 			setBusy(false);
 			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);

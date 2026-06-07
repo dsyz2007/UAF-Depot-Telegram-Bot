@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import WebApp from '@twa-dev/sdk';
 import { api, confirmDialog, type Me } from '../lib/api';
+import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface OpenCase {
 	id: number;
@@ -52,6 +53,8 @@ export function SickTab({
 	useEffect(() => {
 		refresh();
 	}, []);
+	// Sync the case (e.g. superior approved it) when the user returns to the app.
+	useFocusRefresh(refresh);
 
 	// When routed here from the Parade tab (user marked RSI/RSO without
 	// reporting), stash the type; act on it once the open-case state has loaded.
@@ -180,20 +183,34 @@ export function SickTab({
 	}
 
 	const showUpdateForm = open.reportsick_status === 'approved' || open.reportsick_status === 'flagged';
+	const sickIcon = open.case_type === 'RSI' ? '🏥' : '🩺';
+	const sickAcc =
+		open.reportsick_status === 'approved' || open.reportsick_status === 'updated'
+			? 'acc-approved'
+			: open.reportsick_status === 'flagged'
+				? 'acc-rejected'
+				: 'acc-pending';
 
 	return (
 		<div>
-			<div className="card">
-				<div className="card-row">
-					<h3 style={{ margin: 0 }}>{open.case_type}</h3>
+			<div className={`entry-card ${sickAcc}`}>
+				<div className="entry-head">
+					<span className="entry-title">{sickIcon} {open.case_type}</span>
 					<span className={`badge status-${open.reportsick_status}`}>{open.reportsick_status.replace(/_/g, ' ')}</span>
 				</div>
-				<div className="muted">Submitted: {open.created_at}</div>
-				{open.approved_at && <div className="muted">Approved: {open.approved_at}</div>}
+				<div className="entry-meta">
+					<span>📝 {open.created_at}</span>
+					{open.approved_at && <span>✓ {open.approved_at}</span>}
+				</div>
+				{open.num_of_mc_days != null && open.num_of_mc_days >= 1 && (
+					<div className="entry-reason">
+						{open.num_of_mc_days} day(s) MC · {open.mc_start_date} → {open.mc_end_date}
+					</div>
+				)}
 				{open.reportsick_status === 'pending_superior' && (
-					<button className="btn-link danger" style={{ marginTop: 8 }} disabled={busy} onClick={cancelPending}>
-						🗑 Cancel request
-					</button>
+					<div className="entry-actions">
+						<button className="btn-link danger" disabled={busy} onClick={cancelPending}>🗑 Cancel request</button>
+					</div>
 				)}
 			</div>
 

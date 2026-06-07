@@ -65,6 +65,7 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 				runHolidayRefresh(env),
 				runOrdReminders(env),
 				runParadePrune(env),
+				runRetentionPrune(env),
 			]);
 			return;
 		case '0 5,23 * * *': {
@@ -329,6 +330,18 @@ async function runParadePrune(env: Env): Promise<void> {
 		env.depot_db.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < ?`).bind(cutoff),
 		// Nudge-message rows only matter for today/tomorrow; drop anything past.
 		env.depot_db.prepare(`DELETE FROM parade_nudge_messages WHERE target_date < ?`).bind(today),
+	]);
+}
+
+// Retention: delete off requests and sick cases that ended more than ~2 months
+// ago (SGT) to keep the DB small. "Ended" = an off's enddate, or a sick case's
+// MC end date (falling back to its created date when there's no MC).
+async function runRetentionPrune(env: Env): Promise<void> {
+	await env.depot_db.batch([
+		env.depot_db.prepare(`DELETE FROM off_requests WHERE enddate < date('now','+8 hours','-2 months')`),
+		env.depot_db.prepare(
+			`DELETE FROM sick_cases WHERE COALESCE(mc_end_date, date(created_at)) < date('now','+8 hours','-2 months')`,
+		),
 	]);
 }
 
