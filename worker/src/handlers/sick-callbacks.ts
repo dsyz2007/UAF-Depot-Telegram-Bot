@@ -4,14 +4,18 @@
 
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
+import { canApprove } from '../superiors';
 
 interface SickRow {
 	id: number;
 	user_id: number;
 	case_type: 'RSI' | 'RSO';
 	reportsick_status: string;
+	sick_date: string | null;
 	personnel_name: string;
 	personnel_tid: string;
+	dept: string | null;
+	sub: string | null;
 }
 
 export function registerSickCallbacks(bot: Bot, env: Env): void {
@@ -21,9 +25,9 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 		const superiorTid = String(ctx.from.id);
 
 		const superior = await env.depot_db
-			.prepare('SELECT id, full_name FROM users WHERE telegram_id = ?')
+			.prepare('SELECT id, full_name, user_role, appointment, department, sub_department FROM users WHERE telegram_id = ?')
 			.bind(superiorTid)
-			.first<{ id: number; full_name: string }>();
+			.first<{ id: number; full_name: string; user_role: string; appointment: string | null; department: string | null; sub_department: string | null }>();
 		if (!superior) {
 			await ctx.answerCallbackQuery({ text: 'You are not registered.' });
 			return;
@@ -31,8 +35,9 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 
 		const row = await env.depot_db
 			.prepare(
-				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status,
-				        u.full_name AS personnel_name, u.telegram_id AS personnel_tid
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
+				        u.full_name AS personnel_name, u.telegram_id AS personnel_tid,
+				        u.department AS dept, u.sub_department AS sub
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
 			.bind(sickId)
@@ -45,30 +50,49 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 			await ctx.answerCallbackQuery({ text: `Already ${row.reportsick_status}.` });
 			return;
 		}
+		if (!(await canApprove(env, superior, row.dept, row.sub, row.user_id))) {
+			await ctx.answerCallbackQuery({ text: 'Not authorised to action this.' });
+			return;
+		}
 
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare('UPDATE sick_cases SET reportsick_status = ? WHERE id = ?')
-				.bind('rejected', sickId)
+			const flipR = await env.depot_db
+				.prepare(`UPDATE sick_cases SET reportsick_status = 'rejected', rejected_by = ?, rejected_at = datetime('now') WHERE id = ? AND reportsick_status = 'pending_superior'`)
+				.bind(superior.id, sickId)
 				.run();
+			if ((flipR.meta.changes ?? 0) === 0) {
+				await ctx.answerCallbackQuery({ text: 'Already handled.' });
+				return;
+			}
+			// Roll back the optimistic parade entry for that day (if still set).
+			if (row.sick_date) {
+				await env.depot_db
+					.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND parade_status = ?`)
+					.bind(row.user_id, row.sick_date, row.case_type)
+					.run();
+			}
 			await ctx.editMessageText(`❌ ${row.personnel_name}'s ${row.case_type} request was rejected by ${superior.full_name}.`);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.personnel_tid,
-				text: `❌ Your ${row.case_type} request has been rejected by ${superior.full_name}.`,
+				text: `❌ Your ${row.case_type} request was rejected by ${superior.full_name}.${row.sick_date ? `\nYour parade status for ${row.sick_date} is now blank (unfilled).` : ''}`,
 			});
 			return;
 		}
 
-		// Approve flow: set approved + enqueue 3 reminders.
-		await env.depot_db
+		// Approve flow: atomic flip first, then enqueue 3 reminders.
+		const flipA = await env.depot_db
 			.prepare(
 				`UPDATE sick_cases
 				 SET reportsick_status = 'approved', superior_user_id = ?, approved_at = datetime('now')
-				 WHERE id = ?`,
+				 WHERE id = ? AND reportsick_status = 'pending_superior'`,
 			)
 			.bind(superior.id, sickId)
 			.run();
+		if ((flipA.meta.changes ?? 0) === 0) {
+			await ctx.answerCallbackQuery({ text: 'Already handled.' });
+			return;
+		}
 
 		// D1 supports batched prepared statements — one round-trip.
 		const stmt = env.depot_db.prepare(

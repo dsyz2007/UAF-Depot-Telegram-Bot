@@ -226,6 +226,10 @@ h4 {
 	border-radius: 12px;
 	font-size: 12px;
 	font-weight: 500;
+	/* When a long status wraps to a 2nd line, clone the padding/rounded
+	   background onto each line instead of cutting off mid-pill. */
+	-webkit-box-decoration-break: clone;
+	box-decoration-break: clone;
 }
 
 .badge.status-pending_superior { background: var(--depot-warning); }
@@ -257,6 +261,7 @@ h4 {
 .entry-card.acc-sick { border-left-color: var(--depot-danger); }
 .entry-card.acc-grant { border-left-color: var(--depot-warning); }
 .entry-card.acc-parade { border-left-color: #0f766e; }
+.entry-card.acc-leave { border-left-color: #0288d1; }
 
 /* Small uppercase type tag so request types are unmistakable at a glance. */
 .type-chip {
@@ -274,6 +279,7 @@ h4 {
 .type-chip.sick { background: var(--depot-danger); }
 .type-chip.grant { background: var(--depot-warning); }
 .type-chip.parade { background: #0f766e; }
+.type-chip.leave { background: #0288d1; }
 
 .entry-head {
 	display: flex;
@@ -305,6 +311,67 @@ h4 {
 	margin-top: 9px;
 	display: flex;
 	gap: 14px;
+}
+/* One labelled fact per line (used in Recent approvals so each request reads
+   cleanly rather than as a space-separated blob). */
+.entry-line {
+	margin-top: 4px;
+	font-size: 13px;
+	line-height: 1.35;
+}
+
+/* Credit Off(s) recipient picker — grouped-by-department scrollable list. */
+.credit-list {
+	max-height: 280px;
+	overflow-y: auto;
+	border: 1px solid var(--tg-theme-section-separator-color, #ddd);
+	border-radius: 10px;
+	background: var(--tg-theme-bg-color, #fff);
+}
+.credit-group-header {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--tg-theme-secondary-bg-color, #eef1f4);
+	color: var(--tg-theme-hint-color, #6b7280);
+	font-size: 11.5px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	padding: 5px 12px;
+}
+.credit-chip-check {
+	color: var(--depot-success, #2e7d32);
+	font-weight: 700;
+}
+.credit-option {
+	width: 100%;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 10px;
+	text-align: left;
+	background: transparent;
+	border: none;
+	border-bottom: 1px solid var(--tg-theme-section-separator-color, #eee);
+	padding: 10px 12px;
+	cursor: pointer;
+	font: inherit;
+	color: inherit;
+}
+.credit-option:last-child {
+	border-bottom: none;
+}
+.credit-option:hover,
+.credit-option:active {
+	background: var(--tg-theme-secondary-bg-color, #f1f3f5);
+}
+.credit-option.selected {
+	background: rgba(46, 125, 50, 0.14);
+	box-shadow: inset 3px 0 0 var(--depot-success, #2e7d32);
+}
+.credit-option-name {
+	font-weight: 500;
 }
 
 /* Spaced, bordered approve/reject buttons so they're hard to mis-tap. */

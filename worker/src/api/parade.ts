@@ -1,12 +1,16 @@
 import { json, type AuthedContext } from './router';
-import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, isSelfManaged, type ParadeStatus } from '../types';
+import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, autoApprovesOwn, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
-import { isWorkingDay, sgtToday, sgtDateAddDays, dayOfWeekSgt } from '../holidays';
+import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
-const AM_CUTOFF_MIN = 7 * 60; // 07:00 SGT
+// Sentinel "status" meaning: clear (delete) this period's entry so the day
+// reverts to the original empty/blank state. Not a real parade status.
+const CLEAR_STATUS = 'Blank';
+
+const AM_CUTOFF_MIN = 7 * 60 + 30; // 07:30 SGT — staff may self-edit (no approval) until now
 const PM_CUTOFF_MIN = 13 * 60; // 13:00 SGT
 
 // SGT minutes-into-day (0..1439). Uses UTC + 8h offset (no DST in SG).
@@ -88,6 +92,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id AS user_id, u.full_name, u.department, u.sub_department,
+				        u.user_role, u.personnel_type,
 				        p.parade_state_date, p.period, p.parade_status, p.reason
 				 FROM users u
 				 LEFT JOIN parade_state_entries p
@@ -101,6 +106,8 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				full_name: string;
 				department: string | null;
 				sub_department: string | null;
+				user_role: string | null;
+				personnel_type: string | null;
 				parade_state_date: string | null;
 				period: 'AM' | 'PM' | null;
 				parade_status: string | null;
@@ -113,15 +120,65 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	// buttons in the "Everyone" panel). Superadmin → everyone; otherwise the
 	// caller's direct reports via either superior slot.
 	if (request.method === 'GET' && sub === '/staff-ids') {
-		if (user.user_role === 'superadmin') return json({ all: true, ids: [] as number[] });
+		if (user.user_role === 'admin' || user.user_role === 'superadmin') return json({ all: true, ids: [] as number[] });
+		// Appointment-holders may edit their own unit's members.
+		if (user.appointment) {
+			const { results } = await env.depot_db
+				.prepare(
+					`SELECT id FROM users
+					 WHERE department = ? AND IFNULL(sub_department,'') = IFNULL(?, '')
+					   AND id != ? AND full_name NOT LIKE 'PENDING:%'`,
+				)
+				.bind(user.department, user.sub_department ?? null, user.id)
+				.all<{ id: number }>();
+			return json({ all: false, ids: (results ?? []).map((r) => r.id) });
+		}
+		return json({ all: false, ids: [] as number[] });
+	}
+
+	// View ONE person's month forecast (admin/superadmin only), rate-limited per
+	// viewer per day: users cannot, admins 40/day, superadmins 300/day.
+	if (request.method === 'GET' && sub === '/user-month') {
+		if (user.user_role !== 'admin' && user.user_role !== 'superadmin') {
+			return json({ error: 'forbidden' }, { status: 403 });
+		}
+		const targetId = Number(url.searchParams.get('user_id'));
+		const ym = url.searchParams.get('ym') ?? '';
+		if (!Number.isInteger(targetId)) return json({ error: 'bad_user' }, { status: 400 });
+		if (!/^\d{4}-\d{2}$/.test(ym)) return json({ error: 'bad_ym' }, { status: 400 });
+
+		const cap = user.user_role === 'superadmin' ? 300 : 40;
+		const today = sgtToday();
+		const usedRow = await env.depot_db
+			.prepare(`SELECT count FROM forecast_views WHERE viewer_id = ? AND view_date = ?`)
+			.bind(user.id, today)
+			.first<{ count: number }>();
+		const used = usedRow?.count ?? 0;
+		if (used >= cap) return json({ error: 'view_limit', cap, used }, { status: 429 });
+
+		// Validate the target BEFORE charging a view, so a bad/stale id doesn't burn quota.
+		const target = await env.depot_db.prepare(`SELECT full_name FROM users WHERE id = ?`).bind(targetId).first<{ full_name: string }>();
+		if (!target) return json({ error: 'user_not_found' }, { status: 404 });
+
+		await env.depot_db
+			.prepare(
+				`INSERT INTO forecast_views (viewer_id, view_date, count) VALUES (?, ?, 1)
+				 ON CONFLICT(viewer_id, view_date) DO UPDATE SET count = count + 1`,
+			)
+			.bind(user.id, today)
+			.run();
+
+		const start = `${ym}-01`;
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT id FROM users
-				 WHERE (superior_telegram_id = ? OR superior_telegram_id_2 = ?) AND full_name NOT LIKE 'PENDING:%'`,
+				`SELECT parade_state_date, period, parade_status, reason
+				 FROM parade_state_entries
+				 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date < date(?, '+1 month')
+				 ORDER BY parade_state_date, period`,
 			)
-			.bind(user.telegram_id, user.telegram_id)
-			.all<{ id: number }>();
-		return json({ all: false, ids: (results ?? []).map((r) => r.id) });
+			.bind(targetId, start, start)
+			.all<{ parade_state_date: string; period: 'AM' | 'PM'; parade_status: string; reason: string | null }>();
+		return json({ full_name: target.full_name, entries: results ?? [], cap, remaining: cap - used - 1 });
 	}
 
 	// Deprecated — keep until any cached old WebApp bundles roll over. New
@@ -165,10 +222,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			if (e.period !== 'AM' && e.period !== 'PM') return json({ error: 'bad_period' }, { status: 400 });
 			if (seenPeriods.has(e.period)) return json({ error: 'duplicate_period' }, { status: 400 });
 			seenPeriods.add(e.period);
-			if (typeof e.status !== 'string' || !ALLOWED_STATUS.has(e.status)) {
+			// CLEAR_STATUS ('Blank') is a valid action — it deletes the entry.
+			if (typeof e.status !== 'string' || (e.status !== CLEAR_STATUS && !ALLOWED_STATUS.has(e.status))) {
 				return json({ error: 'bad_status' }, { status: 400 });
 			}
-			const reason = e.reason?.trim() || null;
+			const reason = e.status === CLEAR_STATUS ? null : e.reason?.trim() || null;
 			if (REASON_REQUIRED.has(e.status) && !reason) {
 				return json({ error: 'reason_required', status: e.status, period: e.period }, { status: 400 });
 			}
@@ -181,72 +239,134 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		// Target resolution. By default a user edits their own state. A superior
 		// (either slot) may edit their staff; a superadmin may edit anyone.
 		const editingSelf = !Number.isInteger(body.user_id) || body.user_id === user.id;
-		let target: { id: number; full_name: string } = { id: user.id, full_name: user.full_name };
+		let target: { id: number; full_name: string; department: string | null } = {
+			id: user.id,
+			full_name: user.full_name,
+			department: user.department,
+		};
 		if (!editingSelf) {
 			const t = await env.depot_db
-				.prepare('SELECT id, full_name, superior_telegram_id, superior_telegram_id_2 FROM users WHERE id = ?')
+				.prepare('SELECT id, full_name, department, sub_department FROM users WHERE id = ?')
 				.bind(body.user_id)
-				.first<{ id: number; full_name: string; superior_telegram_id: string | null; superior_telegram_id_2: string | null }>();
+				.first<{ id: number; full_name: string; department: string | null; sub_department: string | null }>();
 			if (!t) return json({ error: 'user_not_found' }, { status: 404 });
-			const isSuper = user.user_role === 'superadmin';
-			const isTheirSuperior =
-				t.superior_telegram_id === user.telegram_id || t.superior_telegram_id_2 === user.telegram_id;
-			if (!isSuper && !isTheirSuperior) return json({ error: 'forbidden' }, { status: 403 });
-			target = { id: t.id, full_name: t.full_name };
+			// Admins & superadmins may edit anyone; an appointment-holder only their
+			// own unit's members.
+			const canEditAnyone = user.user_role === 'admin' || user.user_role === 'superadmin';
+			const sameUnit =
+				!!user.appointment && t.department === user.department && (user.sub_department ?? '') === (t.sub_department ?? '');
+			if (!canEditAnyone && !sameUnit) return json({ error: 'forbidden' }, { status: 403 });
+			target = { id: t.id, full_name: t.full_name, department: t.department };
 		}
 
 		const allDates = expandRange(body.startdate, body.enddate);
-
-		// Working-day overrides covering the range. A forced non-working day is
-		// treated exactly like a weekend (skipped); a forced working day makes an
-		// otherwise-weekend date submittable. Override always wins.
-		const placeholders = allDates.map(() => '?').join(',');
-		const { results: ovRows } = await env.depot_db
-			.prepare(`SELECT override_date, is_working_day FROM working_day_overrides WHERE override_date IN (${placeholders})`)
-			.bind(...allDates)
-			.all<{ override_date: string; is_working_day: number }>();
-		const overrideMap = new Map((ovRows ?? []).map((r) => [r.override_date, r.is_working_day]));
-
-		const dates = allDates.filter((d) => {
-			const ov = overrideMap.get(d);
-			if (ov !== undefined) return ov === 1; // override wins over weekend rule
-			const dow = dayOfWeekSgt(d);
-			return !(dow === 0 || dow === 6); // skip weekends
-		});
-		const skippedWeekends = allDates.length - dates.length;
-
 		const today = sgtToday();
+
+		// Past-day lock: once a day has ended, only a superadmin may amend its
+		// parade state. Everyone else (incl. admins / appointment-holders) is
+		// blocked from editing any date before today (SGT).
+		const canEditPast = user.user_role === 'superadmin';
+		const notPast = allDates.filter((d) => canEditPast || d >= today);
+		const skippedPast = allDates.length - notPast.length;
+
+		// Working-day info covering the range (two queries total). A slot is
+		// skipped when its (department, period) is non-working — weekend / confirmed
+		// holiday, or a superadmin override forcing it non-working. An override can
+		// also force an otherwise-weekend slot working. A date is kept only if at
+		// least one of the submitted periods is working for the target's department.
+		const workInfo = await getRangeWorkInfo(env, notPast);
+		const targetDept = target.department;
+		const dates = notPast.filter((d) => clean.some((e) => slotWorking(workInfo.get(d)!, targetDept, e.period)));
+		const skippedWeekends = notPast.length - dates.length;
+
+		// Compulsory backing (self-edits only): OFF needs an off request covering
+		// every OFF date; RSI/RSO needs an active sick case of that type. If the
+		// application is missing we save NOTHING and tell the frontend to route
+		// the user to the Off / Sick page to apply first.
+		if (editingSelf && dates.length > 0) {
+			if (clean.some((e) => e.status === 'OFF')) {
+				const { results: offReqs } = await env.depot_db
+					.prepare(
+						`SELECT startdate, enddate FROM off_requests
+						 WHERE user_id = ? AND off_status IN ('pending','approved')
+						   AND startdate <= ? AND enddate >= ?`,
+					)
+					.bind(user.id, body.enddate, body.startdate)
+					.all<{ startdate: string; enddate: string }>();
+				const covered = (d: string) => (offReqs ?? []).some((r) => r.startdate <= d && d <= r.enddate);
+				// Only require backing for dates where an OFF entry actually lands on a
+				// working slot (a per-department override can make one half non-working,
+				// in which case that OFF is skipped and needs no off request).
+				const needsBacking = (d: string) =>
+					clean.some((e) => e.status === 'OFF' && slotWorking(workInfo.get(d)!, targetDept, e.period));
+				const uncovered = dates.filter((d) => needsBacking(d) && !covered(d));
+				if (uncovered.length > 0) {
+					return json({ ok: true, applied: 0, pending: 0, skipped_weekends: skippedWeekends, skipped_past: skippedPast, blocked_off: true, uncovered_dates: uncovered });
+				}
+			}
+			for (const t of ['RSI', 'RSO'] as const) {
+				if (!clean.some((e) => e.status === t)) continue;
+				const existing = await env.depot_db
+					.prepare(
+						`SELECT 1 FROM sick_cases WHERE user_id = ? AND case_type = ?
+						   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
+					)
+					.bind(user.id, t)
+					.first();
+				if (!existing) {
+					return json({ ok: true, applied: 0, pending: 0, skipped_weekends: skippedWeekends, skipped_past: skippedPast, blocked_sick: t });
+				}
+			}
+		}
+
 		const minutesNow = sgtMinutesIntoDay();
 		// The late-change approval gate applies only to a user editing their OWN
-		// state and only when they're not self-managed. A superior/superadmin
+		// state, only when they're not self-managed, and NOT for Regulars (who can
+		// always update after the cutoffs without approval). A superior/superadmin
 		// editing staff applies changes directly (they're the approver).
-		const todayIsWorking = editingSelf && !isSelfManaged(user) ? await isWorkingDay(env, today) : false;
+		const gateApplies = editingSelf && !autoApprovesOwn(user) && user.personnel_type !== 'Regular';
 
-		// Classify each (date, period) entry into one of three buckets:
-		//   • on-time / future / non-working / past  → apply immediately
-		//   • LATE + status 'Present'                 → apply immediately, but
-		//       send an FYI to the superior (no approval needed)
-		//   • LATE + status ≠ 'Present'               → stage as pending change
+		// Classify each (date, period) entry into one of these buckets:
+		//   • status 'Blank'                          → delete the entry (a fix),
+		//       applies directly, no approval/backing
+		//   • on-time / future / past(superadmin)     → apply immediately
+		//   • LATE + status 'Present'/duty/RSI/RSO    → apply immediately
+		//   • LATE + other status                     → stage as pending change
 		//       request; superior must approve before it applies
-		// "Late" = target date is today (SGT) on a working day AND
-		//   AM submitted at/after 07:00  OR  PM submitted at/after 13:00.
+		// "Late" = target date is today (SGT) on a working slot AND
+		//   AM submitted at/after 07:30  OR  PM submitted at/after 13:00.
 		const directOps: ReturnType<typeof env.depot_db.prepare>[] = [];
+		const deleteOps: ReturnType<typeof env.depot_db.prepare>[] = [];
 		const upsertStmt = env.depot_db.prepare(
 			`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
 			 VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT(user_id, parade_state_date, period)
 			 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 		);
+		const deleteStmt = env.depot_db.prepare(
+			`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND period = ?`,
+		);
 		const pendingPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
 
 		for (const d of dates) {
 			for (const e of clean) {
+				// Skip a period whose (department, slot) is non-working.
+				if (!slotWorking(workInfo.get(d)!, targetDept, e.period)) continue;
+				// 'Blank' resets the slot to the original empty state.
+				if (e.status === CLEAR_STATUS) {
+					deleteOps.push(deleteStmt.bind(target.id, d, e.period));
+					continue;
+				}
 				const isLate =
-					todayIsWorking &&
+					gateApplies &&
 					d === today &&
 					((e.period === 'AM' && minutesNow >= AM_CUTOFF_MIN) ||
 						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
-				if (isLate && e.status !== 'Present') {
+				// RSI/RSO reaching here are already backed by an active sick case
+				// (the gate is the sick approval, and they're already shown
+				// optimistically) — so they apply directly, never staged again.
+				const noApprovalNeeded = e.status === 'Present' || e.status === 'Operator Off' || e.status === 'RSI' || e.status === 'RSO';
+				if (isLate && !noApprovalNeeded) {
 					// Late non-Present → needs superior approval.
 					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
 				} else {
@@ -256,9 +376,8 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			}
 		}
 
-		if (directOps.length > 0) {
-			await env.depot_db.batch(directOps);
-		}
+		if (directOps.length > 0) await env.depot_db.batch(directOps);
+		if (deleteOps.length > 0) await env.depot_db.batch(deleteOps);
 
 		const approverTids = pendingPayloads.length ? await approverTidsFor(env, user) : [];
 
@@ -312,16 +431,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			}
 		}
 
-		// The nudge-edit and auto-route below only make sense for a user editing
-		// their OWN state; a superior editing staff skips both.
-		let suggestOff = false;
-		let suggestSick: 'RSI' | 'RSO' | null = null;
+		// Edit the most-recent parade nudge (if any) in place, so the user's own
+		// update is reflected without sending another notification. Only today /
+		// tomorrow are ever nudged. Best-effort — never let a nudge-edit failure
+		// break the save. (OFF/RSI/RSO backing was already enforced upfront.)
 		if (editingSelf) {
-			// ── Edit the most-recent parade nudge (if any) in place, so the user's
-			// update is reflected without sending another notification. Only today /
-			// tomorrow are ever nudged, so only those can have a tracked message.
-			// Best-effort: never let a nudge-edit failure (e.g. migration 011 not
-			// applied yet, or a too-old Telegram message) break the save/route.
 			try {
 				const tomorrow = sgtDateAddDays(today, 1);
 				const editableDates = [...new Set(dates)].filter((d) => d === today || d === tomorrow);
@@ -348,48 +462,15 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			} catch (e) {
 				console.error('parade nudge-edit failed (non-fatal)', e);
 			}
-
-			// ── Auto-route: if the user marked OFF / RSI / RSO but never applied
-			// for it, flag the frontend to bounce them to the Off / Sick apply
-			// form. Only when something was actually saved (a weekend-only range
-			// that got fully skipped shouldn't route anywhere).
-			const savedSomething = directOps.length > 0 || pendingPayloads.length > 0;
-			if (savedSomething && clean.some((e) => e.status === 'OFF')) {
-				const existing = await env.depot_db
-					.prepare(
-						`SELECT 1 FROM off_requests
-						 WHERE user_id = ? AND off_status IN ('pending','approved')
-						   AND startdate <= ? AND enddate >= ? LIMIT 1`,
-					)
-					.bind(user.id, body.enddate, body.startdate)
-					.first();
-				suggestOff = !existing;
-			}
-			for (const t of ['RSI', 'RSO'] as const) {
-				if (!savedSomething || !clean.some((e) => e.status === t)) continue;
-				const existing = await env.depot_db
-					.prepare(
-						`SELECT 1 FROM sick_cases
-						 WHERE user_id = ? AND case_type = ?
-						   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
-					)
-					.bind(user.id, t)
-					.first();
-				if (!existing) {
-					suggestSick = t;
-					break;
-				}
-			}
 		}
 
 		return json({
 			ok: true,
-			applied: directOps.length,
+			applied: directOps.length + deleteOps.length,
 			pending: pendingPayloads.length,
 			pending_ids: pendingIds,
 			skipped_weekends: skippedWeekends,
-			suggest_off: suggestOff,
-			suggest_sick: suggestSick,
+			skipped_past: skippedPast,
 			target_user_id: target.id,
 		});
 	}

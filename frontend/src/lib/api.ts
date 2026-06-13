@@ -53,8 +53,8 @@ export const api = {
 	},
 };
 
-export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'STG' | 'Others';
-export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'STG', 'Others'];
+export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'DSP' | 'Others';
+export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others'];
 
 // Cross-tab navigation request: the Parade tab raises one of these when a user
 // marks OFF / RSI / RSO without having applied, so App can switch to the Off /
@@ -63,23 +63,38 @@ export type RouteAction =
 	| { kind: 'off'; start: string; end: string }
 	| { kind: 'sick'; sickType: 'RSI' | 'RSO' };
 
-export type StgSubDepartment = 'C1+C2' | 'C3+C4';
-export const STG_SUB_DEPARTMENTS: readonly StgSubDepartment[] = ['C1+C2', 'C3+C4'];
+export type PersonnelType = 'NSF' | 'Regular';
+export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'Regular'];
 
-export type PersonnelType = 'NSF' | 'NSF Officer' | 'Regular';
-export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'NSF Officer', 'Regular'];
+export type Appointment = 'WOIC' | '2IC' | 'PC';
+export const APPOINTMENTS: readonly Appointment[] = ['WOIC', '2IC', 'PC'];
+
+// Display labels. NSF → "N", Regular → "R". (Legacy 'NSF Officer' rows, if any
+// remain from before that type was removed, still render as "N".)
+export function personnelLabel(t: string | null | undefined): string {
+	if (t === 'Regular') return 'R';
+	if (t === 'NSF' || t === 'NSF Officer') return 'N';
+	return '';
+}
+
+// Department display label. STG was merged into a single "DSP" department, so
+// any legacy 'STG' rows (and their sub-sections) collapse to "DSP".
+export function deptLabel(department: string | null | undefined, _sub?: string | null | undefined): string {
+	if (department === 'DSP' || department === 'STG') return 'DSP';
+	return department ?? 'Unassigned';
+}
 
 export interface Me {
 	id: number;
 	telegram_id: string;
 	full_name: string;
 	user_role: 'user' | 'admin' | 'superadmin';
-	superior_telegram_id: string | null;
-	superior_telegram_id_2: string | null;
 	ord_date: string | null;
 	department: Department | null;
-	sub_department: StgSubDepartment | null;
+	sub_department: string | null;
 	personnel_type: PersonnelType | null;
+	appointment: Appointment | null;
+	self_managed: number;
 	off_credits: number;
 	is_approver: boolean;
 	pending: boolean;
@@ -115,6 +130,25 @@ export function confirmDialog(message: string): Promise<boolean> {
 			if (!settled) finish(window.confirm(message));
 		}, 2000);
 	});
+}
+
+// Robust alert — Telegram's WebApp.showAlert throws on older clients (< Bot API
+// 6.2) and silently no-ops on a few others, which makes a *successful* action
+// look like "nothing happened". This wraps it and falls back to window.alert so
+// the user always sees the result.
+export function alertDialog(message: string): void {
+	const tg = (window as unknown as {
+		Telegram?: { WebApp?: { showAlert?: (m: string) => void } };
+	}).Telegram?.WebApp;
+	if (!tg || typeof tg.showAlert !== 'function') {
+		window.alert(message);
+		return;
+	}
+	try {
+		tg.showAlert(message);
+	} catch {
+		window.alert(message);
+	}
 }
 
 // Generic DELETE helper for the admin overrides endpoint.

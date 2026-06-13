@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
-import WebApp from '@twa-dev/sdk';
-import { api, type Me, type RouteAction } from '../lib/api';
+import { api, alertDialog, deptLabel, type Me, type RouteAction } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface Entry {
@@ -10,30 +9,48 @@ interface Entry {
 	full_name: string;
 	department: string | null;
 	sub_department: string | null;
+	user_role: string | null;
+	personnel_type: string | null;
 	// /api/parade/day LEFT JOINs from users, so unfilled users return rows
-	// where these four are null. The bottom panel still renders them so admins
-	// can see at a glance who hasn't submitted.
+	// where the parade fields are null. The bottom panel still renders them so
+	// admins can see at a glance who hasn't submitted.
 	parade_state_date: string | null;
 	period: 'AM' | 'PM' | null;
 	parade_status: string | null;
 	reason: string | null;
 }
 
-// Stable ordering of department headings in the day-details panel.
-const DEPT_ORDER: readonly string[] = [
-	'DHQ',
-	'DMSP',
-	'DCS',
-	'STG — C1+C2',
-	'STG — C3+C4',
-	'STG',
-	'Others',
-	'Unassigned',
-];
-function deptKeyFor(e: { department: string | null; sub_department: string | null }): string {
-	if (e.department === 'STG' && e.sub_department) return `STG — ${e.sub_department}`;
-	return e.department ?? 'Unassigned';
+// Ranking for the Everyone-panel sort: 1st descending rights
+// (superadmin > admin > user), 2nd type R before N, 3rd alphabetical.
+function roleRank(r: string | null): number {
+	return r === 'superadmin' ? 0 : r === 'admin' ? 1 : 2;
 }
+function typeRank(t: string | null): number {
+	return t === 'Regular' ? 0 : 1; // Regular before NSF
+}
+function cmpPersonnel(a: { user_role: string | null; personnel_type: string | null; full_name: string }, b: typeof a): number {
+	return (
+		roleRank(a.user_role) - roleRank(b.user_role) ||
+		typeRank(a.personnel_type) - typeRank(b.personnel_type) ||
+		a.full_name.localeCompare(b.full_name)
+	);
+}
+
+// One row per user in the Everyone panel: their AM/PM entries plus the fields
+// the filter/sort needs.
+type UserAgg = {
+	id: number;
+	full_name: string;
+	department: string | null;
+	sub_department: string | null;
+	user_role: string | null;
+	personnel_type: string | null;
+	AM?: Entry;
+	PM?: Entry;
+};
+
+// Stable ordering of department headings in the day-details panel.
+const DEPT_ORDER: readonly string[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others', 'Unassigned'];
 
 // Render a single AM-or-PM cell: coloured status badge stacked above the
 // (truncated) reason. Empty cell when there's no entry for that period.
@@ -72,6 +89,7 @@ const STATUSES = [
 	'Outgoing DO',
 	'NTM Swap-In',
 	'NTM Swap-Out',
+	'Operator Off',
 ] as const;
 type Status = (typeof STATUSES)[number];
 
@@ -116,6 +134,7 @@ const STATUS_LABELS: Record<Status, string> = {
 	Others: 'Others',
 	'NTM Swap-In': 'NTM Swap-In',
 	'NTM Swap-Out': 'NTM Swap-Out',
+	'Operator Off': 'Operator Off',
 };
 
 const PRESENT_COLOR = '#4caf50';
@@ -144,6 +163,7 @@ const COLORS: Record<string, string> = {
 	'Outgoing DO': PRESENT_COLOR,
 	'NTM Swap-In': PRESENT_COLOR,
 	'NTM Swap-Out': PRESENT_COLOR,
+	'Operator Off': '#9e9e9e', // same grey as OFF
 };
 
 // IMPORTANT: use local-time components, NOT toISOString — DayPicker gives us
@@ -201,37 +221,43 @@ const NON_PRESENT_STATUSES = [
 ] as const;
 
 // Statuses that make the reason field compulsory in the submit modal.
-const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'Leave (Others)', 'Others']);
+const REASON_REQUIRED = new Set<string>(['Course', 'AO', 'MA', 'MC', 'RSO', 'RSI', 'OL', 'Leave (Others)', 'Others']);
+
+// Leave statuses route through the dedicated Take Leave flow (superior approval
+// + OneNS reminder) instead of being written to the calendar directly. MA
+// (medical appointment) also needs superior approval, so it routes through the
+// same flow — but WITHOUT the OneNS reminder.
+const LEAVE_SET = new Set<string>(['LL', 'OL', 'Leave (Others)']);
+const APPROVAL_ROUTED_SET = new Set<string>([...LEAVE_SET, 'MA']);
 
 function isNsfish(t: string | null): boolean {
 	return t === 'NSF' || t === 'NSF Officer';
 }
 
 function countSplit(rows: StrengthRow[]) {
-	const nsf = rows.filter((r) => isNsfish(r.personnel_type));
+	// Everyone who isn't a Regular counts under N (incl. anyone with an unset
+	// personnel_type) — so N + R always equals the department's headcount and the
+	// grand total reconciles with the per-department breakdown.
 	const reg = rows.filter((r) => r.personnel_type === 'Regular');
+	const nsf = rows.filter((r) => r.personnel_type !== 'Regular');
 	// Present = literal Present + anyone on an Incoming/Outgoing duty.
 	const present = (arr: StrengthRow[]) => arr.filter((r) => isPresentish(r.status)).length;
 	return { nsf, reg, nsfPresent: present(nsf), regPresent: present(reg) };
 }
 
-function buildStrengthReport(users: StrengthRow[], period: 'AM' | 'PM'): string {
+function buildStrengthReport(amUsers: StrengthRow[], pmUsers: StrengthRow[], period: 'AM' | 'PM'): string {
+	// Header/counts reflect the current period; the absence listing below merges
+	// both half-days (AM / PM / FD) so a full-day picture is shown.
+	const users = period === 'AM' ? amUsers : pmUsers;
 	const lines: string[] = [];
 	lines.push(`*${period} Present Strength*`);
 	lines.push('');
 
-	// STG section (with C1+C2 / C3+C4 sub-departments)
-	const stg = users.filter((u) => u.department === 'STG');
-	const c12 = stg.filter((u) => u.sub_department === 'C1+C2');
-	const c34 = stg.filter((u) => u.sub_department === 'C3+C4');
-	const c12s = countSplit(c12);
-	const c34s = countSplit(c34);
-	lines.push('STG');
-	lines.push(`C1+C2 NSF: ${c12s.nsfPresent}/${c12s.nsf.length}`);
-	lines.push(`C1+C2 Regular: ${c12s.regPresent}/${c12s.reg.length}`);
-	lines.push('');
-	lines.push(`C3+C4 NSF: ${c34s.nsfPresent}/${c34s.nsf.length}`);
-	lines.push(`C3+C4 Regular: ${c34s.regPresent}/${c34s.reg.length}`);
+	// DSP (formerly STG, now a single combined department).
+	const dsp = countSplit(users.filter((u) => u.department === 'DSP' || u.department === 'STG'));
+	lines.push('DSP');
+	lines.push(`N: ${dsp.nsfPresent}/${dsp.nsf.length}`);
+	lines.push(`R: ${dsp.regPresent}/${dsp.reg.length}`);
 	lines.push('');
 
 	// DMSP / DCS / DHQ
@@ -239,8 +265,8 @@ function buildStrengthReport(users: StrengthRow[], period: 'AM' | 'PM'): string 
 		const inDept = users.filter((u) => u.department === dept);
 		const s = countSplit(inDept);
 		lines.push(dept);
-		lines.push(`NSF: ${s.nsfPresent}/${s.nsf.length}`);
-		lines.push(`Regular: ${s.regPresent}/${s.reg.length}`);
+		lines.push(`N: ${s.nsfPresent}/${s.nsf.length}`);
+		lines.push(`R: ${s.regPresent}/${s.reg.length}`);
 		lines.push('');
 	}
 
@@ -250,24 +276,53 @@ function buildStrengthReport(users: StrengthRow[], period: 'AM' | 'PM'): string 
 	lines.push(`Total Strength: ${totalPresent}/${totalRegistered}`);
 	lines.push('');
 
-	// List all genuinely-absent Regulars + NSF Officers (one per row). Duty
-	// statuses count as present, so they're excluded here too.
-	const listed = users.filter(
-		(u) =>
-			!isPresentish(u.status) &&
-			(u.personnel_type === 'Regular' || u.personnel_type === 'NSF Officer'),
-	);
-	for (const u of listed) {
-		const status = u.status ?? 'Not submitted';
-		const reason = u.reason ? ` (${u.reason})` : '';
-		lines.push(`${u.full_name} ${status}${reason}`);
+	// List Regulars + NSF Officers who are non-present for at least half a day,
+	// with an AM / PM / FD breakdown. Merge both periods by user id.
+	const label = (status: string | null, reason: string | null) =>
+		`${status ?? 'Not submitted'}${reason ? ` (${reason})` : ''}`;
+	type Merged = { id: number; full_name: string; personnel_type: string | null; am?: StrengthRow; pm?: StrengthRow };
+	const byId = new Map<number, Merged>();
+	for (const u of amUsers) byId.set(u.id, { id: u.id, full_name: u.full_name, personnel_type: u.personnel_type, am: u });
+	for (const u of pmUsers) {
+		const cur = byId.get(u.id) ?? { id: u.id, full_name: u.full_name, personnel_type: u.personnel_type };
+		cur.pm = u;
+		byId.set(u.id, cur);
+	}
+	const listed = [...byId.values()]
+		.filter(
+			(e) =>
+				(e.personnel_type === 'Regular' || e.personnel_type === 'NSF Officer') &&
+				(!isPresentish(e.am?.status ?? null) || !isPresentish(e.pm?.status ?? null)),
+		)
+		.sort((a, b) => a.full_name.localeCompare(b.full_name));
+	for (const e of listed) {
+		const amS = e.am?.status ?? null;
+		const pmS = e.pm?.status ?? null;
+		const amR = e.am?.reason ?? null;
+		const pmR = e.pm?.reason ?? null;
+		const amAbsent = !isPresentish(amS);
+		const pmAbsent = !isPresentish(pmS);
+		let detail: string;
+		if (amAbsent && pmAbsent && amS === pmS && amR === pmR) {
+			detail = `FD ${label(amS, amR)}`;
+		} else {
+			const parts: string[] = [];
+			if (amAbsent) parts.push(`AM ${label(amS, amR)}`);
+			if (pmAbsent) parts.push(`PM ${label(pmS, pmR)}`);
+			detail = parts.join(', ');
+		}
+		lines.push(`${e.full_name} ${detail}`);
 	}
 	lines.push('');
 
-	// Counts per non-Present status (everyone, not just Regulars/Officers).
+	// Counts per non-Present status (everyone, not just Regulars/Officers). The
+	// OFF line folds in Operator Off (it counts toward the total OFF).
 	lines.push('*Other status*');
 	for (const s of NON_PRESENT_STATUSES) {
-		const n = users.filter((u) => u.status === s).length;
+		const n =
+			s === 'OFF'
+				? users.filter((u) => u.status === 'OFF' || u.status === 'Operator Off').length
+				: users.filter((u) => u.status === s).length;
 		lines.push(`${s}: ${n}`);
 	}
 	lines.push(`Total absent: ${totalRegistered - totalPresent}`);
@@ -310,6 +365,13 @@ function initialDate(minIso: string, maxIso: string): Date {
 		const d = new Date(`${raw}T00:00:00`);
 		if (!Number.isNaN(d.getTime())) return d;
 	}
+	// From 5:30pm onwards, parade state is usually being filled for the NEXT day —
+	// default the calendar to tomorrow so the common case needs no extra taps.
+	const now = new Date();
+	if (now.getHours() * 60 + now.getMinutes() >= 17 * 60 + 30) {
+		const tmr = new Date(t.getFullYear(), t.getMonth(), t.getDate() + 1);
+		if (ymdKey(tmr) <= maxIso) return tmr;
+	}
 	return t;
 }
 
@@ -322,14 +384,20 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [selectedDate, setSelectedDate] = useState<Date>(initial);
 	const [showSubmit, setShowSubmit] = useState(false);
-	const [copyModalText, setCopyModalText] = useState<string | null>(null);
+	const [strengthData, setStrengthData] = useState<{ am: StrengthRow[]; pm: StrengthRow[]; date: string } | null>(null);
 	// "Everyone's status" is collapsed by default — its /api/parade/day fetch
 	// only fires when expanded, so most users never pay that read cost.
 	const [showEveryone, setShowEveryone] = useState(false);
+	// Everyone-panel filters (all client-side over the already-fetched /day data —
+	// zero extra reads, so safe for the free tier).
+	const [everyoneSearch, setEveryoneSearch] = useState('');
+	const [everyoneDept, setEveryoneDept] = useState<string>('all');
+	const [everyonePersonnel, setEveryonePersonnel] = useState<'all' | 'Regular' | 'NSF'>('all');
 	// Who this caller may edit parade state for (superadmin → all; superiors →
 	// their reports). Drives the inline ✏️ buttons in the Everyone panel.
 	const [staffEdit, setStaffEdit] = useState<{ all: boolean; ids: Set<number> }>({ all: false, ids: new Set() });
 	const [editTarget, setEditTarget] = useState<{ id: number; name: string } | null>(null);
+	const [forecastTarget, setForecastTarget] = useState<{ id: number; name: string } | null>(null);
 	const canEditParade = (uid: number) => staffEdit.all || staffEdit.ids.has(uid);
 
 	// Fetch only the current user's entries for the visible month (~60 rows max).
@@ -459,7 +527,7 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 				</div>
 			</div>
 
-			{isAdminish(me.user_role) && <ExportButton selectedDate={ymdKey(selectedDate)} />}
+			{isAdminish(me.user_role) && <ExportButton selectedDate={ymdKey(selectedDate)} minIso={bounds.minIso} maxIso={bounds.maxIso} />}
 
 			<div style={{ marginTop: 14 }}>
 				<h4 style={{ marginBottom: 8 }}>Legend</h4>
@@ -484,89 +552,143 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 						className="btn btn-secondary"
 						style={{ flex: 1 }}
 						onClick={async () => {
-							const period = periodByTimeSgt();
 							try {
-								const res = await api.get<{ users: StrengthRow[] }>(
-									`/api/parade/strength?date=${ymdKey(selectedDate)}&period=${period}`,
-								);
-								setCopyModalText(buildStrengthReport(res.users, period));
+								const d = ymdKey(selectedDate);
+								const [am, pm] = await Promise.all([
+									api.get<{ users: StrengthRow[] }>(`/api/parade/strength?date=${d}&period=AM`),
+									api.get<{ users: StrengthRow[] }>(`/api/parade/strength?date=${d}&period=PM`),
+								]);
+								setStrengthData({ am: am.users, pm: pm.users, date: d });
 							} catch (e) {
-								WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+								alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 							}
 						}}
 					>
 						📋 View state
 					</button>
 				</div>
-				{!showEveryone ? null : dayDetails.length === 0 ? (
-					<p className="muted">No active users.</p>
-				) : (
-					(() => {
-						// Group the day's entries by department for clearer display.
-						const groups = new Map<string, Entry[]>();
-						for (const e of dayDetails) {
-							const key = deptKeyFor(e);
-							const arr = groups.get(key) ?? [];
-							arr.push(e);
-							groups.set(key, arr);
-						}
-						return (
-							<>
-								{DEPT_ORDER.map((dept) => {
-									const list = groups.get(dept);
-									if (!list || list.length === 0) return null;
-									// Collapse the (user, period) rows into one row per user
-									// with AM/PM cells side-by-side. Users with no entries for
-									// this date come back as a single row with period=null —
-									// we still register them so they show up as "—/—".
-									const byUser = new Map<number, { id: number; full_name: string; AM?: Entry; PM?: Entry }>();
-									for (const e of list) {
-										const cur = byUser.get(e.user_id) ?? { id: e.user_id, full_name: e.full_name };
-										if (e.period === 'AM') cur.AM = e;
-										else if (e.period === 'PM') cur.PM = e;
-										byUser.set(e.user_id, cur);
-									}
-									const users = [...byUser.values()].sort((a, b) => a.full_name.localeCompare(b.full_name));
-									return (
-										<div key={dept} style={{ marginTop: 12 }}>
-											<h5 className="section-title" style={{ margin: '0 0 4px' }}>
-												{dept} ({users.length})
-											</h5>
-											<table>
-												<thead>
-													<tr><th>Name</th><th>AM</th><th>PM</th></tr>
-												</thead>
-												<tbody>
-													{users.map((u) => (
-														<tr key={u.id}>
-															<td>
-																{u.full_name}
-																{canEditParade(u.id) && (
-																	<button
-																		className="btn-link"
-																		style={{ marginLeft: 6 }}
-																		title="Edit this person's state for the selected date"
-																		onClick={() => {
-																			setEditTarget({ id: u.id, name: u.full_name });
-																			setShowSubmit(true);
-																		}}
-																	>
-																		✏️
-																	</button>
-																)}
-															</td>
-															<td>{renderStatusCell(u.AM)}</td>
-															<td>{renderStatusCell(u.PM)}</td>
-														</tr>
-													))}
-												</tbody>
-											</table>
-										</div>
-									);
-								})}
-							</>
-						);
-					})()
+				{showEveryone && (
+					<div style={{ marginTop: 12 }}>
+						<div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+							<input
+								value={everyoneSearch}
+								onChange={(e) => setEveryoneSearch(e.target.value)}
+								placeholder="🔎 Search name"
+								style={{ flex: '1 1 140px' }}
+							/>
+							<select value={everyoneDept} onChange={(e) => setEveryoneDept(e.target.value)}>
+								<option value="all">All depts</option>
+								{DEPT_ORDER.map((d) => (
+									<option key={d} value={d}>{d}</option>
+								))}
+							</select>
+							<select value={everyonePersonnel} onChange={(e) => setEveryonePersonnel(e.target.value as 'all' | 'Regular' | 'NSF')}>
+								<option value="all">All types</option>
+								<option value="Regular">R</option>
+								<option value="NSF">N</option>
+							</select>
+						</div>
+						{(() => {
+							const byUser = new Map<number, UserAgg>();
+							for (const e of dayDetails) {
+								const cur =
+									byUser.get(e.user_id) ?? {
+										id: e.user_id,
+										full_name: e.full_name,
+										department: e.department,
+										sub_department: e.sub_department,
+										user_role: e.user_role,
+										personnel_type: e.personnel_type,
+									};
+								if (e.period === 'AM') cur.AM = e;
+								else if (e.period === 'PM') cur.PM = e;
+								byUser.set(e.user_id, cur);
+							}
+							let users = [...byUser.values()];
+							const q = everyoneSearch.trim().toLowerCase();
+							const filtersActive = q !== '' || everyoneDept !== 'all' || everyonePersonnel !== 'all';
+							if (q) users = users.filter((u) => u.full_name.toLowerCase().includes(q));
+							if (everyoneDept !== 'all') users = users.filter((u) => deptLabel(u.department, u.sub_department) === everyoneDept);
+							if (everyonePersonnel === 'Regular') users = users.filter((u) => u.personnel_type === 'Regular');
+							else if (everyonePersonnel === 'NSF') users = users.filter((u) => isNsfish(u.personnel_type));
+
+							if (users.length === 0) {
+								return <p className="muted">{filtersActive ? 'No matching users.' : 'No active users.'}</p>;
+							}
+
+							const renderRow = (u: UserAgg) => (
+								<tr key={u.id}>
+									<td>
+										{u.full_name}
+										{canEditParade(u.id) && (
+											<button
+												className="btn-link"
+												style={{ marginLeft: 6 }}
+												title="Edit this person's state for the selected date"
+												onClick={() => {
+													setEditTarget({ id: u.id, name: u.full_name });
+													setShowSubmit(true);
+												}}
+											>
+												✏️
+											</button>
+										)}
+										{isAdminish(me.user_role) && (
+											<button
+												className="btn-link"
+												style={{ marginLeft: 4 }}
+												title="View this person's month forecast"
+												onClick={() => setForecastTarget({ id: u.id, name: u.full_name })}
+											>
+												📅
+											</button>
+										)}
+									</td>
+									<td>{renderStatusCell(u.AM)}</td>
+									<td>{renderStatusCell(u.PM)}</td>
+								</tr>
+							);
+							const table = (rows: UserAgg[]) => (
+								<table>
+									<thead><tr><th>Name</th><th>AM</th><th>PM</th></tr></thead>
+									<tbody>{rows.map(renderRow)}</tbody>
+								</table>
+							);
+
+							if (filtersActive) {
+								const sorted = [...users].sort(cmpPersonnel);
+								return (
+									<div style={{ marginTop: 4 }}>
+										<h5 className="section-title" style={{ margin: '0 0 4px' }}>Results ({sorted.length})</h5>
+										{table(sorted)}
+									</div>
+								);
+							}
+							const groups = new Map<string, UserAgg[]>();
+							for (const u of users) {
+								const k = deptLabel(u.department, u.sub_department);
+								const arr = groups.get(k) ?? [];
+								arr.push(u);
+								groups.set(k, arr);
+							}
+							const order = [...DEPT_ORDER, ...[...groups.keys()].filter((k) => !DEPT_ORDER.includes(k))];
+							return (
+								<>
+									{order
+										.filter((d) => groups.has(d))
+										.map((dept) => {
+											const list = [...groups.get(dept)!].sort(cmpPersonnel);
+											return (
+												<div key={dept} style={{ marginTop: 12 }}>
+													<h5 className="section-title" style={{ margin: '0 0 4px' }}>{dept} ({list.length})</h5>
+													{table(list)}
+												</div>
+											);
+										})}
+								</>
+							);
+						})()}
+					</div>
 				)}
 			</div>
 
@@ -575,6 +697,7 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 					initialDate={ymdKey(selectedDate)}
 					minIso={bounds.minIso}
 					maxIso={bounds.maxIso}
+					canEditPast={me.user_role === 'superadmin'}
 					target={editTarget}
 					onClose={() => {
 						setShowSubmit(false);
@@ -585,7 +708,13 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 				/>
 			)}
 
-			{copyModalText && <CopyTextModal text={copyModalText} onClose={() => setCopyModalText(null)} />}
+			{strengthData && (
+				<StrengthModal amUsers={strengthData.am} pmUsers={strengthData.pm} date={strengthData.date} onClose={() => setStrengthData(null)} />
+			)}
+
+			{forecastTarget && (
+				<ForecastModal target={forecastTarget} ym={ymKey(month)} onClose={() => setForecastTarget(null)} />
+			)}
 		</div>
 	);
 }
@@ -600,6 +729,7 @@ function SubmitModal({
 	initialDate,
 	minIso,
 	maxIso,
+	canEditPast,
 	target,
 	onClose,
 	onDone,
@@ -608,6 +738,9 @@ function SubmitModal({
 	initialDate: string;
 	minIso: string;
 	maxIso: string;
+	// Superadmins may edit days that have already ended; everyone else is capped
+	// at today (past-day parade state is locked).
+	canEditPast: boolean;
 	// When set, a superior/superadmin is editing this person's state for the
 	// single `initialDate` (no range, no auto-routing).
 	target?: { id: number; name: string } | null;
@@ -619,37 +752,42 @@ function SubmitModal({
 	const [enddate, setEnddate] = useState(initialDate);
 	// 'fd' = full-day same status for both AM & PM; 'diff' = separate AM / PM.
 	const [mode, setMode] = useState<'fd' | 'diff'>('fd');
-	const [fdStatus, setFdStatus] = useState<Status | typeof NONE>(NONE);
+	const [fdStatus, setFdStatus] = useState<Status | 'Blank' | typeof NONE>(NONE);
 	const [fdReason, setFdReason] = useState('');
-	const [amStatus, setAmStatus] = useState<Status | typeof NONE>(NONE);
+	const [amStatus, setAmStatus] = useState<Status | 'Blank' | typeof NONE>(NONE);
 	const [amReason, setAmReason] = useState('');
-	const [pmStatus, setPmStatus] = useState<Status | typeof NONE>(NONE);
+	const [pmStatus, setPmStatus] = useState<Status | 'Blank' | typeof NONE>(NONE);
 	const [pmReason, setPmReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
-	const reasonNeeded = (s: Status | typeof NONE) => s !== NONE && REASON_REQUIRED.has(s);
+	const reasonNeeded = (s: Status | 'Blank' | typeof NONE) => s !== NONE && REASON_REQUIRED.has(s);
+	const noReasonField = (s: Status | 'Blank' | typeof NONE) => s === NONE || s === 'Present' || s === 'Blank';
+
+	// Past-day lock: non-superadmins can't pick a date before today.
+	const todayIso = ymdKey(todayLocal());
+	const effMinIso = canEditPast ? minIso : minIso > todayIso ? minIso : todayIso;
 
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
-	const inRange = !!startdate && !!enddate && startdate >= minIso && enddate <= maxIso;
+	const inRange = !!startdate && !!enddate && startdate >= effMinIso && enddate <= maxIso;
 
 	// Build the period entries from whichever mode is active.
 	const entries: { period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
 	let reasonOk = true;
 	if (mode === 'fd') {
 		if (fdStatus !== NONE) {
-			const r = fdStatus === 'Present' ? null : fdReason.trim() || null;
+			const r = noReasonField(fdStatus) ? null : fdReason.trim() || null;
 			if (reasonNeeded(fdStatus) && !r) reasonOk = false;
 			entries.push({ period: 'AM', status: fdStatus, reason: r });
 			entries.push({ period: 'PM', status: fdStatus, reason: r });
 		}
 	} else {
 		if (amStatus !== NONE) {
-			const r = amStatus === 'Present' ? null : amReason.trim() || null;
+			const r = noReasonField(amStatus) ? null : amReason.trim() || null;
 			if (reasonNeeded(amStatus) && !r) reasonOk = false;
 			entries.push({ period: 'AM', status: amStatus, reason: r });
 		}
 		if (pmStatus !== NONE) {
-			const r = pmStatus === 'Present' ? null : pmReason.trim() || null;
+			const r = noReasonField(pmStatus) ? null : pmReason.trim() || null;
 			if (reasonNeeded(pmStatus) && !r) reasonOk = false;
 			entries.push({ period: 'PM', status: pmStatus, reason: r });
 		}
@@ -657,10 +795,29 @@ function SubmitModal({
 	const atLeastOne = entries.length > 0;
 	const canSave = datesValid && inRange && atLeastOne && reasonOk;
 
+	// Leave selection — choosing LL / OL / Leave (Others) / MA routes into the
+	// dedicated approval flow (self-service only; an approver editing a staff
+	// member writes the status directly). It can be full-day (FD) or a half
+	// (AM/PM) depending on which period(s) carry the routed status.
+	const leaveSel: { type: string; reason: string; period: 'AM' | 'PM' | 'FD' } | null = (() => {
+		if (mode === 'fd') return APPROVAL_ROUTED_SET.has(fdStatus) ? { type: fdStatus, reason: fdReason.trim(), period: 'FD' } : null;
+		const amLeave = APPROVAL_ROUTED_SET.has(amStatus);
+		const pmLeave = APPROVAL_ROUTED_SET.has(pmStatus);
+		if (amLeave && pmLeave && amStatus === pmStatus) return { type: amStatus, reason: amReason.trim() || pmReason.trim(), period: 'FD' };
+		if (amLeave) return { type: amStatus, reason: amReason.trim(), period: 'AM' };
+		if (pmLeave) return { type: pmStatus, reason: pmReason.trim(), period: 'PM' };
+		return null;
+	})();
+	const isLeaveRequest = !target && leaveSel != null;
+	// MA routes through the same approval flow as leave, but is NOT leave: no
+	// OneNS reminder, different wording.
+	const isMaRequest = isLeaveRequest && leaveSel?.type === 'MA';
+
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (!inRange) hint = `Dates must be within ${minIso} → ${maxIso} (±2 months from this month).`;
+	else if (!canEditPast && startdate < todayIso) hint = 'Only a superadmin can edit days that have already passed.';
+	else if (!inRange) hint = `Dates must be within ${effMinIso} → ${maxIso}.`;
 	else if (!atLeastOne) hint = mode === 'fd' ? 'Pick a status.' : 'Set at least one of AM / PM status.';
 	else if (!reasonOk) hint = 'A reason is required for that status.';
 
@@ -674,17 +831,60 @@ function SubmitModal({
 		if (!canSave) return;
 		setBusy(true);
 		try {
+			// Leave (LL/OL/Leave Others) goes through the dedicated approval flow,
+			// not the parade calendar write.
+			if (isLeaveRequest && leaveSel) {
+				const lres = await api.post<{ auto_approved?: boolean }>('/api/leave/request', {
+					leave_type: leaveSel.type,
+					period: leaveSel.period,
+					startdate,
+					enddate,
+					reason: leaveSel.reason || null,
+				});
+				await onDone();
+				onClose();
+				const lrange = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
+				const half = leaveSel.period === 'FD' ? 'full-day' : `${leaveSel.period} half-day`;
+				if (isMaRequest) {
+					alertDialog(
+						lres.auto_approved
+							? `🩺 ${half} MA applied for ${lrange} (no approval needed).`
+							: `🩺 Your ${half} MA (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.`,
+					);
+				} else {
+					alertDialog(
+						lres.auto_approved
+							? `✅ ${half} ${leaveSel.type} leave applied for ${lrange} (no approval needed).\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`
+							: `🏝️ Your ${half} ${leaveSel.type} leave (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`,
+					);
+				}
+				return;
+			}
 			const payload: Record<string, unknown> = { startdate, enddate, entries };
 			if (target) payload.user_id = target.id;
 			const res = await api.post<{
 				applied: number;
 				pending: number;
 				skipped_weekends: number;
-				suggest_off?: boolean;
-				suggest_sick?: 'RSI' | 'RSO' | null;
+				skipped_past?: number;
+				blocked_off?: boolean;
+				blocked_sick?: 'RSI' | 'RSO' | null;
 			}>('/api/parade/submit', payload);
 			await onDone();
 			onClose();
+			// COMPULSORY backing: OFF / RSI / RSO weren't saved because there's no
+			// matching application yet — route to the apply form first. (Self only;
+			// staff edits never block.) Navigate first, then alert.
+			if (!target && res.blocked_off) {
+				onRoute({ kind: 'off', start: startdate, end: enddate });
+				alertDialog(`⚠ Your OFF was NOT saved — you must request these dates off first. Opening the Off page; submit the request, then set OFF again.`);
+				return;
+			}
+			if (!target && res.blocked_sick) {
+				onRoute({ kind: 'sick', sickType: res.blocked_sick });
+				alertDialog(`⚠ Your ${res.blocked_sick} was NOT saved — you must report ${res.blocked_sick} first. Opening the Sick page, then set it again.`);
+				return;
+			}
 			const parts =
 				mode === 'fd'
 					? `Full day: ${entries[0].status}`
@@ -697,42 +897,35 @@ function SubmitModal({
 			if (res.skipped_weekends > 0) {
 				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
 			}
+			if (res.skipped_past && res.skipped_past > 0) {
+				msg += `\n\n🔒 ${res.skipped_past} past day(s) skipped — only a superadmin can edit days that have ended.`;
+			}
 			if (res.applied === 0 && res.pending === 0) {
-				msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
+				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved — those days have already passed (locked).';
+				else msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
 			}
-			// Self-edits may auto-route to the Off / Sick apply form when the user
-			// marked OFF / RSI / RSO without applying. Staff edits never route.
-			// Navigate FIRST, then alert — Telegram's showAlert is modal/blocking
-			// on some clients, so doing it after guarantees the tab switch happens.
-			if (!target && res.suggest_off) {
-				onRoute({ kind: 'off', start: startdate, end: enddate });
-				WebApp.showAlert(`${msg}\n\n📅 You marked OFF but haven't applied — opening the Off page to request it.`);
-			} else if (!target && res.suggest_sick) {
-				onRoute({ kind: 'sick', sickType: res.suggest_sick });
-				WebApp.showAlert(`${msg}\n\n🤒 You marked ${res.suggest_sick} but haven't reported it — opening the Sick page.`);
-			} else {
-				WebApp.showAlert(msg);
-			}
+			alertDialog(msg);
 		} catch (e) {
 			setBusy(false);
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
 	const statusField = (
-		value: Status | typeof NONE,
-		setValue: (s: Status | typeof NONE) => void,
+		value: Status | 'Blank' | typeof NONE,
+		setValue: (s: Status | 'Blank' | typeof NONE) => void,
 		reason: string,
 		setReason: (s: string) => void,
 	) => (
 		<>
 			<label>Status
-				<select value={value} onChange={(e) => setValue(e.target.value as Status | typeof NONE)}>
+				<select value={value} onChange={(e) => setValue(e.target.value as Status | 'Blank' | typeof NONE)}>
 					<option value={NONE}>— leave unchanged —</option>
+					<option value="Blank">⬜ Blank — clear this period</option>
 					{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
 				</select>
 			</label>
-			{value !== NONE && value !== 'Present' && (
+			{!noReasonField(value) && (
 				<label>
 					Reason {reasonNeeded(value) ? <span className="danger">*required</span> : <span className="muted">(optional)</span>}
 					<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder={reasonNeeded(value) ? 'Specify' : 'Optional'} />
@@ -746,27 +939,24 @@ function SubmitModal({
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>{target ? `Edit ${target.name}` : 'Submit / Edit Parade Status'}</h3>
 
-				{target ? (
+				{target && (
 					<div className="muted" style={{ marginBottom: 8 }}>
-						Editing <b>{target.name}</b>'s state for <b>{initialDate}</b> (applies immediately).
+						Editing <b>{target.name}</b>'s state (applies immediately — pick a single day or a date range).
 					</div>
-				) : (
-					<>
-						<label>Start date<input
-							type="date"
-							value={startdate}
-							min={minIso}
-							max={maxIso}
-							onChange={(e) => {
-								const v = e.target.value;
-								setStartdate(v);
-								// Snap end date to start if it's empty or now before start.
-								if (!enddate || enddate < v) setEnddate(v);
-							}}
-						/></label>
-						<label>End date<input type="date" value={enddate} min={startdate || minIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
-					</>
 				)}
+				<label>Start date<input
+					type="date"
+					value={startdate}
+					min={effMinIso}
+					max={maxIso}
+					onChange={(e) => {
+						const v = e.target.value;
+						setStartdate(v);
+						// Snap end date to start if it's empty or now before start.
+						if (!enddate || enddate < v) setEnddate(v);
+					}}
+				/></label>
+				<label>End date<input type="date" value={enddate} min={startdate || effMinIso} max={maxIso} onChange={(e) => setEnddate(e.target.value)} /></label>
 
 				<div className="seg" style={{ marginBottom: 10 }}>
 					<button className={mode === 'fd' ? 'active' : ''} onClick={() => setMode('fd')}>FD Same Status</button>
@@ -791,24 +981,46 @@ function SubmitModal({
 					</>
 				)}
 
+				{isLeaveRequest && (
+					<div
+						style={{
+							margin: '0 0 10px',
+							padding: '10px 12px',
+							borderRadius: 12,
+							background: 'var(--depot-info, #0288d1)',
+							color: '#fff',
+							lineHeight: 1.4,
+						}}
+					>
+						{isMaRequest ? (
+							<>
+								🩺 This is a <b>medical appointment (MA)</b>{leaveSel ? ` (${leaveSel.period === 'FD' ? 'full-day' : leaveSel.period + ' half-day'})` : ''}. Pressing <b>Request MA</b> forwards
+								the request to your superior for approval via the Telegram bot. You'll be notified here and on Telegram once it's actioned.
+							</>
+						) : (
+							<>
+								🏝️ This is <b>leave</b>{leaveSel ? ` (${leaveSel.period === 'FD' ? 'full-day' : leaveSel.period + ' half-day'})` : ''}. Pressing <b>Take Leave</b> automatically forwards
+								the request to your superior for approval via the Telegram bot. <b>You still need to SUBMIT the leave on{' '}
+								<u>OneNS</u> yourself after approval via the telegram bot</b> — the bot cannot do that for you.
+							</>
+						)}
+					</div>
+				)}
+
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
 
 				<button className="btn" disabled={busy || !canSave} onClick={submit}>
-					{busy ? 'Saving…' : 'Save'}
+					{busy ? 'Saving…' : isLeaveRequest ? (isMaRequest ? '🩺 Request MA (needs approval)' : '🏝️ Take Leave (request approval)') : 'Save'}
 				</button>
 			</div>
 		</div>
 	);
 }
 
-function ExportButton({ selectedDate }: { selectedDate: string }) {
-	// Parade entries are pruned at 5 days, so anything older than today − 4
-	// days will always export blank. Clamp the picker to today − 4 …today.
-	const today = todayLocal();
-	const minIso = ymdKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 4));
-	const maxIso = ymdKey(today);
-
-	// Default the picker to the calendar's selected date but clamp it.
+function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; minIso: string; maxIso: string }) {
+	// Picker spans the whole calendar window (±2 months). Future dates export the
+	// already-submitted forecast; past dates beyond the 5-day retention prune come
+	// back empty (that data has been deleted).
 	const clamp = (d: string) => (d < minIso ? minIso : d > maxIso ? maxIso : d);
 	const [date, setDate] = useState(clamp(selectedDate));
 
@@ -823,11 +1035,11 @@ function ExportButton({ selectedDate }: { selectedDate: string }) {
 		setBusy(true);
 		try {
 			const res = await api.post<{ ok: boolean; rows: number }>('/api/parade/export', { date });
-			WebApp.showAlert(
+			alertDialog(
 				`📄 CSV for ${date} (${res.rows} entries) sent to your Telegram chat with the bot. Excel opens it directly.`,
 			);
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			setBusy(false);
 		}
@@ -838,7 +1050,7 @@ function ExportButton({ selectedDate }: { selectedDate: string }) {
 			<h4 style={{ marginTop: 0 }}>Export CSV (Admin/Superadmin)</h4>
 			<p className="muted" style={{ marginTop: 0 }}>
 				Single-date export, grouped by department. Sent to your chat with the bot — Excel opens it directly.
-				Limited to the last 5 days (older data is pruned).
+				Any date in the calendar (±2 months) works — parade data is retained for the whole calendar window.
 			</p>
 			<input type="date" value={date} min={minIso} max={maxIso} onChange={(e) => setDate(e.target.value)} />
 			<button className="btn" disabled={busy} onClick={exportCsv}>
@@ -848,8 +1060,12 @@ function ExportButton({ selectedDate }: { selectedDate: string }) {
 	);
 }
 
-function CopyTextModal({ text, onClose }: { text: string; onClose: () => void }) {
+// Strength report with an AM / PM toggle — pick which half-day's strength to
+// view/copy for the selected date. Defaults to the current half-day.
+function StrengthModal({ amUsers, pmUsers, date, onClose }: { amUsers: StrengthRow[]; pmUsers: StrengthRow[]; date: string; onClose: () => void }) {
+	const [period, setPeriod] = useState<'AM' | 'PM'>(periodByTimeSgt());
 	const [copied, setCopied] = useState(false);
+	const text = buildStrengthReport(amUsers, pmUsers, period);
 
 	async function copy() {
 		try {
@@ -857,14 +1073,18 @@ function CopyTextModal({ text, onClose }: { text: string; onClose: () => void })
 			setCopied(true);
 			setTimeout(() => setCopied(false), 2000);
 		} catch {
-			WebApp.showAlert('Clipboard blocked by Telegram. Long-press the text to select, then copy.');
+			alertDialog('Clipboard blocked by Telegram. Long-press the text to select, then copy.');
 		}
 	}
 
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3 style={{ marginBottom: 4 }}>Parade State</h3>
+				<h3 style={{ marginBottom: 6 }}>Parade State — {date}</h3>
+				<div className="seg" style={{ marginBottom: 8 }}>
+					<button className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>🌅 AM strength</button>
+					<button className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>🌇 PM strength</button>
+				</div>
 				<p className="muted" style={{ marginTop: 0 }}>
 					Tap <b>Copy</b> below, or long-press the text to select manually.
 				</p>
@@ -877,6 +1097,71 @@ function CopyTextModal({ text, onClose }: { text: string; onClose: () => void })
 				/>
 				<div className="actions">
 					<button className="btn" onClick={copy}>{copied ? '✅ Copied' : '📋 Copy'}</button>
+					<button className="btn btn-secondary" onClick={onClose}>Close</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+// Read-only month forecast for ONE person (admin/superadmin). Rate-limited
+// server-side per viewer per day; shows remaining quota and a clear message
+// when the limit is hit.
+function ForecastModal({ target, ym, onClose }: { target: { id: number; name: string }; ym: string; onClose: () => void }) {
+	const [data, setData] = useState<{ full_name: string; entries: MyMonthRow[]; cap: number; remaining: number } | null>(null);
+	const [err, setErr] = useState<string | null>(null);
+
+	useEffect(() => {
+		api
+			.get<{ full_name: string; entries: MyMonthRow[]; cap: number; remaining: number }>(
+				`/api/parade/user-month?user_id=${target.id}&ym=${ym}`,
+			)
+			.then(setData)
+			.catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)));
+	}, [target.id, ym]);
+
+	const byDate = new Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>();
+	for (const e of data?.entries ?? []) {
+		const cur = byDate.get(e.parade_state_date) ?? {};
+		cur[e.period] = e;
+		byDate.set(e.parade_state_date, cur);
+	}
+	const dates = [...byDate.keys()].sort();
+	const limitHit = err != null && (err.includes('view_limit') || err.includes('429'));
+
+	return (
+		<div className="modal-backdrop" onClick={onClose}>
+			<div className="modal" onClick={(e) => e.stopPropagation()}>
+				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — {ym}</h3>
+				{err ? (
+					<p className="muted danger">{limitHit ? "You've hit your daily forecast-view limit. Try again tomorrow." : err}</p>
+				) : !data ? (
+					<p className="muted">Loading…</p>
+				) : (
+					<>
+						<p className="muted" style={{ marginTop: 0 }}>{data.remaining} view{data.remaining === 1 ? '' : 's'} left today.</p>
+						{dates.length === 0 ? (
+							<p className="muted">No parade state submitted for this month.</p>
+						) : (
+							<table>
+								<thead><tr><th>Date</th><th>AM</th><th>PM</th></tr></thead>
+								<tbody>
+									{dates.map((d) => {
+										const r = byDate.get(d)!;
+										return (
+											<tr key={d}>
+												<td>{d}</td>
+												<td>{renderStatusCell(r.AM)}</td>
+												<td>{renderStatusCell(r.PM)}</td>
+											</tr>
+										);
+									})}
+								</tbody>
+							</table>
+						)}
+					</>
+				)}
+				<div className="actions" style={{ marginTop: 10 }}>
 					<button className="btn btn-secondary" onClick={onClose}>Close</button>
 				</div>
 			</div>

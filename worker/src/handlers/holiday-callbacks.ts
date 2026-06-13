@@ -60,11 +60,15 @@ export function registerHolidayCallbacks(bot: Bot, env: Env): void {
 			.prepare(`UPDATE public_holidays SET confirmed = 1 WHERE holiday_date = ?`)
 			.bind(date)
 			.run();
+		// Migration 018 made the PK composite (override_date, period); write a
+		// whole-day ('FD'), all-departments (NULL) override with the matching
+		// conflict target.
 		await env.depot_db
 			.prepare(
-				`INSERT INTO working_day_overrides (override_date, is_working_day, reason, set_by_user_id)
-				 VALUES (?, 1, ?, ?)
-				 ON CONFLICT(override_date) DO UPDATE SET
+				`INSERT INTO working_day_overrides (override_date, period, departments, is_working_day, reason, set_by_user_id)
+				 VALUES (?, 'FD', NULL, 1, ?, ?)
+				 ON CONFLICT(override_date, period) DO UPDATE SET
+				   departments = NULL,
 				   is_working_day = 1,
 				   reason = excluded.reason,
 				   set_by_user_id = excluded.set_by_user_id,

@@ -9,6 +9,7 @@
 
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
+import { canApprove } from '../superiors';
 
 interface ChangeRow {
 	id: number;
@@ -20,6 +21,8 @@ interface ChangeRow {
 	status: string;
 	user_tid: string;
 	user_name: string;
+	user_dept: string | null;
+	user_sub: string | null;
 }
 
 export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
@@ -29,9 +32,9 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 		const approverTid = String(ctx.from.id);
 
 		const approver = await env.depot_db
-			.prepare(`SELECT id, full_name FROM users WHERE telegram_id = ?`)
+			.prepare(`SELECT id, full_name, user_role, appointment, department, sub_department FROM users WHERE telegram_id = ?`)
 			.bind(approverTid)
-			.first<{ id: number; full_name: string }>();
+			.first<{ id: number; full_name: string; user_role: string; appointment: string | null; department: string | null; sub_department: string | null }>();
 		if (!approver) {
 			await ctx.answerCallbackQuery({ text: 'You are not registered.' });
 			return;
@@ -40,7 +43,8 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 		const row = await env.depot_db
 			.prepare(
 				`SELECT c.id, c.user_id, c.parade_state_date, c.period, c.new_status, c.new_reason, c.status,
-				        u.telegram_id AS user_tid, u.full_name AS user_name
+				        u.telegram_id AS user_tid, u.full_name AS user_name,
+				        u.department AS user_dept, u.sub_department AS user_sub
 				 FROM parade_change_requests c
 				 JOIN users u ON u.id = c.user_id
 				 WHERE c.id = ?`,
@@ -55,16 +59,24 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 			await ctx.answerCallbackQuery({ text: `Already ${row.status}.` });
 			return;
 		}
+		if (!(await canApprove(env, approver, row.user_dept, row.user_sub, row.user_id))) {
+			await ctx.answerCallbackQuery({ text: 'Not authorised to action this.' });
+			return;
+		}
 
 		if (action === 'reject') {
-			await env.depot_db
+			const flipR = await env.depot_db
 				.prepare(
 					`UPDATE parade_change_requests
 					 SET status = 'rejected', superior_user_id = ?, approved_at = datetime('now')
-					 WHERE id = ?`,
+					 WHERE id = ? AND status = 'pending'`,
 				)
 				.bind(approver.id, changeId)
 				.run();
+			if ((flipR.meta.changes ?? 0) === 0) {
+				await ctx.answerCallbackQuery({ text: 'Already handled.' });
+				return;
+			}
 			await ctx.editMessageText(
 				`❌ Late ${row.period} change rejected by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`,
 			);
@@ -76,24 +88,28 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
-		// Approve: apply the change and flip request status.
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(
-					`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
-					 VALUES (?, ?, ?, ?, ?)
-					 ON CONFLICT(user_id, parade_state_date, period)
-					 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
-				)
-				.bind(row.user_id, row.parade_state_date, row.period, row.new_status, row.new_reason),
-			env.depot_db
-				.prepare(
-					`UPDATE parade_change_requests
-					 SET status = 'approved', superior_user_id = ?, approved_at = datetime('now')
-					 WHERE id = ?`,
-				)
-				.bind(approver.id, changeId),
-		]);
+		// Approve: flip request status atomically first, then apply the change.
+		const flipApprove = await env.depot_db
+			.prepare(
+				`UPDATE parade_change_requests
+				 SET status = 'approved', superior_user_id = ?, approved_at = datetime('now')
+				 WHERE id = ? AND status = 'pending'`,
+			)
+			.bind(approver.id, changeId)
+			.run();
+		if ((flipApprove.meta.changes ?? 0) === 0) {
+			await ctx.answerCallbackQuery({ text: 'Already handled.' });
+			return;
+		}
+		await env.depot_db
+			.prepare(
+				`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(user_id, parade_state_date, period)
+				 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
+			)
+			.bind(row.user_id, row.parade_state_date, row.period, row.new_status, row.new_reason)
+			.run();
 
 		await ctx.editMessageText(
 			`✅ Late ${row.period} change approved by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`,

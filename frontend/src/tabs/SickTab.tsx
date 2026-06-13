@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import WebApp from '@twa-dev/sdk';
-import { api, confirmDialog, type Me } from '../lib/api';
+import { api, alertDialog, confirmDialog, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface OpenCase {
 	id: number;
 	case_type: 'RSI' | 'RSO';
 	reportsick_status: string;
+	sick_date: string | null;
+	reason: string | null;
 	approved_at: string | null;
 	updated_status: string | null;
 	updated_at: string | null;
@@ -19,6 +20,17 @@ interface OpenCase {
 	created_at: string;
 }
 
+// SGT (UTC+8) date string, optionally offset by N days.
+function sgtDateStr(offsetDays = 0): string {
+	const d = new Date(Date.now() + 8 * 3_600_000 + offsetDays * 86_400_000);
+	return d.toISOString().slice(0, 10);
+}
+// True once it's 15:00 (3pm) SGT or later — past then, RSI/RSO is usually for tomorrow.
+function sgtPastSickCutoff(): boolean {
+	const d = new Date(Date.now() + 8 * 3_600_000);
+	return d.getUTCHours() * 60 + d.getUTCMinutes() >= 15 * 60;
+}
+
 export function SickTab({
 	me,
 	initialSick,
@@ -28,9 +40,13 @@ export function SickTab({
 	initialSick?: 'RSI' | 'RSO' | null;
 	onConsumed?: () => void;
 }) {
-	const selfManaged = !!me.superior_telegram_id && me.superior_telegram_id === me.telegram_id;
+	const selfManaged = !!me.self_managed;
+	// Appointment-holders & self-managed users auto-approve their own RSI/RSO, so
+	// they can also one-step-undo it (no separate superior to ask).
+	const autoApproves = !!me.self_managed || !!me.appointment;
 	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
-	const [pendingReport, setPendingReport] = useState<'RSI' | 'RSO' | null>(null);
+	// Which day a new RSI/RSO is for — defaults to tomorrow once it's past 17:30.
+	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(sgtPastSickCutoff() ? 'tomorrow' : 'today');
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [mcDays, setMcDays] = useState<number | ''>('');
@@ -38,6 +54,8 @@ export function SickTab({
 	const [endDate, setEndDate] = useState('');
 	const [location, setLocation] = useState('');
 	const [approxTime, setApproxTime] = useState('');
+	// Optional reason / symptoms captured at report time, shown to the approver.
+	const [reportReason, setReportReason] = useState('');
 
 	function refresh() {
 		setLoadError(null);
@@ -56,45 +74,30 @@ export function SickTab({
 	// Sync the case (e.g. superior approved it) when the user returns to the app.
 	useFocusRefresh(refresh);
 
-	// When routed here from the Parade tab (user marked RSI/RSO without
-	// reporting), stash the type; act on it once the open-case state has loaded.
+	// When routed here from the Parade tab, just land on the report UI (below);
+	// the user picks the day + RSI/RSO. Consume the route so it doesn't re-fire.
 	const routeHandled = useRef(false);
 	useEffect(() => {
 		if (initialSick && !routeHandled.current) {
 			routeHandled.current = true;
-			setPendingReport(initialSick);
 			onConsumed?.();
 		}
 		if (!initialSick) routeHandled.current = false;
 	}, [initialSick, onConsumed]);
 
-	useEffect(() => {
-		if (!pendingReport || open === undefined) return;
-		const type = pendingReport;
-		setPendingReport(null);
-		(async () => {
-			if (open) {
-				WebApp.showAlert(`You already have an open ${open.case_type} case — no new report needed.`);
-				return;
-			}
-			const ok = await confirmDialog(`Report ${type} now? Your superior will be notified.`);
-			if (ok) await report(type);
-		})();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [pendingReport, open]);
-
 	async function report(case_type: 'RSI' | 'RSO') {
 		setBusy(true);
 		try {
-			await api.post('/api/sick/report', { case_type });
+			const sickDate = sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1);
+			await api.post('/api/sick/report', { case_type, sick_date: sickDate, reason: reportReason.trim() || null });
 			await refresh();
-			WebApp.showAlert(
+			alertDialog(
 				selfManaged
-					? `${case_type} logged (no approval needed). Update your status below.`
-					: `${case_type} submitted — awaiting approval.`,
+					? `${case_type} logged for ${sickDate} (no approval needed). Update your status below.`
+					: `${case_type} submitted for ${sickDate} — awaiting approval. Your parade state for that day now shows ${case_type}.`,
 			);
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			setBusy(false);
 		}
@@ -102,15 +105,18 @@ export function SickTab({
 
 	async function cancelPending() {
 		if (!open) return;
-		const ok = await confirmDialog('Cancel this sick report?');
+		const isPending = open.reportsick_status === 'pending_superior';
+		const ok = await confirmDialog(
+			isPending ? 'Cancel this sick report?' : 'Undo this RSI/RSO? It will be removed and your parade status for that day reverted.',
+		);
 		if (!ok) return;
 		setBusy(true);
 		try {
 			await api.post('/api/sick/cancel', { id: open.id });
 			await refresh();
-			WebApp.showAlert('Cancelled.');
+			alertDialog('Cancelled.');
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			setBusy(false);
 		}
@@ -119,11 +125,11 @@ export function SickTab({
 	async function submitUpdate() {
 		if (!open) return;
 		if (mcDays === '' || mcDays < 0) {
-			WebApp.showAlert('Please enter number of MC days (0 if none).');
+			alertDialog('Please enter number of MC days (0 if none).');
 			return;
 		}
 		if (mcDays >= 1 && (!startDate || !endDate)) {
-			WebApp.showAlert('Please enter MC start and end dates.');
+			alertDialog('Please enter MC start and end dates.');
 			return;
 		}
 		setBusy(true);
@@ -142,9 +148,9 @@ export function SickTab({
 			setLocation('');
 			setApproxTime('');
 			await refresh();
-			WebApp.showAlert('Update sent.');
+			alertDialog('Update sent.');
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			setBusy(false);
 		}
@@ -170,13 +176,42 @@ export function SickTab({
 	if (open === undefined) return <div className="muted">Loading…</div>;
 
 	if (!open) {
+		const pastCutoff = sgtPastSickCutoff();
 		return (
 			<div>
 				<h3>Report Sick</h3>
-				<p className="muted">No open case. Choose:</p>
+				<p className="muted" style={{ marginBottom: 6 }}>Which day is this RSI/RSO for?</p>
+				<div className="seg" style={{ marginBottom: 8 }}>
+					<button className={sickDay === 'today' ? 'active' : ''} onClick={() => setSickDay('today')}>
+						Today · {sgtDateStr(0)}
+					</button>
+					<button className={sickDay === 'tomorrow' ? 'active' : ''} onClick={() => setSickDay('tomorrow')}>
+						Tomorrow · {sgtDateStr(1)}
+					</button>
+				</div>
+				{pastCutoff && (
+					<div
+						style={{
+							margin: '0 0 10px',
+							padding: '10px 12px',
+							borderRadius: 12,
+							background: sickDay === 'today' ? 'var(--depot-danger)' : 'var(--depot-warning)',
+							color: '#fff',
+							fontWeight: 600,
+							lineHeight: 1.4,
+						}}
+					>
+						⚠ It's past 3pm — afternoon/evening reports are usually for <b>TOMORROW</b>. You've selected <b>{sickDay === 'today' ? 'TODAY' : 'TOMORROW'}</b> ({sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}). Double-check before submitting.
+					</div>
+				)}
+				<label>Reason / symptoms <span className="danger">*required</span> <span className="muted">(shown to your approver)</span>
+					<textarea value={reportReason} onChange={(e) => setReportReason(e.target.value)} placeholder="e.g. Fever and sore throat" />
+				</label>
+				<p className="muted" style={{ marginBottom: 6 }}>Report for <b>{sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}</b>:</p>
+				{!reportReason.trim() && <p className="muted danger" style={{ marginBottom: 6 }}>Enter a reason / symptoms to report.</p>}
 				<div className="actions">
-					<button className="btn" disabled={busy} onClick={() => report('RSI')}>🏥 RSI (In-Camp)</button>
-					<button className="btn" disabled={busy} onClick={() => report('RSO')}>🩺 RSO (Outside)</button>
+					<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSI')}>🏥 RSI (In-Camp)</button>
+					<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSO')}>🩺 RSO (Outside)</button>
 				</div>
 			</div>
 		);
@@ -199,17 +234,22 @@ export function SickTab({
 					<span className={`badge status-${open.reportsick_status}`}>{open.reportsick_status.replace(/_/g, ' ')}</span>
 				</div>
 				<div className="entry-meta">
+					{open.sick_date && <span>📅 for {open.sick_date}</span>}
 					<span>📝 {open.created_at}</span>
 					{open.approved_at && <span>✓ {open.approved_at}</span>}
 				</div>
+				{open.reason && <div className="entry-reason">Reason: {open.reason}</div>}
 				{open.num_of_mc_days != null && open.num_of_mc_days >= 1 && (
 					<div className="entry-reason">
 						{open.num_of_mc_days} day(s) MC · {open.mc_start_date} → {open.mc_end_date}
 					</div>
 				)}
-				{open.reportsick_status === 'pending_superior' && (
+				{(open.reportsick_status === 'pending_superior' ||
+					(autoApproves && ['approved', 'updated', 'flagged'].includes(open.reportsick_status))) && (
 					<div className="entry-actions">
-						<button className="btn-link danger" disabled={busy} onClick={cancelPending}>🗑 Cancel request</button>
+						<button className="btn-link danger" disabled={busy} onClick={cancelPending}>
+							{open.reportsick_status === 'pending_superior' ? '🗑 Cancel request' : '↩ Undo RSI/RSO'}
+						</button>
 					</div>
 				)}
 			</div>
@@ -231,6 +271,19 @@ export function SickTab({
 						<>
 							<label>MC start date *<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} /></label>
 							<label>MC end date *<input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} /></label>
+							<div
+								style={{
+									margin: '6px 0 12px',
+									padding: '12px 14px',
+									borderRadius: 12,
+									background: 'var(--depot-warning)',
+									color: '#fff',
+									fontWeight: 600,
+									lineHeight: 1.4,
+								}}
+							>
+								📎 Attach your MC document now — send the <b>photo or PDF</b> of your MC <u>directly to this bot in the chat</u>. It auto-forwards to your superior.
+							</div>
 						</>
 					)}
 					<label>
@@ -252,9 +305,6 @@ export function SickTab({
 					<button className="btn" disabled={busy || mcDays === ''} onClick={submitUpdate}>
 						{busy ? 'Saving…' : 'Submit update'}
 					</button>
-					<p className="muted" style={{ marginTop: 8 }}>
-						📎 To attach your MC, send the photo or PDF directly to this bot in the chat. It auto-forwards to your superior.
-					</p>
 				</>
 			)}
 		</div>

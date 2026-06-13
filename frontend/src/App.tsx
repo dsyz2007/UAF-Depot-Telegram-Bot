@@ -50,14 +50,14 @@ export default function App() {
 	}
 
 	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
-	// Today tab (which hosts the Approvals inbox) is shown to anyone who
-	// approves for someone — admins/superadmins plus user-role superiors.
+	// Pending tab (which hosts the Approvals inbox) is shown to anyone who
+	// approves for someone — admins/superadmins plus appointment-holders.
 	const showToday = isAdminish || me.is_approver;
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
 		{ key: 'parade', label: '🪖 Parade', show: true },
 		{ key: 'off', label: '📅 Off', show: true },
 		{ key: 'sick', label: '🤒 Sick', show: true },
-		{ key: 'today', label: '📊 Today', show: showToday },
+		{ key: 'today', label: '🗂 Pending', show: showToday },
 		{ key: 'admin', label: '⚙ Admin', show: isAdminish },
 	];
 

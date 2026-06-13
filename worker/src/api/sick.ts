@@ -1,12 +1,52 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
-import { isSelfManaged } from '../types';
-import { approverTidsFor } from '../superiors';
+import { autoApprovesOwn } from '../types';
+import { approverTidsFor, sameUnit } from '../superiors';
+import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, slotWorking } from '../holidays';
+
+// Optimistically set a user's parade state for `date` to the sick status
+// (RSI/RSO) when they report — shown even before approval. Bypasses the normal
+// late-change gate because the sick approval IS the gate. Skips any half-day
+// that is non-working for the user's department (weekend / holiday / override)
+// so RSI/RSO never shows on a non-working day.
+//
+// Which half-day(s) get marked:
+//   • for TODAY → only the half-day currently in progress (AM before noon SGT,
+//     otherwise PM) — you don't retroactively mark a half-day that's over.
+//   • for a LATER day (report() only ever passes tomorrow) → only that day's AM.
+// report() clamps sick_date to today/tomorrow, so these two cases are exhaustive.
+export async function setParadeForSick(env: Env, userId: number, dept: string | null, date: string, status: string): Promise<void> {
+	const info = await getDayWorkInfo(env, date);
+	const periods: ('AM' | 'PM')[] = date === sgtToday() ? [sgtPeriodNow()] : ['AM'];
+	const stmt = env.depot_db.prepare(
+		`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+		 VALUES (?, ?, ?, ?, NULL)
+		 ON CONFLICT(user_id, parade_state_date, period)
+		 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
+	);
+	const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+	for (const period of periods) {
+		if (!slotWorking(info, dept, period)) continue;
+		ops.push(stmt.bind(userId, date, period, status));
+	}
+	if (ops.length) await env.depot_db.batch(ops);
+}
+
+// Revert the optimistic parade state on reject/cancel — only clears entries
+// still set to this sick status, so it won't clobber a status the user changed.
+async function clearParadeForSick(env: Env, userId: number, date: string, status: string): Promise<void> {
+	await env.depot_db
+		.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND parade_status = ?`)
+		.bind(userId, date, status)
+		.run();
+}
 
 interface OpenCase {
 	id: number;
 	case_type: 'RSI' | 'RSO';
 	reportsick_status: string;
+	sick_date: string | null;
+	reason: string | null;
 	approved_at: string | null;
 	updated_status: string | null;
 	updated_at: string | null;
@@ -30,10 +70,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	if (request.method === 'GET' && sub === '/my-open') {
 		const row = await env.depot_db
 			.prepare(
-				`SELECT id, case_type, reportsick_status, approved_at, updated_status, updated_at,
+				`SELECT id, case_type, reportsick_status, sick_date, reason, approved_at, updated_status, updated_at,
 				        num_of_mc_days, mc_start_date, mc_end_date, location, approx_time, mc_file_id, created_at
 				 FROM sick_cases
-				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','flagged')
+				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','updated','flagged')
 				 ORDER BY id DESC LIMIT 1`,
 			)
 			.bind(user.id)
@@ -42,43 +82,55 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'POST' && sub === '/report') {
-		const body = (await request.json()) as { case_type?: string };
+		const body = (await request.json()) as { case_type?: string; sick_date?: string; reason?: string };
 		if (body.case_type !== 'RSI' && body.case_type !== 'RSO') {
 			return json({ error: 'bad_case_type' }, { status: 400 });
 		}
+		// Which day this RSI/RSO is for — today or tomorrow only (default today).
+		const today = sgtToday();
+		const tomorrow = sgtDateAddDays(today, 1);
+		const sickDate = isValidDate(body.sick_date) && (body.sick_date === today || body.sick_date === tomorrow) ? body.sick_date : today;
+		// Reason / symptoms — compulsory; shown to the approver in the inbox + recent.
+		const reason = body.reason?.trim() || null;
+		if (!reason) return json({ error: 'reason_required' }, { status: 400 });
+
 		const open = await env.depot_db
 			.prepare(
 				`SELECT id FROM sick_cases
-				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved')`,
+				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','updated','flagged')`,
 			)
 			.bind(user.id)
 			.first<{ id: number }>();
 		if (open) return json({ error: 'already_open', id: open.id }, { status: 409 });
 
-		// Self-managed users skip the superior-approval step: the case is logged
-		// as approved immediately, no DM, no reminders, no MC requirement.
-		if (isSelfManaged(user)) {
+		// Self-managed users and appointment-holders skip the approval step: the
+		// case is logged as approved immediately, no DM, no reminders.
+		if (autoApprovesOwn(user)) {
 			const ins = await env.depot_db
 				.prepare(
-					`INSERT INTO sick_cases (user_id, case_type, reportsick_status, superior_user_id, approved_at)
-					 VALUES (?, ?, 'approved', ?, datetime('now'))
+					`INSERT INTO sick_cases (user_id, case_type, reportsick_status, superior_user_id, approved_at, sick_date, reason)
+					 VALUES (?, ?, 'approved', ?, datetime('now'), ?, ?)
 					 RETURNING id`,
 				)
-				.bind(user.id, body.case_type, user.id)
+				.bind(user.id, body.case_type, user.id, sickDate, reason)
 				.first<{ id: number }>();
 			if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
-			return json({ ok: true, id: ins.id, auto_approved: true });
+			await setParadeForSick(env, user.id, user.department, sickDate, body.case_type);
+			return json({ ok: true, id: ins.id, auto_approved: true, sick_date: sickDate });
 		}
 
 		const ins = await env.depot_db
 			.prepare(
-				`INSERT INTO sick_cases (user_id, case_type, reportsick_status)
-				 VALUES (?, ?, 'pending_superior')
+				`INSERT INTO sick_cases (user_id, case_type, reportsick_status, sick_date, reason)
+				 VALUES (?, ?, 'pending_superior', ?, ?)
 				 RETURNING id`,
 			)
-			.bind(user.id, body.case_type)
+			.bind(user.id, body.case_type, sickDate, reason)
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
+
+		// Optimistically reflect it on the parade calendar right away (pending).
+		await setParadeForSick(env, user.id, user.department, sickDate, body.case_type);
 
 		// Per-request DM with inline buttons to EACH superior (either may approve).
 		const approverTids = await approverTidsFor(env, user);
@@ -86,7 +138,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
-				text: `🟡 <b>${body.case_type}</b> request from ${user.full_name}.`,
+				text: `🟡 <b>${body.case_type}</b> request from ${user.full_name}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
@@ -105,7 +157,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				.bind(firstMsgId, ins.id)
 				.run();
 		}
-		return json({ ok: true, id: ins.id });
+		return json({ ok: true, id: ins.id, sick_date: sickDate });
 	}
 
 	if (request.method === 'POST' && sub === '/update') {
@@ -197,18 +249,23 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true });
 	}
 
-	// Requester cancels their own pending sick case.
+	// Requester cancels/undoes their OWN sick case in one step. Normally only a
+	// still-pending case is cancellable; but an appointment-holder / self-managed
+	// user (who auto-approves their own requests) may also one-step-undo their own
+	// already-approved RSI/RSO — there's no separate superior to ask.
 	if (request.method === 'POST' && sub === '/cancel') {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
-			.prepare(`SELECT id, user_id, case_type, reportsick_status FROM sick_cases WHERE id = ?`)
+			.prepare(`SELECT id, user_id, case_type, reportsick_status, sick_date FROM sick_cases WHERE id = ?`)
 			.bind(body.id)
-			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string }>();
+			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_case' }, { status: 403 });
-		if (row.reportsick_status !== 'pending_superior') {
-			return json({ error: 'not_pending' }, { status: 409 });
+		const isPending = row.reportsick_status === 'pending_superior';
+		const selfUndo = autoApprovesOwn(user) && ['approved', 'updated', 'flagged'].includes(row.reportsick_status);
+		if (!isPending && !selfUndo) {
+			return json({ error: 'not_cancellable', state: row.reportsick_status }, { status: 409 });
 		}
 
 		await env.depot_db
@@ -217,6 +274,12 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				   cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`,
 			)
 			.bind(user.id, body.id)
+			.run();
+		// Roll back the optimistic parade entry for that day + clear any reminders.
+		if (row.sick_date) await clearParadeForSick(env, user.id, row.sick_date, row.case_type);
+		await env.depot_db
+			.prepare(`DELETE FROM reminders WHERE related_type = 'sick_case' AND related_id = ? AND sent_at IS NULL`)
+			.bind(body.id)
 			.run();
 
 		const approverTids = await approverTidsFor(env, user);
@@ -241,6 +304,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.prepare(
 				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.superior_user_id,
 				        u.telegram_id AS requester_tid, u.full_name AS requester_name,
+				        u.department AS requester_dept, u.sub_department AS requester_sub,
 				        sup.telegram_id AS approver_tid, sup.full_name AS approver_name
 				 FROM sick_cases s
 				 JOIN users u ON u.id = s.user_id
@@ -256,6 +320,8 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				superior_user_id: number | null;
 				requester_tid: string;
 				requester_name: string;
+				requester_dept: string | null;
+				requester_sub: string | null;
 				approver_tid: string | null;
 				approver_name: string | null;
 			}>();
@@ -263,18 +329,22 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		if (!['approved', 'updated', 'flagged'].includes(row.reportsick_status)) {
 			return json({ error: 'bad_state', state: row.reportsick_status }, { status: 409 });
 		}
-		if (user.user_role !== 'superadmin' && row.superior_user_id !== user.id) {
-			return json({ error: 'not_your_approval' }, { status: 403 });
-		}
+		const canRevert =
+			user.user_role === 'superadmin' ||
+			row.superior_user_id === user.id ||
+			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub));
+		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
 		// Reopen as pending (back to the inbox) and clear the approval fields.
-		await env.depot_db
+		const flip = await env.depot_db
 			.prepare(
 				`UPDATE sick_cases SET reportsick_status = 'pending_superior',
-				   superior_user_id = NULL, approved_at = NULL WHERE id = ?`,
+				   superior_user_id = NULL, approved_at = NULL
+				 WHERE id = ? AND reportsick_status IN ('approved','updated','flagged')`,
 			)
 			.bind(body.id)
 			.run();
+		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'bad_state' }, { status: 409 });
 
 		await env.depot_db
 			.prepare(

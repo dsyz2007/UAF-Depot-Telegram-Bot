@@ -1,18 +1,31 @@
 import { useEffect, useRef, useState } from 'react';
-import WebApp from '@twa-dev/sdk';
-import { api, confirmDialog, type Me } from '../lib/api';
+import { api, alertDialog, confirmDialog, deptLabel, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
+
+// Department heading order for the "Everyone" list (matches the Parade tab).
+const DEPT_ORDER: readonly string[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others', 'Unassigned'];
 
 interface SummaryRow {
 	id: number;
 	full_name: string;
 	off_credits: number;
 	department: string | null;
+	sub_department: string | null;
+	personnel_type: string | null;
+	user_role: string;
+}
+
+// Sort within a department: Regulars first, then NSFs, each alphabetical.
+function cmpOffRow(a: SummaryRow, b: SummaryRow): number {
+	const ra = a.personnel_type === 'Regular' ? 0 : 1;
+	const rb = b.personnel_type === 'Regular' ? 0 : 1;
+	return ra - rb || a.full_name.localeCompare(b.full_name);
 }
 interface DetailRow {
 	id: number;
 	startdate: string;
 	enddate: string;
+	period: string;
 	reason: string;
 	approved_date: string | null;
 	approved_by_id: number | null;
@@ -27,6 +40,17 @@ interface StaffRow {
 	full_name: string;
 	off_credits: number;
 	department: string | null;
+	user_role: string;
+	personnel_type: string | null;
+}
+
+// Same 3-tiebreak ordering as the Parade "Show everyone" panel:
+// 1) descending rights (superadmin > admin > user), 2) Regular before NSF,
+// 3) alphabetical.
+function cmpStaff(a: StaffRow, b: StaffRow): number {
+	const roleRank = (r: string) => (r === 'superadmin' ? 0 : r === 'admin' ? 1 : 2);
+	const typeRank = (t: string | null) => (t === 'Regular' ? 0 : 1);
+	return roleRank(a.user_role) - roleRank(b.user_role) || typeRank(a.personnel_type) - typeRank(b.personnel_type) || a.full_name.localeCompare(b.full_name);
 }
 interface GrantRow {
 	id: number;
@@ -53,6 +77,11 @@ function dayCount(start: string, end: string): number {
 	return Math.floor((b - a) / 86_400_000) + 1;
 }
 
+// Credit-days: a half-day (AM/PM) costs 0.5 per day, a full day costs 1.
+function offDays(start: string, end: string, period: string): number {
+	return period === 'AM' || period === 'PM' ? dayCount(start, end) * 0.5 : dayCount(start, end);
+}
+
 export function OffTab({
 	me,
 	initialOff,
@@ -73,6 +102,7 @@ export function OffTab({
 	const [showGive, setShowGive] = useState(false);
 	// Everyone's off library is hidden until explicitly shown (declutters the page).
 	const [showEveryone, setShowEveryone] = useState(false);
+	const [everyoneSearch, setEveryoneSearch] = useState('');
 	// "My recent requests" shows only the latest 3 until expanded.
 	const [showAllMine, setShowAllMine] = useState(false);
 
@@ -137,9 +167,9 @@ export function OffTab({
 		try {
 			await api.post('/api/off/cancel', { id });
 			await refreshAll();
-			WebApp.showAlert('Cancelled.');
+			alertDialog('Cancelled.');
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 	async function revertApproval(id: number) {
@@ -148,9 +178,9 @@ export function OffTab({
 		try {
 			await api.post('/api/off/revert', { id });
 			await refreshAll();
-			WebApp.showAlert('Reverted — back to pending approval.');
+			alertDialog('Reverted — back to pending approval.');
 		} catch (e) {
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
@@ -158,7 +188,7 @@ export function OffTab({
 	if (detailUser) {
 		// Total off-days used across all approved requests (one request can
 		// span multiple days; we sum each range inclusive).
-		const totalDaysUsed = details.reduce((sum, d) => sum + dayCount(d.startdate, d.enddate), 0);
+		const totalDaysUsed = details.reduce((sum, d) => sum + offDays(d.startdate, d.enddate, d.period), 0);
 		return (
 			<div>
 				<button className="btn btn-secondary" onClick={() => setDetailUser(null)}>← Back</button>
@@ -183,11 +213,11 @@ export function OffTab({
 							{details.map((d) => (
 								<tr key={d.id}>
 									<td>
-										{fmtDates(d)}
+										{fmtDates(d)}{d.period === 'AM' || d.period === 'PM' ? ` (${d.period})` : ''}
 										<br />
 										<span className="muted">{d.reason}</span>
 									</td>
-									<td>{dayCount(d.startdate, d.enddate)}</td>
+									<td>{offDays(d.startdate, d.enddate, d.period)}</td>
 									<td>{d.approved_by_name ?? '—'}</td>
 									<td>{d.approved_date?.slice(0, 10) ?? '—'}</td>
 									{isAdminish(me.user_role) && (
@@ -242,11 +272,11 @@ export function OffTab({
 				<>
 					<h4 className="section-title">My recent requests</h4>
 					{(showAllMine ? mine : mine.slice(0, 3)).map((m) => {
-						const days = dayCount(m.startdate, m.enddate);
+						const days = offDays(m.startdate, m.enddate, m.period);
 						return (
 							<div key={m.id} className={`entry-card acc-${m.off_status}`}>
 								<div className="entry-head">
-									<span className="entry-title">📅 {fmtDates(m)}</span>
+									<span className="entry-title">📅 {fmtDates(m)}{m.period === 'AM' || m.period === 'PM' ? ` (${m.period})` : ''}</span>
 									<span className={`badge status-${m.off_status}`}>{m.off_status}</span>
 								</div>
 								<div className="entry-meta">
@@ -270,18 +300,41 @@ export function OffTab({
 				</>
 			)}
 
-			{showEveryone &&
-				summary.map((row) => (
-					<div key={row.id} className="row" onClick={() => setDetailUser(row)}>
-						<span>
-							{row.full_name}
-							{row.department && <span className="muted" style={{ marginLeft: 6 }}>· {row.department}</span>}
-						</span>
-						<span className="muted" style={{ fontSize: 13 }}>
-							🪙 {row.off_credits}
-						</span>
-					</div>
-				))}
+			{showEveryone && (
+				<>
+					<input
+						value={everyoneSearch}
+						onChange={(e) => setEveryoneSearch(e.target.value)}
+						placeholder="🔎 Search name"
+						style={{ width: '100%', margin: '8px 0' }}
+					/>
+					{(() => {
+						const q = everyoneSearch.trim().toLowerCase();
+						const filtered = q ? summary.filter((r) => r.full_name.toLowerCase().includes(q)) : summary;
+						const groups = new Map<string, SummaryRow[]>();
+						for (const row of filtered) {
+							const key = deptLabel(row.department, row.sub_department);
+							const arr = groups.get(key) ?? [];
+							arr.push(row);
+							groups.set(key, arr);
+						}
+						const order = [...DEPT_ORDER, ...[...groups.keys()].filter((k) => !DEPT_ORDER.includes(k))];
+						const shown = order.filter((dept) => groups.has(dept));
+						if (shown.length === 0) return <p className="muted">No matching names.</p>;
+						return shown.map((dept) => (
+							<div key={dept}>
+								<h4 className="section-title">{dept} ({groups.get(dept)!.length})</h4>
+								{[...groups.get(dept)!].sort(cmpOffRow).map((row) => (
+									<div key={row.id} className="row" onClick={() => setDetailUser(row)}>
+										<span>{row.full_name}</span>
+										<span className="muted" style={{ fontSize: 13 }}>🪙 {row.off_credits}</span>
+									</div>
+								))}
+							</div>
+						));
+					})()}
+				</>
+			)}
 
 			{/* Everyone's off library is collapsed by default — full-width toggle
 			    at the bottom so the page stays focused on your own off info. */}
@@ -327,32 +380,33 @@ function RequestOffModal({
 }) {
 	const [startdate, setStart] = useState(initialStart ?? '');
 	const [enddate, setEnd] = useState(initialEnd ?? '');
+	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>('FD');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
-	const days = startdate && enddate && startdate <= enddate ? dayCount(startdate, enddate) : 0;
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
-	const sufficient = days > 0 && days <= balance;
+	// A half-day (AM/PM) costs 0.5 credits per day; full day costs 1.
+	const creditDays = datesValid ? offDays(startdate, enddate, period) : 0;
+	// Balance may go negative — no sufficiency check at all.
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (!sufficient) hint = `Need ${days} credit(s) but only have ${balance}. Ask an admin to grant you more credits first.`;
 	else if (!reason.trim()) hint = 'Reason is required.';
 
 	async function submit() {
 		setBusy(true);
 		try {
-			const res = await api.post<{ auto_approved?: boolean; balance_after?: number }>('/api/off/request', { startdate, enddate, reason });
+			const res = await api.post<{ auto_approved?: boolean; balance_after?: number }>('/api/off/request', { startdate, enddate, reason, period });
 			await onDone();
 			onClose();
-			WebApp.showAlert(
+			alertDialog(
 				res.auto_approved
-					? `✅ Off applied (no approval needed). ${days} credit${days === 1 ? '' : 's'} used${res.balance_after != null ? `. Balance: ${res.balance_after}` : ''}.`
-					: `Submitted — awaiting approval. ${days} credit${days === 1 ? '' : 's'} reserved now (refunded if rejected or cancelled).`,
+					? `✅ Off applied (no approval needed). ${creditDays} credit${creditDays === 1 ? '' : 's'} used${res.balance_after != null ? `. Balance: ${res.balance_after}` : ''}.`
+					: `Submitted — awaiting approval. ${creditDays} credit${creditDays === 1 ? '' : 's'} reserved now (refunded if rejected or cancelled).`,
 			);
 		} catch (e) {
 			setBusy(false);
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
@@ -360,14 +414,30 @@ function RequestOffModal({
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Request Off</h3>
-				<div className="muted">Balance: 🪙 {balance} · This request: {days} day{days === 1 ? '' : 's'}</div>
-				<label>Start date<input type="date" value={startdate} onChange={(e) => setStart(e.target.value)} /></label>
-				<label>End date<input type="date" value={enddate} onChange={(e) => setEnd(e.target.value)} /></label>
+				<div className="muted">Balance: 🪙 {balance} · This request: {creditDays} credit{creditDays === 1 ? '' : 's'}</div>
+				<label>Start date<input
+					type="date"
+					value={startdate}
+					onChange={(e) => {
+						const v = e.target.value;
+						setStart(v);
+						// Snap end date to start when it's empty or now before start.
+						if (!enddate || enddate < v) setEnd(v);
+					}}
+				/></label>
+				<label>End date<input type="date" value={enddate} min={startdate || undefined} onChange={(e) => setEnd(e.target.value)} /></label>
+				<label>Half / full day
+					<div className="seg">
+						<button type="button" className={period === 'FD' ? 'active' : ''} onClick={() => setPeriod('FD')}>Full day</button>
+						<button type="button" className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>AM only</button>
+						<button type="button" className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM only</button>
+					</div>
+				</label>
 				<label>Reason<textarea value={reason} onChange={(e) => setReason(e.target.value)} /></label>
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
 				<button
 					className="btn"
-					disabled={busy || !datesValid || !sufficient || !reason.trim()}
+					disabled={busy || !datesValid || !reason.trim()}
 					onClick={submit}
 				>
 					{busy ? 'Submitting…' : 'Submit'}
@@ -378,10 +448,14 @@ function RequestOffModal({
 }
 
 function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; onDone: () => Promise<void> }) {
-	const canCreditOthers = isAdminish(me.user_role);
+	// Admins/superadmins can credit anyone (subject to approval); an
+	// appointment+self user can credit their own department (incl self).
+	const canCreditOthers = isAdminish(me.user_role) || (!!me.appointment && !!me.self_managed);
 	const [staff, setStaff] = useState<StaffRow[]>([]);
-	// '' means self for normal users; admins pick from the dropdown.
+	// '' means self for normal users; admins pick a recipient from the list.
 	const [staffId, setStaffId] = useState<number | ''>('');
+	const [staffSearch, setStaffSearch] = useState('');
+	const [staffDept, setStaffDept] = useState<string>('all');
 	const [numDays, setNumDays] = useState<number | ''>('');
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -393,69 +467,145 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 	const selfSelected = !canCreditOthers || staffId === '' || staffId === me.id;
 	const selected = staff.find((s) => s.id === staffId);
 
+	// Name search + department filter over the recipient list (client-side, like
+	// the Parade "Show everyone" panel).
+	const staffQuery = staffSearch.trim().toLowerCase();
+	const staffDeptOptions = DEPT_ORDER.filter((d) => staff.some((s) => deptLabel(s.department, null) === d));
+	const filteredStaff = staff
+		.filter((s) => (staffQuery ? s.full_name.toLowerCase().includes(staffQuery) : true))
+		.filter((s) => (staffDept === 'all' ? true : deptLabel(s.department, null) === staffDept))
+		.sort(cmpStaff);
+	// Group the (already sorted) matches by department, in DEPT_ORDER.
+	const staffGroups: [string, StaffRow[]][] = (() => {
+		const m = new Map<string, StaffRow[]>();
+		for (const s of filteredStaff) {
+			const k = deptLabel(s.department, null);
+			const arr = m.get(k) ?? [];
+			arr.push(s);
+			m.set(k, arr);
+		}
+		const order = [...DEPT_ORDER, ...[...m.keys()].filter((k) => !DEPT_ORDER.includes(k))];
+		return order.filter((d) => m.has(d)).map((d) => [d, m.get(d)!] as [string, StaffRow[]]);
+	})();
+
 	async function submit() {
 		setBusy(true);
 		try {
-			// Omit staff_id to default to self on the server.
-			const payload: Record<string, unknown> = { num_days: Number(numDays), reason };
+			// Round to 1 decimal place (half-days like 3.5 are allowed) + trimmed
+			// reason. (The server also coerces.) Omit staff_id to default to self.
+			const payload: Record<string, unknown> = { num_days: Math.round(Number(numDays) * 10) / 10, reason: reason.trim() };
 			if (canCreditOthers && staffId !== '') payload.staff_id = staffId;
-			const res = await api.post<{ auto_approved?: boolean; balance?: number }>('/api/off/grant', payload);
+			const res = await api.post<{ auto_approved?: boolean; balance?: number; recipient_name?: string }>('/api/off/grant', payload);
 			await onDone();
 			onClose();
-			WebApp.showAlert(
+			const recipientName = res.recipient_name ?? (selfSelected ? me.full_name : selected?.full_name ?? 'the recipient');
+			alertDialog(
 				res.auto_approved
-					? `✅ ${numDays} off credit(s) added (no approval needed)${res.balance != null ? `. Balance: ${res.balance}` : ''}.`
-					: `Submitted — ${numDays} off credit(s) pending superior approval.`,
+					? `✅ ${numDays} off credit(s) credited to ${recipientName} (no approval needed)${res.balance != null ? `. Their balance: ${res.balance}` : ''}.`
+					: `Submitted — ${numDays} off credit(s) for ${recipientName}, pending superior approval.`,
 			);
 		} catch (e) {
 			setBusy(false);
-			WebApp.showAlert(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
 	const ok = typeof numDays === 'number' && numDays > 0 && reason.trim().length > 0;
+	// Immediate (no approval) only when the granter holds an appointment AND is
+	// self-managed AND the recipient is in their own department (incl self).
+	// Everyone else's credit (incl admin/superadmin → others) is a proposal.
+	const recipientDept = selfSelected ? me.department : selected?.department ?? null;
+	const immediate = !!me.appointment && !!me.self_managed && me.department === recipientDept;
 
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
 				<h3>Credit Off(s)</h3>
 				<p className="muted">
-					Request a number of off days to be credited to your balance. Your superior must approve before the credits are added.
-					{canCreditOthers && ' As an admin, you can also credit your staff.'}
+					{immediate
+						? 'Credits are applied immediately — no approval needed (you hold an appointment, are self-managed, and the recipient is in your department).'
+						: 'This is a proposal — it will be sent to the recipient’s approver(s) for approval before the credits are added.'}
 				</p>
 				{canCreditOthers && (
 					<>
-						<label>Recipient
-							<select value={staffId} onChange={(e) => setStaffId(e.target.value === '' ? '' : Number(e.target.value))}>
-								<option value="">Myself ({me.full_name})</option>
-								{staff.map((s) => (
-									<option key={s.id} value={s.id}>
-										{s.full_name}{s.department ? ` (${s.department})` : ''} — 🪙 {s.off_credits}
-									</option>
-								))}
-							</select>
-						</label>
+						<label style={{ marginBottom: 6 }}>Recipient</label>
+						<input
+							value={staffSearch}
+							onChange={(e) => setStaffSearch(e.target.value)}
+							placeholder="🔎 Search name"
+							style={{ marginTop: 0, marginBottom: 6 }}
+						/>
+						<select
+							value={staffDept}
+							onChange={(e) => setStaffDept(e.target.value)}
+							style={{ marginTop: 0, marginBottom: 6 }}
+						>
+							<option value="all">All departments</option>
+							{staffDeptOptions.map((d) => (
+								<option key={d} value={d}>
+									{d}
+								</option>
+							))}
+						</select>
+						<div className="credit-list">
+							{/* Myself — pinned at the top. */}
+							<button
+								type="button"
+								className={`credit-option${selfSelected ? ' selected' : ''}`}
+								onClick={() => setStaffId('')}
+							>
+								<span className="credit-option-name">
+									Myself <span className="muted">(you)</span>
+									{selfSelected && <span className="credit-chip-check"> ✓</span>}
+								</span>
+								<span className="muted">🪙 {me.off_credits}</span>
+							</button>
+							{staffGroups.length === 0 ? (
+								<p className="muted" style={{ padding: '10px 12px', margin: 0 }}>No matching names.</p>
+							) : (
+								staffGroups.map(([dept, list]) => (
+									<div key={dept}>
+										<div className="credit-group-header">{dept} ({list.length})</div>
+										{list.map((s) => (
+											<button
+												type="button"
+												key={s.id}
+												className={`credit-option${s.id === staffId ? ' selected' : ''}`}
+												onClick={() => setStaffId(s.id)}
+											>
+												<span className="credit-option-name">
+													{s.full_name}
+													{s.id === staffId && <span className="credit-chip-check"> ✓</span>}
+												</span>
+												<span className="muted">🪙 {s.off_credits}</span>
+											</button>
+										))}
+									</div>
+								))
+							)}
+						</div>
 						{!selfSelected && selected && (
-							<div className="muted" style={{ marginBottom: 8 }}>
-								{selected.full_name} currently has 🪙 {selected.off_credits} credit{selected.off_credits === 1 ? '' : 's'}.
+							<div className="muted" style={{ marginTop: 6 }}>
+								Crediting <b>{selected.full_name}</b> ({deptLabel(selected.department, null)}).
 							</div>
 						)}
 					</>
 				)}
-				<label>Number of off days
+				<label>Number of off days (half-days allowed, e.g. 3.5)
 					<input
 						type="number"
-						min={1}
+						min={0.5}
+						step={0.5}
 						value={numDays}
 						onChange={(e) => setNumDays(e.target.value === '' ? '' : Number(e.target.value))}
-						placeholder="e.g. 3"
+						placeholder="e.g. 3 or 3.5"
 					/>
 				</label>
 				<label>Reason
 					<textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Off in lieu for weekend duty" />
 				</label>
 				<button className="btn" disabled={busy || !ok} onClick={submit}>
-					{busy ? 'Submitting…' : 'Submit for superior approval'}
+					{busy ? 'Submitting…' : immediate ? 'Credit now' : 'Submit for superior approval'}
 				</button>
 			</div>
 		</div>

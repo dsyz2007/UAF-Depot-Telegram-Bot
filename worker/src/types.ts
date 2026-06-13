@@ -11,28 +11,39 @@ declare global {
 
 export type UserRole = 'user' | 'admin' | 'superadmin';
 
-export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'STG' | 'Others';
-export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'STG', 'Others'];
+export type Department = 'DHQ' | 'DMSP' | 'DCS' | 'DSP' | 'Others';
+export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others'];
 
-// Only meaningful when department = 'STG'.
-export type StgSubDepartment = 'C1+C2' | 'C3+C4';
-export const STG_SUB_DEPARTMENTS: readonly StgSubDepartment[] = ['C1+C2', 'C3+C4'];
+export type PersonnelType = 'NSF' | 'Regular';
+export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'Regular'];
 
-export type PersonnelType = 'NSF' | 'NSF Officer' | 'Regular';
-export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'NSF Officer', 'Regular'];
+// Department appointments — approvers for a user are the appointment-holders in
+// their own unit (= their department). Any number of each per unit.
+export type Appointment = 'WOIC' | '2IC' | 'PC';
+export const APPOINTMENTS: readonly Appointment[] = ['WOIC', '2IC', 'PC'];
 
 export interface DbUser {
 	id: number;
 	telegram_id: string;
 	full_name: string;
+	// Telegram @username (handle), stored without the leading '@'. May be null
+	// (the user has no handle, or hasn't been captured yet).
+	username: string | null;
 	user_role: UserRole;
+	// Legacy manual-superior columns (kept for data history; no longer used for
+	// routing — replaced by department appointments + self_managed).
 	superior_telegram_id: string | null;
-	// Optional second superior — either superior can approve this user's requests.
 	superior_telegram_id_2: string | null;
 	ord_date: string | null;
 	department: Department | null;
-	sub_department: StgSubDepartment | null;
+	// Legacy STG sub-section column. STG was merged into a single DSP department,
+	// so this is now always null for new data; kept for column compatibility.
+	sub_department: string | null;
 	personnel_type: PersonnelType | null;
+	// Appointment held within their unit (drives who approves whom). NULL = none.
+	appointment: Appointment | null;
+	// Explicit bypass of all approval (the most senior account(s)).
+	self_managed: number;
 	off_credits: number;
 	created_at: string;
 }
@@ -69,7 +80,8 @@ export type ParadeStatus =
 	| 'Incoming DO'
 	| 'Outgoing DO'
 	| 'NTM Swap-In'
-	| 'NTM Swap-Out';
+	| 'NTM Swap-Out'
+	| 'Operator Off';
 
 // Order: the two "Others" sit just above the Incoming/Outgoing duty block and
 // below everything else; the NTM Swap tags sit at the very end.
@@ -96,6 +108,7 @@ export const PARADE_STATUSES: readonly ParadeStatus[] = [
 	'Outgoing DO',
 	'NTM Swap-In',
 	'NTM Swap-Out',
+	'Operator Off',
 ];
 
 // Long-form labels for the legend / dropdown tooltips.
@@ -122,7 +135,15 @@ export const PARADE_STATUS_LABELS: Record<ParadeStatus, string> = {
 	Others: 'Others',
 	'NTM Swap-In': 'NTM Swap-In',
 	'NTM Swap-Out': 'NTM Swap-Out',
+	'Operator Off': 'Operator Off',
 };
+
+// Leave parade statuses — these route through the dedicated Leave-request flow
+// (superior approval + OneNS reminder) instead of being applied directly.
+export const LEAVE_PARADE_STATUSES: readonly ParadeStatus[] = ['LL', 'OL', 'Leave (Others)'];
+export function isLeaveStatus(s: string | null | undefined): boolean {
+	return s === 'LL' || s === 'OL' || s === 'Leave (Others)';
+}
 
 // Statuses that require a reason when submitting parade state.
 export const REASON_REQUIRED_STATUSES: readonly ParadeStatus[] = [
@@ -132,20 +153,22 @@ export const REASON_REQUIRED_STATUSES: readonly ParadeStatus[] = [
 	'MC',
 	'RSO',
 	'RSI',
+	'OL',
 	'Leave (Others)',
 	'Others',
 ];
 
-// A user is "self-managed" — bypassing every approval step — when they have at
-// least one superior set and ALL of their superiors are themselves. If a real
-// (other) second superior exists, that superior can approve, so NOT self-managed.
-export function isSelfManaged(u: {
-	telegram_id: string;
-	superior_telegram_id: string | null;
-	superior_telegram_id_2?: string | null;
-}): boolean {
-	const sups = [u.superior_telegram_id, u.superior_telegram_id_2 ?? null].filter((t): t is string => !!t);
-	return sups.length > 0 && sups.every((t) => t === u.telegram_id);
+// A user is "self-managed" — bypassing every approval step — when the explicit
+// self_managed flag is set.
+export function isSelfManaged(u: { self_managed?: number | boolean | null }): boolean {
+	return !!u.self_managed;
+}
+
+// Whose OWN requests need no approval (auto-approve on submit): self-managed
+// users, AND appointment-holders (they approve their unit, so they approve
+// themselves automatically rather than manually).
+export function autoApprovesOwn(u: { self_managed?: number | boolean | null; appointment?: string | null }): boolean {
+	return !!u.self_managed || !!u.appointment;
 }
 
 export function dayCountInclusive(startdate: string, enddate: string): number {

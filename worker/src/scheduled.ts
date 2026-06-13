@@ -7,8 +7,8 @@
 //   0 5,23 * * *     → 07:00 SGT (23:00 UTC, AM flag) and 13:00 SGT (05:00 UTC, PM flag)
 //   0 4 * * *        → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
 
-import { tgSendMessage } from './tg';
-import { isWorkingDay, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
+import { tgSendMessage, sendThrottled } from './tg';
+import { getDayWorkInfo, slotWorking, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
 
 // Inline keyboard with a single WebApp button that deep-links to a tab.
 // Optional `date` (YYYY-MM-DD) pre-selects that date on the Parade calendar —
@@ -35,7 +35,7 @@ interface DueRow {
 	reminder_type: string;
 	telegram_id: string;
 	full_name: string;
-	superior_telegram_id: string | null;
+	approver_tid: string | null;
 	case_type: string | null;
 }
 
@@ -43,7 +43,6 @@ interface UserRow {
 	id: number;
 	telegram_id: string;
 	full_name: string;
-	superior_telegram_id: string | null;
 }
 
 export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
@@ -90,27 +89,29 @@ async function drainReminders(env: Env): Promise<void> {
 	const { results } = await env.depot_db
 		.prepare(
 			`SELECT r.id, r.user_id, r.related_type, r.related_id, r.reminder_type,
-			        u.telegram_id, u.full_name, u.superior_telegram_id,
+			        u.telegram_id, u.full_name,
+			        sa.telegram_id AS approver_tid,
 			        sc.case_type
 			 FROM reminders r
 			 JOIN users u ON u.id = r.user_id
 			 LEFT JOIN sick_cases sc ON r.related_type = 'sick_case' AND sc.id = r.related_id
+			 LEFT JOIN users sa ON sa.id = sc.superior_user_id
 			 WHERE r.sent_at IS NULL AND r.due_at <= datetime('now')
 			 LIMIT 100`,
 		)
 		.all<DueRow>();
 	if (!results?.length) return;
 
-	const sends: Promise<unknown>[] = results.map((r) => {
+	// Chunked send (10 at a time, ~2s pause) to stay under Telegram's rate limit.
+	const settled = await sendThrottled(results, (r) => {
 		const text = renderReminder(r);
 		const isSuperiorFlag = r.reminder_type === 'sick_update_superior_flag';
-		const targetTid = isSuperiorFlag && r.superior_telegram_id ? r.superior_telegram_id : r.telegram_id;
+		const targetTid = isSuperiorFlag && r.approver_tid ? r.approver_tid : r.telegram_id;
 		// Personnel-facing sick reminders deep-link to the Sick page; the
 		// 8h-flag DM to the superior is informational only — no button.
 		const reply_markup = isSuperiorFlag ? undefined : webAppButton(env, 'sick');
 		return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text, reply_markup });
 	});
-	const settled = await Promise.allSettled(sends);
 
 	const stmt = env.depot_db.prepare(`UPDATE reminders SET sent_at = datetime('now') WHERE id = ?`);
 	await env.depot_db.batch(results.map((r) => stmt.bind(r.id)));
@@ -154,14 +155,17 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 	const today = sgtToday();
 	const targetDate = kind === 'evening_prev_am' ? sgtDateAddDays(today, 1) : today;
 
-	// Skip entirely if target date is non-working (weekend, confirmed PH, override)
-	if (!(await isWorkingDay(env, targetDate))) return;
+	// Which half-day this nudge is about (drives the per-department working check).
+	const period: 'AM' | 'PM' = kind === 'noon_pm' ? 'PM' : 'AM';
+	const info = await getDayWorkInfo(env, targetDate);
+	// Skip entirely if the whole day is non-working with no department exceptions.
+	if (info.baseNonWorking && info.overrides.length === 0) return;
 
 	// All three nudges share a single AM/PM-aware fetch so the message can show
 	// the user's actual current status, and so we can skip anyone already done.
 	const { results: statusRows } = await env.depot_db
 		.prepare(
-			`SELECT u.id, u.telegram_id, u.full_name, u.superior_telegram_id,
+			`SELECT u.id, u.telegram_id, u.full_name, u.department,
 			        MAX(CASE WHEN p.period = 'AM' THEN p.parade_status END) AS am_status,
 			        MAX(CASE WHEN p.period = 'PM' THEN p.parade_status END) AS pm_status
 			 FROM users u
@@ -171,17 +175,16 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 			 GROUP BY u.id`,
 		)
 		.bind(targetDate)
-		.all<UserRow & { am_status: string | null; pm_status: string | null }>();
+		.all<UserRow & { department: string | null; am_status: string | null; pm_status: string | null }>();
 
 	type EnrichedRow = { user: UserRow; amStatus: string | null; pmStatus: string | null };
 
-	// Skip anyone who already has BOTH AM and PM filled for the target date —
-	// they have nothing left to update. Applies to all three nudges (previously
-	// only the 6pm one filtered, and only on AM).
+	// Skip anyone who already has BOTH AM and PM filled for the target date, and
+	// anyone whose relevant half-day is non-working for their department.
 	const enriched: EnrichedRow[] = (statusRows ?? [])
-		.filter((u) => u.am_status === null || u.pm_status === null)
+		.filter((u) => (u.am_status === null || u.pm_status === null) && slotWorking(info, u.department, period))
 		.map((u) => ({
-			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name, superior_telegram_id: u.superior_telegram_id },
+			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name },
 			amStatus: u.am_status,
 			pmStatus: u.pm_status,
 		}));
@@ -191,17 +194,20 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 	// Send, capturing each message_id so a later in-app parade-state update can
 	// edit the most-recent nudge in place (see parade.ts /submit) rather than
 	// sending another notification.
-	const settled = await Promise.allSettled(
-		enriched.map((e) =>
-			tgSendMessage(env.BOT_TOKEN, {
-				chat_id: e.user.telegram_id,
-				text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
-				// Deep-link the calendar to the exact date this reminder is about
-				// (tomorrow for the 9pm nudge, today for the others).
-				reply_markup: webAppButton(env, 'parade', targetDate),
-			}),
-		),
+	// Chunked send (10 at a time, ~2s pause) so a ~90-user nudge stays under
+	// Telegram's ~30 msg/sec limit.
+	const settled = await sendThrottled(enriched, (e) =>
+		tgSendMessage(env.BOT_TOKEN, {
+			chat_id: e.user.telegram_id,
+			text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
+			// Deep-link the calendar to the exact date this reminder is about
+			// (tomorrow for the 9pm nudge, today for the others).
+			reply_markup: webAppButton(env, 'parade', targetDate),
+		}),
 	);
+	settled.forEach((s, i) => {
+		if (s.status === 'rejected') console.error('parade nudge send failed', enriched[i].user.telegram_id, s.reason);
+	});
 
 	const upsertStmt = env.depot_db.prepare(
 		`INSERT INTO parade_nudge_messages (user_id, target_date, chat_id, message_id, updated_at)
@@ -225,7 +231,7 @@ function fmtStatus(s: string | null): string {
 function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: string | null): string {
 	switch (kind) {
 		case 'evening_prev_am':
-			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade by 2359.`;
+			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade.`;
 		case 'morning_am': {
 			// Show user's actual current AM/PM so they know if any update is
 			// needed at a glance.
@@ -252,11 +258,13 @@ function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: s
 // still empty get their superior DM'd. Skip non-working days entirely.
 async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 	const today = sgtToday();
-	if (!(await isWorkingDay(env, today))) return;
+	const info = await getDayWorkInfo(env, today);
+	// Whole day non-working with no department exceptions → nothing to flag.
+	if (info.baseNonWorking && info.overrides.length === 0) return;
 
 	const { results } = await env.depot_db
 		.prepare(
-			`SELECT u.telegram_id, u.full_name, u.superior_telegram_id, u.superior_telegram_id_2
+			`SELECT u.full_name, u.department, u.sub_department, u.self_managed
 			 FROM users u
 			 WHERE u.full_name NOT LIKE 'PENDING:%'
 			   AND NOT EXISTS (
@@ -265,16 +273,37 @@ async function flagPeriodMissing(env: Env, period: 'AM' | 'PM'): Promise<void> {
 			   )`,
 		)
 		.bind(today, period)
-		.all<{ telegram_id: string; full_name: string; superior_telegram_id: string | null; superior_telegram_id_2: string | null }>();
-	const missing = results ?? [];
+		.all<{ full_name: string; department: string | null; sub_department: string | null; self_managed: number }>();
+	// Only flag users whose relevant half-day is actually working for their dept.
+	const missing = (results ?? []).filter((r) => slotWorking(info, r.department, period));
 	if (!missing.length) return;
 
-	// Group by superior so each superior gets one consolidated DM. A user with
-	// two superiors flags both of them.
+	// Build a unit → appointment-holder-tids index once, plus the superadmin
+	// list, so we group missing users by their approvers without a per-user query.
+	const { results: holders } = await env.depot_db
+		.prepare(
+			`SELECT telegram_id, department, sub_department FROM users
+			 WHERE appointment IN ('WOIC','2IC','PC') AND full_name NOT LIKE 'PENDING:%'`,
+		)
+		.all<{ telegram_id: string; department: string | null; sub_department: string | null }>();
+	const unitKey = (d: string | null, s: string | null) => `${d ?? ''}|${s ?? ''}`;
+	const byUnit = new Map<string, string[]>();
+	for (const h of holders ?? []) {
+		const k = unitKey(h.department, h.sub_department);
+		(byUnit.get(k) ?? byUnit.set(k, []).get(k)!).push(h.telegram_id);
+	}
+	const { results: sas } = await env.depot_db
+		.prepare(`SELECT telegram_id FROM users WHERE user_role = 'superadmin'`)
+		.all<{ telegram_id: string }>();
+	const superadminTids = (sas ?? []).map((r) => r.telegram_id);
+
+	// Group missing users under each approver. self-managed users have no approver.
 	const groups = new Map<string, string[]>();
 	for (const r of missing) {
-		const sups = [...new Set([r.superior_telegram_id, r.superior_telegram_id_2].filter(Boolean) as string[])];
-		for (const tid of sups) {
+		if (r.self_managed) continue;
+		const unitHolders = r.department ? byUnit.get(unitKey(r.department, r.sub_department)) : undefined;
+		const approvers = unitHolders && unitHolders.length ? unitHolders : superadminTids;
+		for (const tid of [...new Set(approvers)]) {
 			const arr = groups.get(tid) ?? [];
 			arr.push(r.full_name);
 			groups.set(tid, arr);
@@ -312,7 +341,7 @@ async function runOrdReminders(env: Env): Promise<void> {
 			sends.push(
 				tgSendMessage(env.BOT_TOKEN, {
 					chat_id: sa.telegram_id,
-					text: `🎉 ORD today: ${u.full_name}. Use the button below to remove from the depot bot.`,
+					text: `📅 Expiry date today: ${u.full_name}. Use the button below to remove from the depot bot.`,
 					reply_markup: {
 						inline_keyboard: [[{ text: '🗑 Delete user', callback_data: `user:delete:${u.id}` }]],
 					},
@@ -325,23 +354,48 @@ async function runOrdReminders(env: Env): Promise<void> {
 
 async function runParadePrune(env: Env): Promise<void> {
 	const today = sgtToday();
-	const cutoff = sgtDateAddDays(today, -5);
 	await env.depot_db.batch([
-		env.depot_db.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < ?`).bind(cutoff),
+		// Keep parade state for as long as the date is still reachable in the
+		// calendar (±2 months). The calendar's earliest visible date is the 1st of
+		// (current month − 2), so prune only entries older than that. Anything the
+		// user can still view or export is retained. (Storage is trivially cheap.)
+		env.depot_db
+			.prepare(`DELETE FROM parade_state_entries WHERE parade_state_date < date('now','+8 hours','start of month','-2 months')`),
 		// Nudge-message rows only matter for today/tomorrow; drop anything past.
 		env.depot_db.prepare(`DELETE FROM parade_nudge_messages WHERE target_date < ?`).bind(today),
+		// Forecast-view counters only matter for the current day.
+		env.depot_db.prepare(`DELETE FROM forecast_views WHERE view_date < ?`).bind(today),
 	]);
 }
 
-// Retention: delete off requests and sick cases that ended more than ~2 months
-// ago (SGT) to keep the DB small. "Ended" = an off's enddate, or a sick case's
-// MC end date (falling back to its created date when there's no MC).
+// Retention: delete request/audit records more than ~2 months old (SGT) to keep
+// the DB small. "Old" = the record's relevant end/created date is before the
+// 2-month-ago cutoff. (Parade STATE entries are pruned separately, to the
+// calendar window, in runParadePrune.)
 async function runRetentionPrune(env: Env): Promise<void> {
+	const cutoff = `date('now','+8 hours','-2 months')`;
 	await env.depot_db.batch([
-		env.depot_db.prepare(`DELETE FROM off_requests WHERE enddate < date('now','+8 hours','-2 months')`),
+		// Off requests — by the off's end date.
+		env.depot_db.prepare(`DELETE FROM off_requests WHERE enddate < ${cutoff}`),
+		// Sick cases — by MC end date, falling back to created date when no MC.
+		env.depot_db.prepare(`DELETE FROM sick_cases WHERE COALESCE(mc_end_date, date(created_at)) < ${cutoff}`),
+		// Leave requests — by the leave's end date.
+		env.depot_db.prepare(`DELETE FROM leave_requests WHERE enddate < ${cutoff}`),
+		// Off-credit grants — by created date (they have no "end").
+		env.depot_db.prepare(`DELETE FROM off_credit_grants WHERE date(created_at) < ${cutoff}`),
+		// Late parade-change requests — by the parade date they targeted.
+		env.depot_db.prepare(`DELETE FROM parade_change_requests WHERE parade_state_date < ${cutoff}`),
+		// Reminders — drained or stale ones past their due time.
+		env.depot_db.prepare(`DELETE FROM reminders WHERE due_at < ${cutoff}`),
+		// Past public holidays — they're only consulted for the working-day check
+		// of recent/upcoming dates; older ones just accumulate.
+		env.depot_db.prepare(`DELETE FROM public_holidays WHERE holiday_date < ${cutoff}`),
+		// Stale PENDING stubs — someone /started but was never set up by an admin.
+		// Clear their (empty) reminders first to satisfy the legacy FK, then delete.
 		env.depot_db.prepare(
-			`DELETE FROM sick_cases WHERE COALESCE(mc_end_date, date(created_at)) < date('now','+8 hours','-2 months')`,
+			`DELETE FROM reminders WHERE user_id IN (SELECT id FROM users WHERE full_name LIKE 'PENDING:%' AND date(created_at) < date('now','+8 hours','-3 months'))`,
 		),
+		env.depot_db.prepare(`DELETE FROM users WHERE full_name LIKE 'PENDING:%' AND date(created_at) < date('now','+8 hours','-3 months')`),
 	]);
 }
 

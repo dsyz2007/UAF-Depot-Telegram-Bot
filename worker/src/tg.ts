@@ -23,6 +23,47 @@ export async function tgSendMessage(botToken: string, opts: TgSendOpts): Promise
 	return json.ok && json.result ? { message_id: json.result.message_id } : null;
 }
 
+// Fetch a chat/user's current profile by id. Works for any user the bot has an
+// existing chat with (i.e. anyone who has /start-ed). Returns null on error.
+export async function tgGetChat(
+	botToken: string,
+	chatId: number | string,
+): Promise<{ id: number; username?: string; first_name?: string; last_name?: string } | null> {
+	const res = await fetch(`https://api.telegram.org/bot${botToken}/getChat?chat_id=${chatId}`);
+	if (!res.ok) {
+		console.error('tgGetChat failed', chatId, res.status);
+		return null;
+	}
+	const json = (await res.json()) as {
+		ok: boolean;
+		result?: { id: number; username?: string; first_name?: string; last_name?: string };
+	};
+	return json.ok && json.result ? json.result : null;
+}
+
+// Broadcast helper: run `send` over `items` in chunks with a pause between
+// chunks, so a large fan-out (e.g. nudging ~90 users) doesn't trip Telegram's
+// ~30-messages/second global limit. Returns settled results in the SAME order
+// as `items` so callers can correlate (e.g. capture each message_id).
+export async function sendThrottled<T, R>(
+	items: T[],
+	send: (item: T, index: number) => Promise<R>,
+	opts: { chunkSize?: number; pauseMs?: number } = {},
+): Promise<PromiseSettledResult<R>[]> {
+	const chunkSize = opts.chunkSize ?? 10;
+	const pauseMs = opts.pauseMs ?? 2000;
+	const out: PromiseSettledResult<R>[] = [];
+	for (let i = 0; i < items.length; i += chunkSize) {
+		const chunk = items.slice(i, i + chunkSize);
+		const settled = await Promise.allSettled(chunk.map((item, j) => send(item, i + j)));
+		out.push(...settled);
+		if (i + chunkSize < items.length) {
+			await new Promise((resolve) => setTimeout(resolve, pauseMs));
+		}
+	}
+	return out;
+}
+
 export async function tgEditMessageText(
 	botToken: string,
 	chatId: number | string,

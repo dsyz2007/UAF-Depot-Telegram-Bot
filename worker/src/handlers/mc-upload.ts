@@ -12,9 +12,9 @@ export function registerMcUpload(bot: Bot, env: Env): void {
 		const uploaderTid = String(from.id);
 
 		const user = await env.depot_db
-			.prepare('SELECT id, full_name, telegram_id, superior_telegram_id FROM users WHERE telegram_id = ?')
+			.prepare('SELECT id, full_name, telegram_id FROM users WHERE telegram_id = ?')
 			.bind(uploaderTid)
-			.first<{ id: number; full_name: string; telegram_id: string; superior_telegram_id: string | null }>();
+			.first<{ id: number; full_name: string; telegram_id: string }>();
 		if (!user) {
 			await ctx.reply('You are not registered. Send /start first.');
 			return;
@@ -55,10 +55,9 @@ export function registerMcUpload(bot: Bot, env: Env): void {
 
 		await ctx.reply(`📎 MC received and attached to your ${sickCase.case_type} case.`);
 
-		// Auto-forward to the approving superior (else the user's direct
-		// superior), only if it's a distinct person — copyMessage preserves the
-		// original photo/document and lets us add a caption.
-		const superiorTid = sickCase.superior_tid ?? user.superior_telegram_id;
+		// Auto-forward to the superior who approved the case, if distinct —
+		// copyMessage preserves the original photo/document and adds a caption.
+		const superiorTid = sickCase.superior_tid;
 		if (superiorTid && superiorTid !== uploaderTid) {
 			try {
 				await ctx.api.copyMessage(superiorTid, ctx.chat.id, ctx.message.message_id, {

@@ -8,6 +8,7 @@ import './types';
 import { registerStartHandler } from './handlers/start';
 import { registerOffCallbacks } from './handlers/off-callbacks';
 import { registerSickCallbacks } from './handlers/sick-callbacks';
+import { registerLeaveCallbacks } from './handlers/leave-callbacks';
 import { registerUserCallbacks } from './handlers/user-callbacks';
 import { registerHolidayCallbacks } from './handlers/holiday-callbacks';
 import { registerParadeChangeCallbacks } from './handlers/parade-change-callbacks';
@@ -41,6 +42,7 @@ export function createBot(env: Env): Bot {
 	registerStartHandler(bot, env);
 	registerOffCallbacks(bot, env);
 	registerSickCallbacks(bot, env);
+	registerLeaveCallbacks(bot, env);
 	registerUserCallbacks(bot, env);
 	registerHolidayCallbacks(bot, env);
 	registerParadeChangeCallbacks(bot, env);

@@ -34,27 +34,126 @@ export function dayOfWeekSgt(sgtDate: string): number {
 	return new Date(`${sgtDate}T00:00:00Z`).getUTCDay();
 }
 
-// Precedence:
-// 1. working_day_overrides → use its value
-// 2. confirmed public_holidays → non-working
-// 3. Sat/Sun → non-working
-// 4. otherwise working
-export async function isWorkingDay(env: Env, sgtDate: string): Promise<boolean> {
-	const override = await env.depot_db
-		.prepare('SELECT is_working_day FROM working_day_overrides WHERE override_date = ?')
+// The current half-day by the Singapore clock: AM before 12:00 noon, else PM.
+// Used when a same-day RSI/RSO should mark only the half-day in progress.
+export function sgtPeriodNow(): Period {
+	const sgt = new Date(Date.now() + 8 * 3_600_000);
+	const min = sgt.getUTCHours() * 60 + sgt.getUTCMinutes();
+	return min < 12 * 60 ? 'AM' : 'PM';
+}
+
+// ── Working-day classification (per department + half-day) ─────────────────
+//
+// A date's working/non-working status can now vary by department and by half
+// (AM / PM). Overrides (set by superadmins) win over the weekend/holiday rule.
+//
+// Precedence for a (date, department, period) slot:
+//   1. The most specific matching override wins (period match beats FD;
+//      department-scoped beats all-departments).
+//   2. Else a confirmed public holiday or Sat/Sun → non-working.
+//   3. Else working.
+
+export type Period = 'AM' | 'PM';
+export type OverridePeriod = 'AM' | 'PM' | 'FD';
+
+export interface OverrideRow {
+	period: OverridePeriod;
+	departments: string[] | null; // null = all departments
+	is_working_day: number;
+}
+export interface DayWorkInfo {
+	baseNonWorking: boolean; // weekend or confirmed public holiday
+	overrides: OverrideRow[];
+}
+
+function parseDepartments(csv: string | null): string[] | null {
+	if (!csv) return null;
+	const list = csv.split(',').map((s) => s.trim()).filter(Boolean);
+	return list.length ? list : null;
+}
+
+// Specificity score so the most targeted override wins.
+function overrideScore(o: OverrideRow, period: Period, department: string | null): number {
+	let s = 0;
+	if (o.period === period) s += 2; // exact half beats full-day
+	if (o.departments !== null) s += 1; // department-scoped beats all
+	void department;
+	return s;
+}
+
+// Is a single slot (department, period) working, given the day's info?
+export function slotWorking(info: DayWorkInfo, department: string | null, period: Period): boolean {
+	const matches = info.overrides.filter(
+		(o) =>
+			(o.period === period || o.period === 'FD') &&
+			(o.departments === null || (department !== null && o.departments.includes(department))),
+	);
+	if (matches.length) {
+		matches.sort((a, b) => overrideScore(b, period, department) - overrideScore(a, period, department));
+		return matches[0].is_working_day === 1;
+	}
+	return !info.baseNonWorking;
+}
+
+export async function getDayWorkInfo(env: Env, sgtDate: string): Promise<DayWorkInfo> {
+	const { results: ovs } = await env.depot_db
+		.prepare('SELECT period, departments, is_working_day FROM working_day_overrides WHERE override_date = ?')
 		.bind(sgtDate)
-		.first<{ is_working_day: number }>();
-	if (override) return override.is_working_day === 1;
+		.all<{ period: OverridePeriod; departments: string | null; is_working_day: number }>();
+	const overrides: OverrideRow[] = (ovs ?? []).map((r) => ({
+		period: r.period,
+		departments: parseDepartments(r.departments),
+		is_working_day: r.is_working_day,
+	}));
 
 	const ph = await env.depot_db
 		.prepare('SELECT 1 AS one FROM public_holidays WHERE holiday_date = ? AND confirmed = 1')
 		.bind(sgtDate)
 		.first<{ one: number }>();
-	if (ph) return false;
-
 	const dow = dayOfWeekSgt(sgtDate);
-	if (dow === 0 || dow === 6) return false;
-	return true;
+	const baseNonWorking = !!ph || dow === 0 || dow === 6;
+	return { baseNonWorking, overrides };
+}
+
+// Batch variant — two queries total regardless of range size (used by the
+// parade-submit range expansion so a 90-day range stays cheap).
+export async function getRangeWorkInfo(env: Env, dates: string[]): Promise<Map<string, DayWorkInfo>> {
+	const out = new Map<string, DayWorkInfo>();
+	if (dates.length === 0) return out;
+	const ph = dates.map(() => '?').join(',');
+
+	const { results: ovs } = await env.depot_db
+		.prepare(`SELECT override_date, period, departments, is_working_day FROM working_day_overrides WHERE override_date IN (${ph})`)
+		.bind(...dates)
+		.all<{ override_date: string; period: OverridePeriod; departments: string | null; is_working_day: number }>();
+	const ovByDate = new Map<string, OverrideRow[]>();
+	for (const r of ovs ?? []) {
+		const arr = ovByDate.get(r.override_date) ?? [];
+		arr.push({ period: r.period, departments: parseDepartments(r.departments), is_working_day: r.is_working_day });
+		ovByDate.set(r.override_date, arr);
+	}
+
+	const { results: hols } = await env.depot_db
+		.prepare(`SELECT holiday_date FROM public_holidays WHERE confirmed = 1 AND holiday_date IN (${ph})`)
+		.bind(...dates)
+		.all<{ holiday_date: string }>();
+	const holidaySet = new Set((hols ?? []).map((h) => h.holiday_date));
+
+	for (const d of dates) {
+		const dow = dayOfWeekSgt(d);
+		out.set(d, {
+			baseNonWorking: holidaySet.has(d) || dow === 0 || dow === 6,
+			overrides: ovByDate.get(d) ?? [],
+		});
+	}
+	return out;
+}
+
+// Coarse "is this date a working day for anyone?" — true if either half-day is
+// working under the default (all-department) view. Used for day-level gating.
+export async function isWorkingDay(env: Env, sgtDate: string): Promise<boolean> {
+	const info = await getDayWorkInfo(env, sgtDate);
+	return slotWorking(info, null, 'AM') || slotWorking(info, null, 'PM');
 }
 
 // --------------------------------------------------------------------------

@@ -1,19 +1,23 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
-import { dayCountInclusive, isSelfManaged } from '../types';
-import { approverTidsFor } from '../superiors';
+import { dayCountInclusive, autoApprovesOwn } from '../types';
+import { approverTidsFor, sameUnit } from '../superiors';
 
 interface SummaryRow {
 	id: number;
 	full_name: string;
 	off_credits: number;
 	department: string | null;
+	sub_department: string | null;
+	personnel_type: string | null;
+	user_role: string;
 }
 
 interface DetailRow {
 	id: number;
 	startdate: string;
 	enddate: string;
+	period: string;
 	reason: string;
 	approved_date: string | null;
 	approved_by_id: number | null;
@@ -44,6 +48,16 @@ function isAdminish(role: string): boolean {
 	return role === 'admin' || role === 'superadmin';
 }
 
+// Credit-days for an off request: a half-day (AM/PM) costs 0.5 per day in the
+// range, a full day (FD) costs 1.
+function offDays(start: string, end: string, period: string): number {
+	const d = dayCountInclusive(start, end);
+	return period === 'AM' || period === 'PM' ? d * 0.5 : d;
+}
+function periodSuffix(period: string): string {
+	return period === 'AM' || period === 'PM' ? ` (${period} only)` : '';
+}
+
 export async function handleOff(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/off'.length);
@@ -54,7 +68,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// "taken X" so the JOIN with off_requests is removed — saves reads.
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT id, full_name, off_credits, department
+				`SELECT id, full_name, off_credits, department, sub_department, personnel_type, user_role
 				 FROM users
 				 WHERE full_name NOT LIKE 'PENDING:%'
 				 ORDER BY full_name`,
@@ -68,7 +82,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (!Number.isInteger(id)) return json({ error: 'bad_id' }, { status: 400 });
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT o.id, o.startdate, o.enddate, o.reason, o.approved_date, o.off_status,
+				`SELECT o.id, o.startdate, o.enddate, o.period, o.reason, o.approved_date, o.off_status,
 				        a.id AS approved_by_id, a.full_name AS approved_by_name
 				 FROM off_requests o
 				 LEFT JOIN users a ON a.id = o.approved_by
@@ -83,7 +97,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	if (request.method === 'GET' && sub === '/mine') {
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT o.id, o.startdate, o.enddate, o.reason, o.off_status,
+				`SELECT o.id, o.startdate, o.enddate, o.period, o.reason, o.off_status,
 				        o.approved_date, o.requested_by_user_id AS requester_id,
 				        a.id AS approved_by_id, a.full_name AS approved_by_name
 				 FROM off_requests o
@@ -115,36 +129,31 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 
 	// -------- request off (uses credits) -----------------------------------
 	if (request.method === 'POST' && sub === '/request') {
-		const body = (await request.json()) as { startdate?: string; enddate?: string; reason?: string };
+		const body = (await request.json()) as { startdate?: string; enddate?: string; reason?: string; period?: string };
 		if (!isValidDate(body.startdate) || !isValidDate(body.enddate) || !body.reason?.trim()) {
 			return json({ error: 'invalid_body' }, { status: 400 });
 		}
 		if (body.startdate > body.enddate) return json({ error: 'bad_range' }, { status: 400 });
+		// Guard against a fat-fingered year deducting thousands of credits.
+		if (dayCountInclusive(body.startdate, body.enddate) > 95) return json({ error: 'range_too_long' }, { status: 400 });
 
-		const days = dayCountInclusive(body.startdate, body.enddate);
-		if (user.off_credits < days) {
-			return json(
-				{
-					error: 'insufficient_credits',
-					required: days,
-					balance: user.off_credits,
-					message: `You need ${days} off credit(s) but only have ${user.off_credits}. Ask an admin to grant you more credits first.`,
-				},
-				{ status: 409 },
-			);
-		}
+		// Half-day (AM/PM) costs 0.5 credits per day; full day (FD) costs 1.
+		const period = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
+		const days = offDays(body.startdate, body.enddate, period);
+		const range = `${body.startdate} → ${body.enddate}`;
+		// Off-credit balance is allowed to go negative — no sufficiency block.
 
-		// Self-managed users (superior == themselves) skip approval — the off
-		// is recorded as approved immediately and credits deducted.
-		if (isSelfManaged(user)) {
+		// Self-managed users and appointment-holders skip approval — the off is
+		// recorded as approved immediately and credits deducted.
+		if (autoApprovesOwn(user)) {
 			await env.depot_db.batch([
 				env.depot_db
 					.prepare(
 						`INSERT INTO off_requests
-						   (user_id, requested_by_user_id, startdate, enddate, reason, off_status, approved_by, approved_date)
-						 VALUES (?, ?, ?, ?, ?, 'approved', ?, datetime('now'))`,
+						   (user_id, requested_by_user_id, startdate, enddate, period, reason, off_status, approved_by, approved_date)
+						 VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, datetime('now'))`,
 					)
-					.bind(user.id, user.id, body.startdate, body.enddate, body.reason.trim(), user.id),
+					.bind(user.id, user.id, body.startdate, body.enddate, period, body.reason.trim(), user.id),
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id),
 			]);
 			return json({ ok: true, auto_approved: true, days_requested: days, balance_after: user.off_credits - days });
@@ -153,11 +162,11 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const ins = await env.depot_db
 			.prepare(
 				`INSERT INTO off_requests
-				   (user_id, requested_by_user_id, startdate, enddate, reason, off_status)
-				 VALUES (?, ?, ?, ?, ?, 'pending')
+				   (user_id, requested_by_user_id, startdate, enddate, period, reason, off_status)
+				 VALUES (?, ?, ?, ?, ?, ?, 'pending')
 				 RETURNING id`,
 			)
-			.bind(user.id, user.id, body.startdate, body.enddate, body.reason.trim())
+			.bind(user.id, user.id, body.startdate, body.enddate, period, body.reason.trim())
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
@@ -174,7 +183,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
-				text: `🟡 <b>Off request</b>\n${user.full_name}: ${body.startdate} → ${body.enddate} (${days} day${days === 1 ? '' : 's'})\nBalance (credits already reserved): ${user.off_credits - days}\nReason: ${body.reason}`,
+				text: `🟡 <b>Off request</b>\n${user.full_name}: ${range} (${days} day${days === 1 ? '' : 's'})${periodSuffix(period)}\nBalance (credits already reserved): ${user.off_credits - days}\nReason: ${body.reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
@@ -200,54 +209,63 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	// -------- credit offs (self or admin→staff, needs superior approval) --
 	if (request.method === 'POST' && sub === '/grant') {
 		const body = (await request.json()) as {
-			staff_id?: number;
-			num_days?: number;
+			staff_id?: number | string;
+			num_days?: number | string;
 			reason?: string;
 		};
-		// Default target = self (lets normal users credit themselves).
-		const targetId = Number.isInteger(body.staff_id) ? body.staff_id! : user.id;
-		if (!Number.isInteger(body.num_days) || body.num_days! <= 0 || !body.reason?.trim()) {
-			return json({ error: 'invalid_body' }, { status: 400 });
+		// Coerce robustly: num_days / staff_id may arrive as a number OR a numeric
+		// string (older cached bundles, locale quirks). Fractional credits are
+		// allowed (e.g. 3.5 for half-days) — rounded to 1 decimal place. Precise
+		// errors so failures are diagnosable instead of a generic invalid_body.
+		const sid = Number(body.staff_id);
+		const targetId = Number.isInteger(sid) && sid > 0 ? sid : user.id;
+		const rawDays = Number(body.num_days);
+		const days = Number.isFinite(rawDays) ? Math.round(rawDays * 10) / 10 : NaN;
+		const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+		if (!Number.isFinite(days) || days <= 0) {
+			return json({ error: 'invalid_num_days', got: body.num_days ?? null }, { status: 400 });
 		}
+		if (!reason) return json({ error: 'reason_required' }, { status: 400 });
 
 		const isSelf = targetId === user.id;
-		if (!isSelf && !isAdminish(user.user_role)) {
-			return json({ error: 'forbidden' }, { status: 403 });
-		}
 
 		const staff = await env.depot_db
-			.prepare('SELECT id, telegram_id, full_name, superior_telegram_id, superior_telegram_id_2 FROM users WHERE id = ?')
+			.prepare('SELECT id, telegram_id, full_name, department, sub_department, self_managed, appointment FROM users WHERE id = ?')
 			.bind(targetId)
 			.first<{
 				id: number;
 				telegram_id: string;
 				full_name: string;
-				superior_telegram_id: string | null;
-				superior_telegram_id_2: string | null;
+				department: string | null;
+				sub_department: string | null;
+				self_managed: number;
+				appointment: string | null;
 			}>();
 		if (!staff) return json({ error: 'staff_not_found' }, { status: 404 });
-		// Admins can credit only their direct reports (either superior slot);
-		// superadmins anyone; anyone can self-credit.
-		if (
-			!isSelf &&
-			user.user_role === 'admin' &&
-			staff.superior_telegram_id !== user.telegram_id &&
-			staff.superior_telegram_id_2 !== user.telegram_id
-		) {
-			return json({ error: 'not_your_staff' }, { status: 403 });
+
+		// Immediate (no approval) ONLY when the GRANTER holds an appointment AND is
+		// self-managed AND the recipient is in the granter's own department (incl
+		// themselves). Everyone else's credit — including a superadmin/admin
+		// crediting another person — is a proposal routed for approval.
+		const granterAutoCredit = !!user.appointment && !!user.self_managed && sameUnit(user, staff.department, staff.sub_department);
+
+		// Who may credit ANOTHER person: admins/superadmins (any department,
+		// subject to approval), or an appointment+self granter within their own
+		// department. Anyone may propose a self-credit.
+		if (!isSelf && !isAdminish(user.user_role) && !granterAutoCredit) {
+			return json({ error: 'forbidden' }, { status: 403 });
 		}
 
-		// If the recipient is self-managed (their superior is themselves), there's
-		// no distinct approver — add the credits immediately.
-		if (isSelfManaged(staff)) {
+		if (granterAutoCredit) {
+			// The appointment+self granter self-approves their own-department credit.
 			await env.depot_db.batch([
 				env.depot_db
 					.prepare(
 						`INSERT INTO off_credit_grants (user_id, granted_by, num_days, reason, status, superior_user_id, approved_at)
 						 VALUES (?, ?, ?, ?, 'approved', ?, datetime('now'))`,
 					)
-					.bind(staff.id, user.id, body.num_days, body.reason.trim(), staff.id),
-				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(body.num_days, staff.id),
+					.bind(staff.id, user.id, days, reason, user.id),
+				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, staff.id),
 			]);
 			const bal = await env.depot_db
 				.prepare(`SELECT off_credits FROM users WHERE id = ?`)
@@ -256,10 +274,10 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			if (staff.telegram_id !== user.telegram_id) {
 				await tgSendMessage(env.BOT_TOKEN, {
 					chat_id: staff.telegram_id,
-					text: `🪙 ${user.full_name} credited you +${body.num_days} off day(s). Balance: ${bal?.off_credits ?? '?'}.`,
+					text: `🪙 ${user.full_name} credited you +${days} off day(s). Balance: ${bal?.off_credits ?? '?'}.`,
 				});
 			}
-			return json({ ok: true, auto_approved: true, balance: bal?.off_credits });
+			return json({ ok: true, auto_approved: true, balance: bal?.off_credits, recipient_name: staff.full_name });
 		}
 
 		const ins = await env.depot_db
@@ -268,7 +286,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				 VALUES (?, ?, ?, ?, 'pending_superior')
 				 RETURNING id`,
 			)
-			.bind(staff.id, user.id, body.num_days, body.reason.trim())
+			.bind(staff.id, user.id, days, reason)
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
@@ -279,7 +297,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
-				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${body.num_days} day(s)\nReason: ${body.reason}`,
+				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${days} day(s)\nReason: ${reason}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
@@ -303,11 +321,11 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (staff.telegram_id !== user.telegram_id && !approverTids.includes(staff.telegram_id)) {
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: staff.telegram_id,
-				text: `🪙 ${user.full_name} proposed crediting you ${body.num_days} off day(s) — pending superior approval. Reason: ${body.reason}`,
+				text: `🪙 ${user.full_name} proposed crediting you ${days} off day(s) — pending superior approval. Reason: ${reason}`,
 			});
 		}
 
-		return json({ ok: true, id: ins.id });
+		return json({ ok: true, id: ins.id, recipient_name: staff.full_name });
 	}
 
 	// -------- cancel own pending request ---------------------------------
@@ -316,22 +334,23 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
 			.prepare(
-				`SELECT id, user_id, off_status, startdate, enddate FROM off_requests WHERE id = ?`,
+				`SELECT id, user_id, off_status, startdate, enddate, period FROM off_requests WHERE id = ?`,
 			)
 			.bind(body.id)
-			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string }>();
+			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
 		if (row.off_status !== 'pending') return json({ error: 'not_pending' }, { status: 409 });
 
-		// Refund the credits reserved at request time.
-		const refundDays = dayCountInclusive(row.startdate, row.enddate);
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`)
-				.bind(user.id, body.id),
-			env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(refundDays, row.user_id),
-		]);
+		// Refund the credits reserved at request time (matching the half/full-day rate).
+		const refundDays = offDays(row.startdate, row.enddate, row.period);
+		// Atomic flip so a cancel racing with a reject can't double-refund.
+		const flip = await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND off_status = 'pending'`)
+			.bind(user.id, body.id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_pending' }, { status: 409 });
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(refundDays, row.user_id).run();
 
 		const approverTids = await approverTidsFor(env, user);
 		await Promise.allSettled(
@@ -354,6 +373,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.prepare(
 				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.approved_by,
 				        u.telegram_id AS requester_tid, u.full_name AS requester_name,
+				        u.department AS requester_dept, u.sub_department AS requester_sub,
 				        a.telegram_id AS approver_tid, a.full_name AS approver_name
 				 FROM off_requests o
 				 JOIN users u ON u.id = o.user_id
@@ -370,22 +390,29 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				approved_by: number | null;
 				requester_tid: string;
 				requester_name: string;
+				requester_dept: string | null;
+				requester_sub: string | null;
 				approver_tid: string | null;
 				approver_name: string | null;
 			}>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.off_status !== 'approved') return json({ error: 'not_approved' }, { status: 409 });
-		if (user.user_role !== 'superadmin' && row.approved_by !== user.id) {
-			return json({ error: 'not_your_approval' }, { status: 403 });
-		}
+		// Superadmin (any), the original approver, or a same-department
+		// appointment-holder may revert.
+		const canRevert =
+			user.user_role === 'superadmin' ||
+			row.approved_by === user.id ||
+			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub));
+		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
 		// Reopen as pending (back to the inbox). Credits were reserved at request
 		// time and stay reserved while pending — no refund here (they're only
 		// returned on reject/cancel).
-		await env.depot_db
-			.prepare(`UPDATE off_requests SET off_status = 'pending', approved_by = NULL, approved_date = NULL WHERE id = ?`)
+		const flipRevert = await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status = 'pending', approved_by = NULL, approved_date = NULL WHERE id = ? AND off_status = 'approved'`)
 			.bind(body.id)
 			.run();
+		if ((flipRevert.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
 
 		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
@@ -405,6 +432,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.status, g.superior_user_id,
 				        u.telegram_id AS staff_tid, u.full_name AS staff_name,
+				        u.department AS staff_dept, u.sub_department AS staff_sub,
 				        gr.telegram_id AS granter_tid
 				 FROM off_credit_grants g
 				 JOIN users u ON u.id = g.user_id
@@ -420,21 +448,27 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				superior_user_id: number | null;
 				staff_tid: string;
 				staff_name: string;
+				staff_dept: string | null;
+				staff_sub: string | null;
 				granter_tid: string | null;
 			}>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.status !== 'approved') return json({ error: 'not_approved' }, { status: 409 });
-		if (user.user_role !== 'superadmin' && row.superior_user_id !== user.id) {
-			return json({ error: 'not_your_approval' }, { status: 403 });
-		}
-		// Reopen as pending (back to the inbox) and claw the credits back.
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(`UPDATE off_credit_grants SET status='pending_superior', superior_user_id=NULL, approved_at=NULL WHERE id=?`)
-				.bind(body.id),
-			// MAX(0, …) so we never push the balance negative if they already spent it.
-			env.depot_db.prepare(`UPDATE users SET off_credits = MAX(0, off_credits - ?) WHERE id = ?`).bind(row.num_days, row.user_id),
-		]);
+		const canRevertGrant =
+			user.user_role === 'superadmin' ||
+			row.superior_user_id === user.id ||
+			(!!user.appointment && sameUnit(user, row.staff_dept, row.staff_sub));
+		if (!canRevertGrant) return json({ error: 'not_your_approval' }, { status: 403 });
+		// Reopen as pending (back to the inbox) and claw the credits back — atomic
+		// flip so a double-revert can't claw twice.
+		const flipClaw = await env.depot_db
+			.prepare(`UPDATE off_credit_grants SET status='pending_superior', superior_user_id=NULL, approved_at=NULL WHERE id=? AND status='approved'`)
+			.bind(body.id)
+			.run();
+		if ((flipClaw.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
+		// Plain subtraction (negative balances are allowed) so the clawback
+		// exactly mirrors the unclamped grant-add — keeps approve/revert reversible.
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(row.num_days, row.user_id).run();
 		const msg = `↩ Off-credit reverted by ${user.full_name}: −${row.num_days} day(s) from ${row.staff_name} (pending approval again).`;
 		const sent = new Set<string>([user.telegram_id]);
 		const notify = (tid: string | null) =>
@@ -444,21 +478,29 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'GET' && sub === '/staff') {
-		if (user.user_role === 'superadmin') {
-			const { results } = await env.depot_db
-				.prepare(`SELECT id, full_name, off_credits, department FROM users WHERE full_name NOT LIKE 'PENDING:%' ORDER BY full_name`)
-				.all<{ id: number; full_name: string; off_credits: number; department: string | null }>();
-			return json(results ?? []);
-		}
-		if (user.user_role === 'admin') {
+		// Admins & superadmins may credit anyone. Include role + personnel type so
+		// the client can sort by the same tiebreaks as the Parade panel.
+		if (user.user_role === 'admin' || user.user_role === 'superadmin') {
 			const { results } = await env.depot_db
 				.prepare(
-					`SELECT id, full_name, off_credits, department FROM users
-					 WHERE (superior_telegram_id = ? OR superior_telegram_id_2 = ?) AND full_name NOT LIKE 'PENDING:%'
+					`SELECT id, full_name, off_credits, department, user_role, personnel_type
+					 FROM users WHERE full_name NOT LIKE 'PENDING:%' ORDER BY full_name`,
+				)
+				.all<{ id: number; full_name: string; off_credits: number; department: string | null; user_role: string; personnel_type: string | null }>();
+			return json(results ?? []);
+		}
+		// An appointment+self granter may credit their OWN department's members.
+		if (user.appointment && user.self_managed) {
+			const { results } = await env.depot_db
+				.prepare(
+					`SELECT id, full_name, off_credits, department, user_role, personnel_type
+					 FROM users
+					 WHERE full_name NOT LIKE 'PENDING:%'
+					   AND department = ? AND IFNULL(sub_department,'') = IFNULL(?, '')
 					 ORDER BY full_name`,
 				)
-				.bind(user.telegram_id, user.telegram_id)
-				.all<{ id: number; full_name: string; off_credits: number; department: string | null }>();
+				.bind(user.department, user.sub_department ?? null)
+				.all<{ id: number; full_name: string; off_credits: number; department: string | null; user_role: string; personnel_type: string | null }>();
 			return json(results ?? []);
 		}
 		return json([]);

@@ -6,6 +6,8 @@ import { sgtToday } from '../holidays';
 interface OffRow {
 	id: number;
 	full_name: string;
+	department: string | null;
+	sub_department: string | null;
 	startdate: string;
 	enddate: string;
 	reason: string;
@@ -15,6 +17,8 @@ interface OffRow {
 interface SickRow {
 	id: number;
 	full_name: string;
+	department: string | null;
+	sub_department: string | null;
 	case_type: 'RSI' | 'RSO';
 	reportsick_status: string;
 	created_at: string;
@@ -27,7 +31,11 @@ interface SickRow {
 
 export async function handleToday(actx: AuthedContext): Promise<Response> {
 	const { request, env, user } = actx;
-	if (user.user_role !== 'admin' && user.user_role !== 'superadmin') {
+	// Admins/superadmins and appointment-holders (WOIC/2IC/PC) — i.e. anyone who
+	// can approve — get the Today dashboard. Matches /api/me's is_approver so the
+	// tab never loads to a 403.
+	const isApprover = user.user_role === 'admin' || user.user_role === 'superadmin' || !!user.appointment;
+	if (!isApprover) {
 		return json({ error: 'forbidden' }, { status: 403 });
 	}
 	if (request.method !== 'GET') return json({ error: 'method' }, { status: 405 });
@@ -36,7 +44,7 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 
 	const offs = await env.depot_db
 		.prepare(
-			`SELECT o.id, u.full_name, o.startdate, o.enddate, o.reason,
+			`SELECT o.id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.reason,
 			        a.full_name AS approved_by_name
 			 FROM off_requests o
 			 JOIN users u ON u.id = o.user_id
@@ -50,7 +58,7 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 
 	const sickOpen = await env.depot_db
 		.prepare(
-			`SELECT s.id, u.full_name, s.case_type, s.reportsick_status, s.created_at,
+			`SELECT s.id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.created_at,
 			        s.approved_at, s.num_of_mc_days, s.mc_start_date, s.mc_end_date,
 			        s.medicine_prescribed
 			 FROM sick_cases s
@@ -64,7 +72,7 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 
 	const sickPending = await env.depot_db
 		.prepare(
-			`SELECT s.id, u.full_name, s.case_type, s.reportsick_status, s.created_at,
+			`SELECT s.id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.created_at,
 			        s.approved_at, s.num_of_mc_days, s.mc_start_date, s.mc_end_date,
 			        s.medicine_prescribed
 			 FROM sick_cases s
@@ -76,7 +84,7 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 
 	const offPending = await env.depot_db
 		.prepare(
-			`SELECT o.id, u.full_name, o.startdate, o.enddate, o.reason,
+			`SELECT o.id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.reason,
 			        NULL AS approved_by_name
 			 FROM off_requests o
 			 JOIN users u ON u.id = o.user_id

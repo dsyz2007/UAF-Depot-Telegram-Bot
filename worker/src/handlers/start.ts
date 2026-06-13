@@ -6,6 +6,7 @@ export function registerStartHandler(bot: Bot, env: Env): void {
 		const from = ctx.from;
 		if (!from) return;
 		const telegramId = String(from.id);
+		const username = from.username ?? null;
 		const displayName = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || 'unnamed';
 
 		// Nuke any leftover reply keyboard from earlier code paths. Reply keyboards
@@ -22,15 +23,18 @@ export function registerStartHandler(bot: Bot, env: Env): void {
 		if (!existing) {
 			await env.depot_db
 				.prepare(
-					'INSERT INTO users (telegram_id, full_name, user_role) VALUES (?, ?, ?)',
+					'INSERT INTO users (telegram_id, full_name, user_role, username) VALUES (?, ?, ?, ?)',
 				)
-				.bind(telegramId, `PENDING:${displayName}`, 'user')
+				.bind(telegramId, `PENDING:${displayName}`, 'user', username)
 				.run();
 			await ctx.reply(
 				'Welcome to the depot bot. Your account is pending — an admin will assign your name and role shortly.',
 			);
 			return;
 		}
+
+		// Refresh the stored handle on every /start (usernames can change).
+		await env.depot_db.prepare('UPDATE users SET username = ? WHERE telegram_id = ?').bind(username, telegramId).run();
 
 		if (existing.full_name.startsWith('PENDING:')) {
 			await ctx.reply('Your account is still pending admin approval. Please wait.');

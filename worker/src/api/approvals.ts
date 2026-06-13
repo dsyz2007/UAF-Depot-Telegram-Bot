@@ -2,57 +2,66 @@
 // approve (offs, sick, off-credit grants, late parade changes) and approve /
 // reject them — individually or in bulk ("Approve all").
 //
-// The approver of an item is the requester's superior_telegram_id. Superadmins
-// may action any pending item.
+// The approvers of an item are the appointment-holders (WOIC/2IC/PC) in the
+// requester's unit; superadmins handle their own unit + orphan/no-appointment
+// units. See canApprove() in superiors.ts.
 
 import { json, type AuthedContext } from './router';
-import { tgSendMessage, tgEditMessageText } from '../tg';
+import { tgSendMessage } from '../tg';
 import { dayCountInclusive } from '../types';
+import { canApprove, sameUnit } from '../superiors';
+import { approveLeave, setParadeForLeave } from './leave';
+import { setParadeForSick } from './sick';
 
-// After an inbox approve/reject, rewrite the original per-request DM (if we have
-// its chat + message id) so its inline buttons disappear — keeps chat in sync
-// with the app. Best-effort: silently ignores missing ids / edit failures.
-async function syncChatMessage(
-	env: Env,
-	chatTid: string | null,
-	messageId: string | null,
-	text: string,
-): Promise<void> {
-	if (!chatTid || !messageId) return;
-	try {
-		await tgEditMessageText(env.BOT_TOKEN, chatTid, messageId, text);
-	} catch {
-		// message too old / already edited / wrong chat — ignore
-	}
+// Credit-days for an off request: half-day (AM/PM) = 0.5 per day, full day = 1.
+function offCreditDays(start: string, end: string, period: string): number {
+	const d = dayCountInclusive(start, end);
+	return period === 'AM' || period === 'PM' ? d * 0.5 : d;
 }
 
-interface OffItem {
+interface Dept {
+	user_id: number;
+	department: string | null;
+	sub_department: string | null;
+}
+interface OffItem extends Dept {
 	id: number;
 	full_name: string;
 	startdate: string;
 	enddate: string;
+	period: string;
 	reason: string;
 	days: number;
 }
-interface SickItem {
+interface SickItem extends Dept {
 	id: number;
 	full_name: string;
 	case_type: string;
+	reason: string | null;
 	created_at: string;
 }
-interface GrantItem {
+interface GrantItem extends Dept {
 	id: number;
 	full_name: string;
 	num_days: number;
 	reason: string;
 }
-interface ParadeItem {
+interface ParadeItem extends Dept {
 	id: number;
 	full_name: string;
 	parade_state_date: string;
 	period: string;
 	new_status: string;
 	new_reason: string | null;
+}
+interface LeaveItem extends Dept {
+	id: number;
+	full_name: string;
+	leave_type: string;
+	period: string;
+	startdate: string;
+	enddate: string;
+	reason: string | null;
 }
 
 function isSuperadmin(role: string): boolean {
@@ -63,116 +72,219 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/approvals'.length);
 
-	// Items where I'm one of the approvers. Superadmins see all pending items.
-	const meTid = user.telegram_id;
-	const superClause = isSuperadmin(user.user_role)
-		? ''
-		: 'AND (u.superior_telegram_id = ? OR u.superior_telegram_id_2 = ?)';
-	const bindTid = (stmt: D1PreparedStatement) => (isSuperadmin(user.user_role) ? stmt : stmt.bind(meTid, meTid));
-
 	if (request.method === 'GET' && (sub === '' || sub === '/')) {
-		const offs = await bindTid(
-			env.depot_db.prepare(
-				`SELECT o.id, u.full_name, o.startdate, o.enddate, o.reason
+		// Fetch ALL pending, then keep only the items this viewer may approve
+		// (same-unit appointment-holder, or superadmin for own-unit / orphans).
+		const offsRaw = await env.depot_db
+			.prepare(
+				`SELECT o.id, o.user_id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.period, o.reason
 				 FROM off_requests o JOIN users u ON u.id = o.user_id
-				 WHERE o.off_status = 'pending' ${superClause}
-				 ORDER BY o.created_at`,
-			),
-		).all<{ id: number; full_name: string; startdate: string; enddate: string; reason: string }>();
-
-		const sick = await bindTid(
-			env.depot_db.prepare(
-				`SELECT s.id, u.full_name, s.case_type, s.created_at
+				 WHERE o.off_status = 'pending' ORDER BY o.created_at`,
+			)
+			.all<{ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; startdate: string; enddate: string; period: string; reason: string }>();
+		const sickRaw = await env.depot_db
+			.prepare(
+				`SELECT s.id, s.user_id, u.full_name, u.department, u.sub_department, s.case_type, s.reason, s.created_at
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id
-				 WHERE s.reportsick_status = 'pending_superior' ${superClause}
-				 ORDER BY s.created_at`,
-			),
-		).all<SickItem>();
-
-		const grants = await bindTid(
-			env.depot_db.prepare(
-				`SELECT g.id, u.full_name, g.num_days, g.reason
+				 WHERE s.reportsick_status = 'pending_superior' ORDER BY s.created_at`,
+			)
+			.all<SickItem>();
+		const grantsRaw = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, u.full_name, u.department, u.sub_department, g.num_days, g.reason
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
-				 WHERE g.status = 'pending_superior' ${superClause}
-				 ORDER BY g.created_at`,
-			),
-		).all<GrantItem>();
-
-		const parade = await bindTid(
-			env.depot_db.prepare(
-				`SELECT p.id, u.full_name, p.parade_state_date, p.period, p.new_status, p.new_reason
+				 WHERE g.status = 'pending_superior' ORDER BY g.created_at`,
+			)
+			.all<GrantItem>();
+		const paradeRaw = await env.depot_db
+			.prepare(
+				`SELECT p.id, p.user_id, u.full_name, u.department, u.sub_department, p.parade_state_date, p.period, p.new_status, p.new_reason
 				 FROM parade_change_requests p JOIN users u ON u.id = p.user_id
-				 WHERE p.status = 'pending' ${superClause}
-				 ORDER BY p.created_at`,
-			),
-		).all<ParadeItem>();
+				 WHERE p.status = 'pending' ORDER BY p.created_at`,
+			)
+			.all<{ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; parade_state_date: string; period: string; new_status: string; new_reason: string | null }>();
+		const leaveRaw = await env.depot_db
+			.prepare(
+				`SELECT l.id, l.user_id, u.full_name, u.department, u.sub_department, l.leave_type, l.period, l.startdate, l.enddate, l.reason
+				 FROM leave_requests l JOIN users u ON u.id = l.user_id
+				 WHERE l.status = 'pending' ORDER BY l.created_at`,
+			)
+			.all<LeaveItem>();
 
-		const offItems: OffItem[] = (offs.results ?? []).map((o) => ({ ...o, days: dayCountInclusive(o.startdate, o.enddate) }));
-		return json({
-			offs: offItems,
-			sick: sick.results ?? [],
-			grants: grants.results ?? [],
-			parade: parade.results ?? [],
-		});
+		async function keep<T extends Dept>(rows: T[]): Promise<T[]> {
+			const flags = await Promise.all(rows.map((r) => canApprove(env, user, r.department, r.sub_department, r.user_id)));
+			return rows.filter((_, i) => flags[i]);
+		}
+		const offs = await keep(offsRaw.results ?? []);
+		const sick = await keep(sickRaw.results ?? []);
+		const grants = await keep(grantsRaw.results ?? []);
+		const parade = await keep(paradeRaw.results ?? []);
+		const leave = await keep(leaveRaw.results ?? []);
+
+		const offItems: OffItem[] = offs.map((o) => ({ ...o, days: offCreditDays(o.startdate, o.enddate, o.period) }));
+		return json({ offs: offItems, sick, grants, parade, leave });
 	}
 
-	// Recently-approved items the caller may UNDO: sick cases + credit grants
-	// they approved (superadmin sees all), within the last 14 days.
+	// Recently approved OR rejected items (last 14 days), with a selectable scope.
+	//   ?status = approved | rejected      (which list; default approved)
+	//   ?scope  = self | dept | all        (whose items; default dept)
+	//     • self → only items this caller personally approved/rejected
+	//     • dept → every item for a requester in the caller's department
+	//              (incl. fellow appointment-holders' actions) — DEFAULT
+	//     • all  → every department (items outside the caller's remit are
+	//              view-only: can_undo = false)
+	// Each item carries can_undo — whether THIS caller may undo it:
+	//   superadmin (anything) · appointment-holder (own unit) · else (only own).
 	if (request.method === 'GET' && sub === '/recent') {
+		const status: 'approved' | 'rejected' = url.searchParams.get('status') === 'rejected' ? 'rejected' : 'approved';
+		const scopeParam = url.searchParams.get('scope');
+		const scope: 'self' | 'dept' | 'all' = scopeParam === 'self' || scopeParam === 'all' ? scopeParam : 'dept';
 		const isSuper = isSuperadmin(user.user_role);
-		const offClause = isSuper ? '' : 'AND o.approved_by = ?';
-		const offStmt = env.depot_db.prepare(
-			`SELECT o.id, u.full_name, o.startdate, o.enddate, o.approved_date
-			 FROM off_requests o JOIN users u ON u.id = o.user_id
-			 WHERE o.off_status = 'approved'
-			   AND o.approved_date >= datetime('now','-14 days') ${offClause}
-			 ORDER BY o.approved_date DESC LIMIT 50`,
-		);
-		const offs = await (isSuper ? offStmt : offStmt.bind(user.id)).all<{
-			id: number;
-			full_name: string;
-			startdate: string;
-			enddate: string;
-			approved_date: string | null;
-		}>();
-		const sickClause = isSuper ? '' : 'AND s.superior_user_id = ?';
-		const sickStmt = env.depot_db.prepare(
-			`SELECT s.id, u.full_name, s.case_type, s.reportsick_status, s.approved_at, s.updated_status
-			 FROM sick_cases s JOIN users u ON u.id = s.user_id
-			 WHERE s.reportsick_status IN ('approved','updated','flagged')
-			   AND s.approved_at >= datetime('now','-14 days') ${sickClause}
-			 ORDER BY s.approved_at DESC LIMIT 50`,
-		);
-		const sick = await (isSuper ? sickStmt : sickStmt.bind(user.id)).all<{
-			id: number;
-			full_name: string;
-			case_type: string;
-			reportsick_status: string;
-			approved_at: string | null;
-			updated_status: string | null;
-		}>();
-		const grantClause = isSuper ? '' : 'AND g.superior_user_id = ?';
-		const grantStmt = env.depot_db.prepare(
-			`SELECT g.id, u.full_name, g.num_days, g.reason, g.approved_at
-			 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
-			 WHERE g.status = 'approved'
-			   AND g.approved_at >= datetime('now','-14 days') ${grantClause}
-			 ORDER BY g.approved_at DESC LIMIT 50`,
-		);
-		const grants = await (isSuper ? grantStmt : grantStmt.bind(user.id)).all<{
-			id: number;
-			full_name: string;
-			num_days: number;
-			reason: string;
-			approved_at: string | null;
-		}>();
-		const offItems = (offs.results ?? []).map((o) => ({ ...o, days: dayCountInclusive(o.startdate, o.enddate) }));
-		return json({ offs: offItems, sick: sick.results ?? [], grants: grants.results ?? [] });
+		const appointed = !!user.appointment;
+
+		// Extra WHERE clause + binds restricting which rows come back, given the
+		// row's actor column (who approved/rejected). `u` is the requester join.
+		const scopeSql = (actorCol: string): { clause: string; binds: (string | number)[] } => {
+			if (scope === 'self') return { clause: `AND ${actorCol} = ?`, binds: [user.id] };
+			if (scope === 'dept') {
+				return {
+					clause: `AND u.department = ? AND IFNULL(u.sub_department,'') = IFNULL(?, '')`,
+					binds: [user.department ?? '', user.sub_department ?? ''],
+				};
+			}
+			return { clause: '', binds: [] }; // 'all'
+		};
+		const canUndo = (dept: string | null, subDept: string | null, actorId: number | null): boolean =>
+			isSuper || (appointed && sameUnit(user, dept, subDept)) || (actorId != null && actorId === user.id);
+
+		// Per-status column config (status value + actor column + timestamp column).
+		const approved = status === 'approved';
+
+		const offActor = approved ? 'o.approved_by' : 'o.rejected_by';
+		const offAt = approved ? 'o.approved_date' : 'o.rejected_at';
+		const offSt = approved ? "off_status = 'approved'" : "off_status = 'rejected'";
+		const offScope = scopeSql(offActor);
+		const offs = await env.depot_db
+			.prepare(
+				`SELECT o.id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.period, o.reason,
+				        ${offAt} AS approved_date, ${offActor} AS actor_id, ab.full_name AS approved_by_name
+				 FROM off_requests o JOIN users u ON u.id = o.user_id
+				 LEFT JOIN users ab ON ab.id = ${offActor}
+				 WHERE o.${offSt}
+				   AND ${offAt} >= datetime('now','-14 days') ${offScope.clause}
+				 ORDER BY ${offAt} DESC LIMIT 50`,
+			)
+			.bind(...offScope.binds)
+			.all<{
+				id: number; full_name: string; department: string | null; sub_department: string | null;
+				startdate: string; enddate: string; period: string; reason: string;
+				approved_date: string | null; actor_id: number | null; approved_by_name: string | null;
+			}>();
+
+		const sickActor = approved ? 's.superior_user_id' : 's.rejected_by';
+		const sickAt = approved ? 's.approved_at' : 's.rejected_at';
+		const sickSt = approved ? "reportsick_status IN ('approved','updated','flagged')" : "reportsick_status = 'rejected'";
+		const sickScope = scopeSql(sickActor);
+		const sick = await env.depot_db
+			.prepare(
+				`SELECT s.id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.sick_date, s.reason,
+				        ${sickAt} AS approved_at, s.updated_status, ${sickActor} AS actor_id, ab.full_name AS approved_by_name
+				 FROM sick_cases s JOIN users u ON u.id = s.user_id
+				 LEFT JOIN users ab ON ab.id = ${sickActor}
+				 WHERE s.${sickSt}
+				   AND ${sickAt} >= datetime('now','-14 days') ${sickScope.clause}
+				 ORDER BY ${sickAt} DESC LIMIT 50`,
+			)
+			.bind(...sickScope.binds)
+			.all<{
+				id: number; full_name: string; department: string | null; sub_department: string | null;
+				case_type: string; reportsick_status: string; sick_date: string | null; reason: string | null;
+				approved_at: string | null; updated_status: string | null; actor_id: number | null; approved_by_name: string | null;
+			}>();
+
+		const grantActor = approved ? 'g.superior_user_id' : 'g.rejected_by';
+		const grantAt = approved ? 'g.approved_at' : 'g.rejected_at';
+		const grantSt = approved ? "status = 'approved'" : "status = 'rejected'";
+		const grantScope = scopeSql(grantActor);
+		const grants = await env.depot_db
+			.prepare(
+				`SELECT g.id, u.full_name, u.department, u.sub_department, g.num_days, g.reason,
+				        ${grantAt} AS approved_at, ${grantActor} AS actor_id, ab.full_name AS approved_by_name
+				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
+				 LEFT JOIN users ab ON ab.id = ${grantActor}
+				 WHERE g.${grantSt}
+				   AND ${grantAt} >= datetime('now','-14 days') ${grantScope.clause}
+				 ORDER BY ${grantAt} DESC LIMIT 50`,
+			)
+			.bind(...grantScope.binds)
+			.all<{
+				id: number; full_name: string; department: string | null; sub_department: string | null;
+				num_days: number; reason: string; approved_at: string | null; actor_id: number | null; approved_by_name: string | null;
+			}>();
+
+		const leaveActor = approved ? 'l.approved_by' : 'l.rejected_by';
+		const leaveAt = approved ? 'l.approved_at' : 'l.rejected_at';
+		const leaveSt = approved ? "status = 'approved'" : "status = 'rejected'";
+		const leaveScope = scopeSql(leaveActor);
+		const leave = await env.depot_db
+			.prepare(
+				`SELECT l.id, u.full_name, u.department, u.sub_department, l.leave_type, l.period, l.startdate, l.enddate, l.reason,
+				        ${leaveAt} AS approved_at, ${leaveActor} AS actor_id, ab.full_name AS approved_by_name
+				 FROM leave_requests l JOIN users u ON u.id = l.user_id
+				 LEFT JOIN users ab ON ab.id = ${leaveActor}
+				 WHERE l.${leaveSt}
+				   AND ${leaveAt} >= datetime('now','-14 days') ${leaveScope.clause}
+				 ORDER BY ${leaveAt} DESC LIMIT 50`,
+			)
+			.bind(...leaveScope.binds)
+			.all<{
+				id: number; full_name: string; department: string | null; sub_department: string | null;
+				leave_type: string; period: string; startdate: string; enddate: string; reason: string | null;
+				approved_at: string | null; actor_id: number | null; approved_by_name: string | null;
+			}>();
+
+		// Strip the internal department/actor fields and attach can_undo.
+		const offItems = (offs.results ?? []).map((o) => ({
+			id: o.id, full_name: o.full_name, startdate: o.startdate, enddate: o.enddate, period: o.period,
+			days: offCreditDays(o.startdate, o.enddate, o.period), reason: o.reason,
+			approved_date: o.approved_date, approved_by_name: o.approved_by_name,
+			can_undo: canUndo(o.department, o.sub_department, o.actor_id),
+		}));
+		const sickItems = (sick.results ?? []).map((s) => ({
+			id: s.id, full_name: s.full_name, case_type: s.case_type, reportsick_status: s.reportsick_status,
+			sick_date: s.sick_date, reason: s.reason, approved_at: s.approved_at, updated_status: s.updated_status,
+			approved_by_name: s.approved_by_name, can_undo: canUndo(s.department, s.sub_department, s.actor_id),
+		}));
+		const grantItems = (grants.results ?? []).map((g) => ({
+			id: g.id, full_name: g.full_name, num_days: g.num_days, reason: g.reason,
+			approved_at: g.approved_at, approved_by_name: g.approved_by_name,
+			can_undo: canUndo(g.department, g.sub_department, g.actor_id),
+		}));
+		const leaveItems = (leave.results ?? []).map((l) => ({
+			id: l.id, full_name: l.full_name, leave_type: l.leave_type, period: l.period,
+			startdate: l.startdate, enddate: l.enddate, reason: l.reason,
+			approved_at: l.approved_at, approved_by_name: l.approved_by_name,
+			can_undo: canUndo(l.department, l.sub_department, l.actor_id),
+		}));
+		return json({ status, scope, offs: offItems, sick: sickItems, grants: grantItems, leave: leaveItems });
+	}
+
+	// Un-reject: reopen a previously-REJECTED item back to pending, restoring the
+	// side-effects rejection rolled back (re-reserve off credits, re-paint the
+	// optimistic calendar entry). Authorised exactly like an approval (canApprove).
+	if (request.method === 'POST' && sub === '/unreject') {
+		const body = (await request.json()) as { type?: string; id?: number };
+		const type = body.type;
+		if (!Number.isInteger(body.id) || (type !== 'off' && type !== 'sick' && type !== 'grant' && type !== 'leave')) {
+			return json({ error: 'invalid_body' }, { status: 400 });
+		}
+		const result = await unrejectItem(env, user, type, body.id as number);
+		return json(result, result.ok ? undefined : { status: result.status ?? 409 });
 	}
 
 	if (request.method === 'POST' && sub === '/act') {
 		const body = (await request.json()) as {
-			actions?: { type: 'off' | 'sick' | 'grant' | 'parade'; id: number; action: 'approve' | 'reject' }[];
+			actions?: { type: 'off' | 'sick' | 'grant' | 'parade' | 'leave'; id: number; action: 'approve' | 'reject' }[];
 		};
 		const actions = Array.isArray(body.actions) ? body.actions : [];
 		if (actions.length === 0) return json({ error: 'no_actions' }, { status: 400 });
@@ -195,21 +307,33 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 }
 
 // Returns true if the action was applied, false if skipped (not pending /
-// not authorised / insufficient credits etc.).
+// not authorised). (Off credits are reserved at request time, so there's no
+// insufficient-credits skip here anymore.)
 async function applyAction(
 	env: Env,
 	approver: AuthedContext['user'],
-	type: 'off' | 'sick' | 'grant' | 'parade',
+	type: 'off' | 'sick' | 'grant' | 'parade' | 'leave',
 	id: number,
 	action: 'approve' | 'reject',
 ): Promise<boolean> {
-	const isSuper = isSuperadmin(approver.user_role);
-
+	if (type === 'leave') {
+		const row = await env.depot_db
+			.prepare(
+				`SELECT l.id, l.user_id, l.status, u.department, u.sub_department
+				 FROM leave_requests l JOIN users u ON u.id = l.user_id WHERE l.id = ?`,
+			)
+			.bind(id)
+			.first<{ id: number; user_id: number; status: string; department: string | null; sub_department: string | null }>();
+		if (!row || row.status !== 'pending') return false;
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return false;
+		const res = await approveLeave(env, approver, id, action);
+		return res.ok;
+	}
 	if (type === 'off') {
 		const row = await env.depot_db
 			.prepare(
-				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.superior_message_id,
-				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id, u.superior_telegram_id_2, u.off_credits
+				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.period, o.superior_message_id,
+				        u.full_name, u.telegram_id AS requester_tid, u.department, u.sub_department, u.off_credits
 				 FROM off_requests o JOIN users u ON u.id = o.user_id WHERE o.id = ?`,
 			)
 			.bind(id)
@@ -219,51 +343,70 @@ async function applyAction(
 				off_status: string;
 				startdate: string;
 				enddate: string;
+				period: string;
 				superior_message_id: string | null;
 				full_name: string;
 				requester_tid: string;
-				superior_telegram_id: string | null;
-				superior_telegram_id_2: string | null;
+				department: string | null;
+				sub_department: string | null;
 				off_credits: number;
 			}>();
 		if (!row || row.off_status !== 'pending') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return false;
 		const range = `${row.startdate} → ${row.enddate}`;
-		const days = dayCountInclusive(row.startdate, row.enddate);
+		const days = offCreditDays(row.startdate, row.enddate, row.period);
 
 		if (action === 'reject') {
 			// Credits were reserved at request time — refund them on rejection.
+			// Also blank any parade days the requester had marked OFF for this range,
+			// scoped to the off's period (FD = both halves, AM/PM = that half).
+			const halfDay = row.period === 'AM' || row.period === 'PM';
+			const clearOff = halfDay
+				? env.depot_db
+						.prepare(
+							`DELETE FROM parade_state_entries
+							 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF' AND period = ?`,
+						)
+						.bind(row.user_id, row.startdate, row.enddate, row.period)
+				: env.depot_db
+						.prepare(
+							`DELETE FROM parade_state_entries
+							 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF'`,
+						)
+						.bind(row.user_id, row.startdate, row.enddate);
+			const flipReject = await env.depot_db
+				.prepare(`UPDATE off_requests SET off_status='rejected', rejected_by=?, rejected_at=datetime('now') WHERE id=? AND off_status='pending'`)
+				.bind(approver.id, id)
+				.run();
+			if ((flipReject.meta.changes ?? 0) === 0) return false;
 			await env.depot_db.batch([
-				env.depot_db
-					.prepare(`UPDATE off_requests SET off_status='rejected', approved_by=?, approved_date=datetime('now') WHERE id=?`)
-					.bind(approver.id, id),
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
+				clearOff,
 			]);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
-				text: `❌ Your off request (${range}) was rejected by ${approver.full_name}.\n🪙 ${days} credit(s) refunded.`,
+				text: `❌ Your off request (${range}) was rejected by ${approver.full_name}.\n🪙 ${days} credit(s) refunded.\nYour parade status for ${range} is now blank (unfilled).`,
 			});
-			await syncChatMessage(env, row.superior_telegram_id, row.superior_message_id, `❌ ${row.full_name}'s off (${range}) — rejected by ${approver.full_name}.`);
 			return true;
 		}
-		// Approve: credits already reserved at request time — just record it.
-		await env.depot_db
-			.prepare(`UPDATE off_requests SET off_status='approved', approved_by=?, approved_date=datetime('now') WHERE id=?`)
+		// Approve: credits already reserved at request time — just record it (atomic).
+		const flipApprove = await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status='approved', approved_by=?, approved_date=datetime('now') WHERE id=? AND off_status='pending'`)
 			.bind(approver.id, id)
 			.run();
+		if ((flipApprove.meta.changes ?? 0) === 0) return false;
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `✅ Your off (${range}) was approved by ${approver.full_name}.`,
 		});
-		await syncChatMessage(env, row.superior_telegram_id, row.superior_message_id, `✅ ${row.full_name}'s off (${range}, ${days}d) — approved by ${approver.full_name}.`);
 		return true;
 	}
 
 	if (type === 'sick') {
 		const row = await env.depot_db
 			.prepare(
-				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.approval_message_id,
-				        u.full_name, u.telegram_id AS requester_tid, u.superior_telegram_id, u.superior_telegram_id_2
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.approval_message_id, s.sick_date,
+				        u.full_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
 			.bind(id)
@@ -273,30 +416,39 @@ async function applyAction(
 				case_type: string;
 				reportsick_status: string;
 				approval_message_id: string | null;
+				sick_date: string | null;
 				full_name: string;
 				requester_tid: string;
-				superior_telegram_id: string | null;
-				superior_telegram_id_2: string | null;
+				department: string | null;
+				sub_department: string | null;
 			}>();
 		if (!row || row.reportsick_status !== 'pending_superior') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return false;
 
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare(`UPDATE sick_cases SET reportsick_status='rejected' WHERE id=?`)
-				.bind(id)
+			const flipSickR = await env.depot_db
+				.prepare(`UPDATE sick_cases SET reportsick_status='rejected', rejected_by=?, rejected_at=datetime('now') WHERE id=? AND reportsick_status='pending_superior'`)
+				.bind(approver.id, id)
 				.run();
+			if ((flipSickR.meta.changes ?? 0) === 0) return false;
+			// Roll back the optimistic parade entry for that day (if still set).
+			if (row.sick_date) {
+				await env.depot_db
+					.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND parade_status = ?`)
+					.bind(row.user_id, row.sick_date, row.case_type)
+					.run();
+			}
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
-				text: `❌ Your ${row.case_type} request has been rejected by ${approver.full_name}.`,
+				text: `❌ Your ${row.case_type} request was rejected by ${approver.full_name}.${row.sick_date ? `\nYour parade status for ${row.sick_date} is now blank (unfilled).` : ''}`,
 			});
-			await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `❌ ${row.full_name}'s ${row.case_type} request was rejected by ${approver.full_name}.`);
 			return true;
 		}
-		await env.depot_db
-			.prepare(`UPDATE sick_cases SET reportsick_status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=?`)
+		const flipSickA = await env.depot_db
+			.prepare(`UPDATE sick_cases SET reportsick_status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=? AND reportsick_status='pending_superior'`)
 			.bind(approver.id, id)
 			.run();
+		if ((flipSickA.meta.changes ?? 0) === 0) return false;
 		// Schedule the 3h/6h personnel + 8h superior-flag reminders.
 		const stmt = env.depot_db.prepare(
 			`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
@@ -312,7 +464,6 @@ async function applyAction(
 			text: `✅ Your ${row.case_type} request was approved by ${approver.full_name}.\n\nOnce seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.`,
 			reply_markup: { inline_keyboard: [[{ text: '🤒 Open Sick page', web_app: { url: `${env.WEBAPP_URL}?tab=sick` } }]] },
 		});
-		await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `✅ ${row.full_name}'s ${row.case_type} approved by ${approver.full_name}.`);
 		return true;
 	}
 
@@ -320,7 +471,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status, g.granted_by, g.approval_message_id,
-				        u.telegram_id AS staff_tid, u.full_name AS staff_name, u.superior_telegram_id, u.superior_telegram_id_2,
+				        u.telegram_id AS staff_tid, u.full_name AS staff_name, u.department, u.sub_department,
 				        gr.telegram_id AS granter_tid
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
 				 JOIN users gr ON gr.id = g.granted_by WHERE g.id = ?`,
@@ -335,33 +486,33 @@ async function applyAction(
 				approval_message_id: string | null;
 				staff_tid: string;
 				staff_name: string;
-				superior_telegram_id: string | null;
-				superior_telegram_id_2: string | null;
+				department: string | null;
+				sub_department: string | null;
 				granter_tid: string;
 			}>();
 		if (!row || row.status !== 'pending_superior') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return false;
 
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare(`UPDATE off_credit_grants SET status='rejected', superior_user_id=? WHERE id=?`)
+			const flipGrantR = await env.depot_db
+				.prepare(`UPDATE off_credit_grants SET status='rejected', rejected_by=?, rejected_at=datetime('now') WHERE id=? AND status='pending_superior'`)
 				.bind(approver.id, id)
 				.run();
+			if ((flipGrantR.meta.changes ?? 0) === 0) return false;
 			const sent = new Set<string>([approver.telegram_id]);
 			const notify = (tid: string, text: string) => (sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
 			await Promise.allSettled([
 				notify(row.staff_tid, `❌ Your off-credit request (${row.num_days} day[s]) was rejected by ${approver.full_name}.`),
 				notify(row.granter_tid, `❌ Off-credit request for ${row.staff_name} (${row.num_days} day[s]) was rejected by ${approver.full_name}.`),
 			]);
-			await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `❌ Off-credit request rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`);
 			return true;
 		}
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(`UPDATE off_credit_grants SET status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=?`)
-				.bind(approver.id, id),
-			env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(row.num_days, row.user_id),
-		]);
+		const flipGrantA = await env.depot_db
+			.prepare(`UPDATE off_credit_grants SET status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=? AND status='pending_superior'`)
+			.bind(approver.id, id)
+			.run();
+		if ((flipGrantA.meta.changes ?? 0) === 0) return false;
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(row.num_days, row.user_id).run();
 		const bal = await env.depot_db.prepare(`SELECT off_credits FROM users WHERE id=?`).bind(row.user_id).first<{ off_credits: number }>();
 		const sent = new Set<string>([approver.telegram_id]);
 		const notify = (tid: string, text: string) => (sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
@@ -369,7 +520,6 @@ async function applyAction(
 			notify(row.staff_tid, `🪙 Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s). Balance: ${bal?.off_credits ?? '?'}.`),
 			notify(row.granter_tid, `✅ ${approver.full_name} approved the off-credit for ${row.staff_name}: +${row.num_days} day(s).`),
 		]);
-		await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `✅ Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${bal?.off_credits ?? '?'}.`);
 		return true;
 	}
 
@@ -377,7 +527,7 @@ async function applyAction(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT p.id, p.user_id, p.parade_state_date, p.period, p.new_status, p.new_reason, p.status, p.approval_message_id,
-				        u.full_name, u.telegram_id AS user_tid, u.superior_telegram_id, u.superior_telegram_id_2
+				        u.full_name, u.telegram_id AS user_tid, u.department, u.sub_department
 				 FROM parade_change_requests p JOIN users u ON u.id = p.user_id WHERE p.id = ?`,
 			)
 			.bind(id)
@@ -392,45 +542,158 @@ async function applyAction(
 				approval_message_id: string | null;
 				full_name: string;
 				user_tid: string;
-				superior_telegram_id: string | null;
-				superior_telegram_id_2: string | null;
+				department: string | null;
+				sub_department: string | null;
 			}>();
 		if (!row || row.status !== 'pending') return false;
-		if (!isSuper && row.superior_telegram_id !== approver.telegram_id && row.superior_telegram_id_2 !== approver.telegram_id) return false;
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return false;
 
 		if (action === 'reject') {
-			await env.depot_db
-				.prepare(`UPDATE parade_change_requests SET status='rejected', superior_user_id=?, approved_at=datetime('now') WHERE id=?`)
+			const flipParaR = await env.depot_db
+				.prepare(`UPDATE parade_change_requests SET status='rejected', superior_user_id=?, approved_at=datetime('now') WHERE id=? AND status='pending'`)
 				.bind(approver.id, id)
 				.run();
+			if ((flipParaR.meta.changes ?? 0) === 0) return false;
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.user_tid,
 				text: `❌ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was rejected by ${approver.full_name}.`,
 			});
-			await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `❌ Late ${row.period} change rejected by ${approver.full_name}: ${row.full_name} on ${row.parade_state_date} → ${row.new_status}.`);
 			return true;
 		}
-		await env.depot_db.batch([
-			env.depot_db
-				.prepare(
-					`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
-					 VALUES (?, ?, ?, ?, ?)
-					 ON CONFLICT(user_id, parade_state_date, period)
-					 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
-				)
-				.bind(row.user_id, row.parade_state_date, row.period, row.new_status, row.new_reason),
-			env.depot_db
-				.prepare(`UPDATE parade_change_requests SET status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=?`)
-				.bind(approver.id, id),
-		]);
+		const flipParaA = await env.depot_db
+			.prepare(`UPDATE parade_change_requests SET status='approved', superior_user_id=?, approved_at=datetime('now') WHERE id=? AND status='pending'`)
+			.bind(approver.id, id)
+			.run();
+		if ((flipParaA.meta.changes ?? 0) === 0) return false;
+		await env.depot_db
+			.prepare(
+				`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(user_id, parade_state_date, period)
+				 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
+			)
+			.bind(row.user_id, row.parade_state_date, row.period, row.new_status, row.new_reason)
+			.run();
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.user_tid,
 			text: `✅ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was approved by ${approver.full_name}.`,
 			reply_markup: { inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade` } }]] },
 		});
-		await syncChatMessage(env, row.superior_telegram_id, row.approval_message_id, `✅ Late ${row.period} change approved by ${approver.full_name}: ${row.full_name} on ${row.parade_state_date} → ${row.new_status}.`);
 		return true;
 	}
 
 	return false;
+}
+
+// Reopen a rejected item to pending, restoring rejection's side-effects.
+// Returns { ok } on success, or { ok:false, error, status } to surface to the API.
+type UnrejectResult = { ok: true; reopened: true } | { ok: false; error: string; status?: number };
+
+async function unrejectItem(
+	env: Env,
+	approver: AuthedContext['user'],
+	type: 'off' | 'sick' | 'grant' | 'leave',
+	id: number,
+): Promise<UnrejectResult> {
+	if (type === 'off') {
+		const row = await env.depot_db
+			.prepare(
+				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.period,
+				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				 FROM off_requests o JOIN users u ON u.id = o.user_id WHERE o.id = ?`,
+			)
+			.bind(id)
+			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+		if (!row || row.off_status !== 'rejected') return { ok: false, error: 'not_rejected' };
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
+		const flip = await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status='pending', rejected_by=NULL, rejected_at=NULL WHERE id=? AND off_status='rejected'`)
+			.bind(id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
+		// Credits were refunded on rejection — re-reserve them now (matches request-time reservation).
+		const days = offCreditDays(row.startdate, row.enddate, row.period);
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, row.user_id).run();
+		const range = `${row.startdate} → ${row.enddate}`;
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: row.requester_tid,
+			text: `↩ Your previously-rejected off request (${range}) was reopened for approval by ${approver.full_name}.\n🪙 ${days} credit(s) re-reserved pending the decision.`,
+		});
+		return { ok: true, reopened: true };
+	}
+
+	if (type === 'sick') {
+		const row = await env.depot_db
+			.prepare(
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
+				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
+			)
+			.bind(id)
+			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; requester_tid: string; department: string | null; sub_department: string | null }>();
+		if (!row || row.reportsick_status !== 'rejected') return { ok: false, error: 'not_rejected' };
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
+		const flip = await env.depot_db
+			.prepare(`UPDATE sick_cases SET reportsick_status='pending_superior', rejected_by=NULL, rejected_at=NULL WHERE id=? AND reportsick_status='rejected'`)
+			.bind(id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
+		// Re-show optimistically on the calendar (it was blanked on rejection).
+		if (row.sick_date) await setParadeForSick(env, row.user_id, row.department, row.sick_date, row.case_type);
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: row.requester_tid,
+			text: `↩ Your previously-rejected ${row.case_type} was reopened for approval by ${approver.full_name}.`,
+		});
+		return { ok: true, reopened: true };
+	}
+
+	if (type === 'grant') {
+		const row = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, g.num_days, g.status,
+				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id WHERE g.id = ?`,
+			)
+			.bind(id)
+			.first<{ id: number; user_id: number; num_days: number; status: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+		if (!row || row.status !== 'rejected') return { ok: false, error: 'not_rejected' };
+		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
+		const flip = await env.depot_db
+			.prepare(`UPDATE off_credit_grants SET status='pending_superior', rejected_by=NULL, rejected_at=NULL WHERE id=? AND status='rejected'`)
+			.bind(id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
+		// Grants only add credits on approval, so there's nothing to restore here.
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: row.requester_tid,
+			text: `↩ Your previously-rejected off-credit request (+${row.num_days} day[s]) was reopened for approval by ${approver.full_name}.`,
+		});
+		return { ok: true, reopened: true };
+	}
+
+	// leave (and MA, which rides the same table)
+	const row = await env.depot_db
+		.prepare(
+			`SELECT l.id, l.user_id, l.leave_type, l.period, l.startdate, l.enddate, l.reason, l.status,
+			        u.telegram_id AS requester_tid, u.department, u.sub_department
+			 FROM leave_requests l JOIN users u ON u.id = l.user_id WHERE l.id = ?`,
+		)
+		.bind(id)
+		.first<{ id: number; user_id: number; leave_type: string; period: 'AM' | 'PM' | 'FD'; startdate: string; enddate: string; reason: string | null; status: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+	if (!row || row.status !== 'rejected') return { ok: false, error: 'not_rejected' };
+	if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
+	const flip = await env.depot_db
+		.prepare(`UPDATE leave_requests SET status='pending', rejected_by=NULL, rejected_at=NULL WHERE id=? AND status='rejected'`)
+		.bind(id)
+		.run();
+	if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
+	// Re-paint the optimistic leave on the calendar (blanked on rejection).
+	await setParadeForLeave(env, row.user_id, row.department, row.startdate, row.enddate, row.leave_type, row.reason, row.period);
+	const noun = row.leave_type === 'MA' ? '' : ' leave';
+	const range = row.startdate === row.enddate ? row.startdate : `${row.startdate} → ${row.enddate}`;
+	await tgSendMessage(env.BOT_TOKEN, {
+		chat_id: row.requester_tid,
+		text: `↩ Your previously-rejected ${row.leave_type}${noun} (${range}) was reopened for approval by ${approver.full_name}.`,
+	});
+	return { ok: true, reopened: true };
 }
