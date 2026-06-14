@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
 import { api, alertDialog, deptLabel, DEPARTMENTS, type Me, type RouteAction } from '../lib/api';
@@ -882,7 +882,8 @@ function SubmitModal({
 			}
 			if (!target && res.blocked_sick) {
 				onRoute({ kind: 'sick', sickType: res.blocked_sick });
-				alertDialog(`⚠ Your ${res.blocked_sick} was NOT saved — you must report ${res.blocked_sick} first. Opening the Sick page, then set it again.`);
+				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
+				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar — report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
 				return;
 			}
 			const parts =
@@ -1021,6 +1022,11 @@ function SubmitModal({
 // the number of tabs. Mirrors EXPORT_MAX_DAYS on the worker.
 const EXPORT_MAX_DAYS = 31;
 
+// Compact label-beside-field rows for the export box (keeps it from getting tall).
+const EXPORT_FIELD_ROW: CSSProperties = { display: 'flex', alignItems: 'center', gap: 10 };
+const EXPORT_FIELD_LABEL: CSSProperties = { flexShrink: 0, width: 92 };
+const EXPORT_FIELD_INPUT: CSSProperties = { marginTop: 0, marginBottom: 8, flex: 1, minWidth: 0 };
+
 function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; minIso: string; maxIso: string }) {
 	// Picker spans the whole calendar window (±2 months). Future dates export the
 	// already-submitted forecast; dates beyond the retention window come back empty.
@@ -1073,20 +1079,29 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 				One worksheet (tab) per date, for all departments or a single one. Sent to your chat with the bot.
 				Up to {EXPORT_MAX_DAYS} days per export (parade data is kept for the ±2-month calendar window).
 			</p>
-			<label>Start date<input
-				type="date"
-				value={start}
-				min={minIso}
-				max={maxIso}
-				onChange={(e) => {
-					const v = e.target.value;
-					setStart(v);
-					if (!end || end < v) setEnd(v);
-				}}
-			/></label>
-			<label>End date<input type="date" value={end} min={start || minIso} max={maxIso} onChange={(e) => setEnd(e.target.value)} /></label>
-			<label>Department
-				<select value={dept} onChange={(e) => setDept(e.target.value)}>
+			{/* Label + field on one line each, so this section stays compact. */}
+			<label style={EXPORT_FIELD_ROW}>
+				<span style={EXPORT_FIELD_LABEL}>Start date</span>
+				<input
+					type="date"
+					style={EXPORT_FIELD_INPUT}
+					value={start}
+					min={minIso}
+					max={maxIso}
+					onChange={(e) => {
+						const v = e.target.value;
+						setStart(v);
+						if (!end || end < v) setEnd(v);
+					}}
+				/>
+			</label>
+			<label style={EXPORT_FIELD_ROW}>
+				<span style={EXPORT_FIELD_LABEL}>End date</span>
+				<input type="date" style={EXPORT_FIELD_INPUT} value={end} min={start || minIso} max={maxIso} onChange={(e) => setEnd(e.target.value)} />
+			</label>
+			<label style={EXPORT_FIELD_ROW}>
+				<span style={EXPORT_FIELD_LABEL}>Department</span>
+				<select style={EXPORT_FIELD_INPUT} value={dept} onChange={(e) => setDept(e.target.value)}>
 					<option value="all">All departments</option>
 					{DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
 				</select>

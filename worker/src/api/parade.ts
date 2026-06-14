@@ -225,7 +225,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 
 		// entries = per-period {period, status, reason}. At least one required.
 		const entries = Array.isArray(body.entries) ? body.entries : [];
-		const clean: { period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
+		let clean: { period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
 		const seenPeriods = new Set<string>();
 		for (const e of entries) {
 			if (e.period !== 'AM' && e.period !== 'PM') return json({ error: 'bad_period' }, { status: 400 });
@@ -268,6 +268,17 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			target = { id: t.id, full_name: t.full_name, department: t.department };
 		}
 
+		// RSI/RSO is managed entirely on the Sick page, where it's always recorded as
+		// a SINGLE half-day (today → the current half by SGT clock; a later working
+		// day → its AM). For a self-edit we therefore never paint RSI/RSO from the
+		// calendar: strip those halves (so any OTHER status submitted alongside — e.g.
+		// PM=Present in the same diff submit — is still saved) and route the user to
+		// the Sick page to report the RSI/RSO. Approvers editing a staff member set it
+		// directly, so we leave their entries untouched.
+		const sickType = (clean.find((e) => e.status === 'RSI' || e.status === 'RSO')?.status ?? null) as 'RSI' | 'RSO' | null;
+		const routeSick = editingSelf ? sickType : null;
+		if (routeSick) clean = clean.filter((e) => e.status !== 'RSI' && e.status !== 'RSO');
+
 		const allDates = expandRange(body.startdate, body.enddate);
 		const today = sgtToday();
 
@@ -288,10 +299,10 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const dates = notPast.filter((d) => clean.some((e) => slotWorking(workInfo.get(d)!, targetDept, e.period)));
 		const skippedWeekends = notPast.length - dates.length;
 
-		// Compulsory backing (self-edits only): OFF needs an off request covering
-		// every OFF date; RSI/RSO needs an active sick case of that type. If the
-		// application is missing we save NOTHING and tell the frontend to route
-		// the user to the Off / Sick page to apply first.
+		// Compulsory backing for OFF (self-edits only): OFF needs an off request
+		// covering every OFF date. If it's missing we save NOTHING and tell the
+		// frontend to route the user to the Off page to apply first. (RSI/RSO was
+		// already stripped + routed to the Sick page above.)
 		if (editingSelf && dates.length > 0) {
 			if (clean.some((e) => e.status === 'OFF')) {
 				const { results: offReqs } = await env.depot_db
@@ -313,19 +324,6 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					return json({ ok: true, applied: 0, pending: 0, skipped_weekends: skippedWeekends, skipped_past: skippedPast, blocked_off: true, uncovered_dates: uncovered });
 				}
 			}
-			for (const t of ['RSI', 'RSO'] as const) {
-				if (!clean.some((e) => e.status === t)) continue;
-				const existing = await env.depot_db
-					.prepare(
-						`SELECT 1 FROM sick_cases WHERE user_id = ? AND case_type = ?
-						   AND reportsick_status IN ('pending_superior','approved','updated','flagged') LIMIT 1`,
-					)
-					.bind(user.id, t)
-					.first();
-				if (!existing) {
-					return json({ ok: true, applied: 0, pending: 0, skipped_weekends: skippedWeekends, skipped_past: skippedPast, blocked_sick: t });
-				}
-			}
 		}
 
 		const minutesNow = sgtMinutesIntoDay();
@@ -339,9 +337,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		//   • status 'Blank'                          → delete the entry (a fix),
 		//       applies directly, no approval/backing
 		//   • on-time / future / past(superadmin)     → apply immediately
-		//   • LATE + status 'Present'/duty/RSI/RSO    → apply immediately
+		//   • LATE + status 'Present'/duty             → apply immediately
 		//   • LATE + other status                     → stage as pending change
 		//       request; superior must approve before it applies
+		// (RSI/RSO never reach here for a self-edit — they were stripped above and
+		// routed to the Sick page; an approver's staff edit applies them directly.)
 		// "Late" = target date is today (SGT) on a working slot AND
 		//   AM submitted at/after 07:30  OR  PM submitted at/after 13:00.
 		const directOps: ReturnType<typeof env.depot_db.prepare>[] = [];
@@ -371,10 +371,8 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					d === today &&
 					((e.period === 'AM' && minutesNow >= AM_CUTOFF_MIN) ||
 						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
-				// RSI/RSO reaching here are already backed by an active sick case
-				// (the gate is the sick approval, and they're already shown
-				// optimistically) — so they apply directly, never staged again.
-				const noApprovalNeeded = e.status === 'Present' || e.status === 'Operator Off' || e.status === 'RSI' || e.status === 'RSO';
+				// Present / duty-style statuses apply directly even when late.
+				const noApprovalNeeded = e.status === 'Present' || e.status === 'Operator Off';
 				if (isLate && !noApprovalNeeded) {
 					// Late non-Present → needs superior approval.
 					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
@@ -480,6 +478,10 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			pending_ids: pendingIds,
 			skipped_weekends: skippedWeekends,
 			skipped_past: skippedPast,
+			// Set when an RSI/RSO half was stripped from a self-edit: the rest was
+			// saved (see `applied`), and the frontend routes the user to the Sick page
+			// to report the RSI/RSO.
+			blocked_sick: routeSick ?? undefined,
 			target_user_id: target.id,
 		});
 	}
