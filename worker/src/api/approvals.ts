@@ -9,7 +9,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive } from '../types';
-import { canApprove, sameUnit } from '../superiors';
+import { canApprove, sameUnit, departmentsWithHolders } from '../superiors';
 import { approveLeave, setParadeForLeave } from './leave';
 import { setParadeForSick } from './sick';
 
@@ -73,78 +73,125 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 	const sub = url.pathname.slice('/api/approvals'.length);
 
 	if (request.method === 'GET' && (sub === '' || sub === '/')) {
-		// Fetch ALL pending, then keep only the items this viewer may approve
-		// (same-unit appointment-holder, or superadmin for own-unit / orphans).
+		// Pending requests, scope-selectable:
+		//   ?scope = mine | dept | all
+		//     • mine → requests I submitted that are still pending (DEFAULT for
+		//              normal users, who can't approve anything)
+		//     • dept → every pending request in my department (DEFAULT for approvers)
+		//     • all  → every pending request (any department)
+		// Each item carries can_action — whether THIS viewer may approve/reject it
+		// (false = view-only, e.g. a superadmin viewing a unit whose own
+		// appointment-holders are the proper approvers, or a normal user's own row).
+		const canSeeOthers = user.user_role === 'admin' || user.user_role === 'superadmin' || !!user.appointment;
+		const scopeParam = url.searchParams.get('scope');
+		const defaultScope: 'mine' | 'dept' | 'all' = user.user_role === 'superadmin' ? 'all' : canSeeOthers ? 'dept' : 'mine';
+		let scope: 'mine' | 'dept' | 'all' =
+			scopeParam === 'mine' || scopeParam === 'dept' || scopeParam === 'all' ? scopeParam : defaultScope;
+		if (!canSeeOthers) scope = 'mine'; // normal users only ever see their own
+
+		const sc = ((): { clause: string; binds: (string | number)[] } => {
+			if (scope === 'mine') return { clause: 'AND u.id = ?', binds: [user.id] };
+			if (scope === 'dept') {
+				return {
+					clause: `AND u.department = ? AND IFNULL(u.sub_department,'') = IFNULL(?, '')`,
+					binds: [user.department ?? '', user.sub_department ?? ''],
+				};
+			}
+			return { clause: '', binds: [] };
+		})();
+
 		const offsRaw = await env.depot_db
 			.prepare(
 				`SELECT o.id, o.user_id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.period, o.reason
 				 FROM off_requests o JOIN users u ON u.id = o.user_id
-				 WHERE o.off_status = 'pending' ORDER BY o.created_at`,
+				 WHERE o.off_status = 'pending' ${sc.clause} ORDER BY o.created_at`,
 			)
+			.bind(...sc.binds)
 			.all<{ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; startdate: string; enddate: string; period: string; reason: string }>();
 		const sickRaw = await env.depot_db
 			.prepare(
 				`SELECT s.id, s.user_id, u.full_name, u.department, u.sub_department, s.case_type, s.reason, s.created_at
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id
-				 WHERE s.reportsick_status = 'pending_superior' ORDER BY s.created_at`,
+				 WHERE s.reportsick_status = 'pending_superior' ${sc.clause} ORDER BY s.created_at`,
 			)
+			.bind(...sc.binds)
 			.all<SickItem>();
 		const grantsRaw = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, u.full_name, u.department, u.sub_department, g.num_days, g.reason
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
-				 WHERE g.status = 'pending_superior' ORDER BY g.created_at`,
+				 WHERE g.status = 'pending_superior' ${sc.clause} ORDER BY g.created_at`,
 			)
+			.bind(...sc.binds)
 			.all<GrantItem>();
 		const paradeRaw = await env.depot_db
 			.prepare(
 				`SELECT p.id, p.user_id, u.full_name, u.department, u.sub_department, p.parade_state_date, p.period, p.new_status, p.new_reason
 				 FROM parade_change_requests p JOIN users u ON u.id = p.user_id
-				 WHERE p.status = 'pending' ORDER BY p.created_at`,
+				 WHERE p.status = 'pending' ${sc.clause} ORDER BY p.created_at`,
 			)
+			.bind(...sc.binds)
 			.all<{ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; parade_state_date: string; period: string; new_status: string; new_reason: string | null }>();
 		const leaveRaw = await env.depot_db
 			.prepare(
 				`SELECT l.id, l.user_id, u.full_name, u.department, u.sub_department, l.leave_type, l.period, l.startdate, l.enddate, l.reason
 				 FROM leave_requests l JOIN users u ON u.id = l.user_id
-				 WHERE l.status = 'pending' ORDER BY l.created_at`,
+				 WHERE l.status = 'pending' ${sc.clause} ORDER BY l.created_at`,
 			)
+			.bind(...sc.binds)
 			.all<LeaveItem>();
 
-		async function keep<T extends Dept>(rows: T[]): Promise<T[]> {
-			const flags = await Promise.all(rows.map((r) => canApprove(env, user, r.department, r.sub_department, r.user_id)));
-			return rows.filter((_, i) => flags[i]);
-		}
-		const offs = await keep(offsRaw.results ?? []);
-		const sick = await keep(sickRaw.results ?? []);
-		const grants = await keep(grantsRaw.results ?? []);
-		const parade = await keep(paradeRaw.results ?? []);
-		const leave = await keep(leaveRaw.results ?? []);
+		// Action authority, computed in batch (one query) to avoid a per-row probe.
+		const holderDepts = await departmentsWithHolders(env);
+		const isSuper = isSuperadmin(user.user_role);
+		const appointed = !!user.appointment;
+		const canActOn = (dept: string | null, subDept: string | null): boolean =>
+			(appointed && sameUnit(user, dept, subDept)) || (isSuper && (dept == null || !holderDepts.has(dept)));
+		const withAct = <T extends Dept>(rows: T[]): (T & { can_action: boolean })[] =>
+			rows.map((r) => ({ ...r, can_action: canActOn(r.department, r.sub_department) }));
 
-		const offItems: OffItem[] = offs.map((o) => ({ ...o, days: offCreditDays(o.startdate, o.enddate, o.period) }));
-		return json({ offs: offItems, sick, grants, parade, leave });
+		const offItems = withAct(offsRaw.results ?? []).map((o) => ({ ...o, days: offCreditDays(o.startdate, o.enddate, o.period) }));
+		return json({
+			scope,
+			offs: offItems,
+			sick: withAct(sickRaw.results ?? []),
+			grants: withAct(grantsRaw.results ?? []),
+			parade: withAct(paradeRaw.results ?? []),
+			leave: withAct(leaveRaw.results ?? []),
+		});
 	}
 
 	// Recently approved OR rejected items (last 14 days), with a selectable scope.
-	//   ?status = approved | rejected      (which list; default approved)
-	//   ?scope  = self | dept | all        (whose items; default dept)
-	//     • self → only items this caller personally approved/rejected
-	//     • dept → every item for a requester in the caller's department
-	//              (incl. fellow appointment-holders' actions) — DEFAULT
-	//     • all  → every department (items outside the caller's remit are
-	//              view-only: can_undo = false)
+	//   ?status = approved | rejected            (which list; default approved)
+	//   ?scope  = mine | self | dept | all
+	//     • mine → requests I SUBMITTED that were approved/rejected (DEFAULT for
+	//              normal users — lets them track their own processed requests)
+	//     • self → items I personally approved/rejected (any department — incl. my
+	//              own dept when I really did it myself)
+	//     • dept → every item for a requester in my department
+	//              (incl. fellow appointment-holders' actions) — DEFAULT for approvers
+	//     • all  → every department (items outside my remit are view-only)
 	// Each item carries can_undo — whether THIS caller may undo it:
-	//   superadmin (anything) · appointment-holder (own unit) · else (only own).
+	//   appointment-holder (own unit) · superadmin (orphan / no-holder units) ·
+	//   anyone who personally performed the action (so "self" items stay undoable).
 	if (request.method === 'GET' && sub === '/recent') {
 		const status: 'approved' | 'rejected' = url.searchParams.get('status') === 'rejected' ? 'rejected' : 'approved';
+		const canSeeOthers = user.user_role === 'admin' || user.user_role === 'superadmin' || !!user.appointment;
 		const scopeParam = url.searchParams.get('scope');
-		const scope: 'self' | 'dept' | 'all' = scopeParam === 'self' || scopeParam === 'all' ? scopeParam : 'dept';
+		const defaultScope: 'mine' | 'self' | 'dept' | 'all' = user.user_role === 'superadmin' ? 'all' : canSeeOthers ? 'dept' : 'mine';
+		let scope: 'mine' | 'self' | 'dept' | 'all' =
+			scopeParam === 'mine' || scopeParam === 'self' || scopeParam === 'all' || scopeParam === 'dept'
+				? scopeParam
+				: defaultScope;
+		if (!canSeeOthers) scope = 'mine'; // normal users only ever see their own submissions
 		const isSuper = isSuperadmin(user.user_role);
 		const appointed = !!user.appointment;
+		const holderDepts = await departmentsWithHolders(env);
 
 		// Extra WHERE clause + binds restricting which rows come back, given the
 		// row's actor column (who approved/rejected). `u` is the requester join.
 		const scopeSql = (actorCol: string): { clause: string; binds: (string | number)[] } => {
+			if (scope === 'mine') return { clause: 'AND u.id = ?', binds: [user.id] };
 			if (scope === 'self') return { clause: `AND ${actorCol} = ?`, binds: [user.id] };
 			if (scope === 'dept') {
 				return {
@@ -155,7 +202,9 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			return { clause: '', binds: [] }; // 'all'
 		};
 		const canUndo = (dept: string | null, subDept: string | null, actorId: number | null): boolean =>
-			isSuper || (appointed && sameUnit(user, dept, subDept)) || (actorId != null && actorId === user.id);
+			(appointed && sameUnit(user, dept, subDept)) ||
+			(isSuper && (dept == null || !holderDepts.has(dept))) ||
+			(actorId != null && actorId === user.id);
 
 		// Per-status column config (status value + actor column + timestamp column).
 		const approved = status === 'approved';

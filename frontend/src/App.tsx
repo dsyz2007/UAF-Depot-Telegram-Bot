@@ -50,9 +50,9 @@ export default function App() {
 	}
 
 	const isAdminish = me.user_role === 'admin' || me.user_role === 'superadmin';
-	// Pending tab (which hosts the Approvals inbox) is shown to anyone who
-	// approves for someone — admins/superadmins plus appointment-holders.
-	const showToday = isAdminish || me.is_approver;
+	// Pending tab is shown to everyone: approvers manage their inbox, and normal
+	// users use it to track their OWN pending + approved/rejected requests.
+	const showToday = true;
 	const tabs: { key: TabKey; label: string; show: boolean }[] = [
 		{ key: 'parade', label: '🪖 Parade', show: true },
 		{ key: 'off', label: '📅 Off', show: true },

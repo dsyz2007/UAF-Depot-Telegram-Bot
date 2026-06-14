@@ -1,10 +1,19 @@
 import { json, type AuthedContext } from './router';
-import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, autoApprovesOwn, type ParadeStatus } from '../types';
+import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, DEPARTMENTS, autoApprovesOwn, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
 import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
+
+// Max days per Excel export. One worksheet (tab) per date, so this also caps the
+// number of tabs. 31 = a clean monthly report; small enough that Excel stays
+// snappy and the build stays well under the Workers free-tier CPU budget.
+const EXPORT_MAX_DAYS = 31;
+
+function xmlEscape(s: string): string {
+	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
 
 // Sentinel "status" meaning: clear (delete) this period's entry so the day
 // reverts to the original empty/blank state. Not a real parade status.
@@ -508,45 +517,99 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'POST' && sub === '/export') {
-		// CSV export — single date, admin or superadmin. Telegram's WebView
-		// blocks browser downloads, so we push the file into the user's chat
-		// with the bot via sendDocument instead of returning a blob.
+		// Multi-sheet Excel export — one worksheet (tab) per date in the range,
+		// optionally filtered to a single department. Admin/superadmin only.
+		// Telegram's in-app WebView blocks browser downloads, so we push the file
+		// into the user's chat with the bot via sendDocument.
+		//
+		// Format = SpreadsheetML 2003 (a plain-XML workbook Excel opens with tabs).
+		// We deliberately DON'T build a real .xlsx: that's a ZIP needing a CRC32
+		// pass over the whole file, which could blow the Workers free-tier ~10ms
+		// CPU budget on a big range. SpreadsheetML is pure string-building, so the
+		// CPU cost stays tiny regardless of range size.
 		if (!isAdminish(user.user_role)) return json({ error: 'forbidden' }, { status: 403 });
-		const body = (await request.json().catch(() => ({}))) as { date?: string };
-		const date = body.date ?? '';
-		if (!isValidDate(date)) return json({ error: 'bad_date' }, { status: 400 });
+		const body = (await request.json().catch(() => ({}))) as { start?: string; end?: string; department?: string };
+		const start = body.start ?? '';
+		const end = body.end ?? '';
+		if (!isValidDate(start) || !isValidDate(end)) return json({ error: 'bad_dates' }, { status: 400 });
+		if (start > end) return json({ error: 'bad_range' }, { status: 400 });
+		const dates = expandRange(start, end);
+		if (dates.length > EXPORT_MAX_DAYS) return json({ error: 'range_too_long', max_days: EXPORT_MAX_DAYS }, { status: 400 });
 
+		// Department filter: 'all' (null) or one known department. DSP absorbed the
+		// legacy STG rows, so a DSP filter matches both.
+		const dept = body.department && body.department !== 'all' ? body.department : null;
+		if (dept && !(DEPARTMENTS as readonly string[]).includes(dept)) return json({ error: 'bad_department' }, { status: 400 });
+		let deptClause = '';
+		const qbinds: (string | number)[] = [start, end];
+		if (dept === 'DSP') {
+			deptClause = ` AND u.department IN ('DSP','STG')`;
+		} else if (dept) {
+			deptClause = ` AND u.department = ?`;
+			qbinds.push(dept);
+		}
+
+		type ExportRow = { full_name: string; department: string | null; parade_state_date: string; period: string; parade_status: string; reason: string | null };
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT u.full_name, u.department, p.period, p.parade_status, p.reason
+				`SELECT u.full_name, u.department, p.parade_state_date, p.period, p.parade_status, p.reason
 				 FROM parade_state_entries p
 				 JOIN users u ON u.id = p.user_id
-				 WHERE p.parade_state_date = ?
-				 ORDER BY u.department, u.full_name, p.period`,
+				 WHERE p.parade_state_date >= ? AND p.parade_state_date <= ?${deptClause}
+				 ORDER BY p.parade_state_date, u.department, u.full_name, p.period`,
 			)
-			.bind(date)
-			.all<{ full_name: string; department: string | null; period: string; parade_status: string; reason: string | null }>();
+			.bind(...qbinds)
+			.all<ExportRow>();
 		const rows = results ?? [];
+		// Nothing to export — tell the caller so the UI can show a friendly note
+		// (don't send an empty file).
+		if (rows.length === 0) return json({ ok: true, rows: 0, sheets: 0 });
 
-		const csvEscape = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-		const header = 'department,name,period,status,reason\n';
-		const csvBody = rows
-			.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''].map(csvEscape).join(','))
-			.join('\n');
-		// UTF-8 BOM so Excel auto-detects encoding and renders any non-ASCII
-		// characters correctly. (Note: Google Sheets shows the BOM as "ï»¿"
-		// gibberish in the first header cell — open the file in Excel.)
-		const csv = '﻿' + header + csvBody + '\n';
+		// One worksheet per date that actually has entries (skips blank weekends),
+		// in chronological order.
+		const byDate = new Map<string, ExportRow[]>();
+		for (const r of rows) {
+			const arr = byDate.get(r.parade_state_date) ?? [];
+			arr.push(r);
+			byDate.set(r.parade_state_date, arr);
+		}
 
+		const cell = (v: string) => `<Cell><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`;
+		const rowXml = (cells: string[]) => `<Row>${cells.map(cell).join('')}</Row>`;
+		const header = rowXml(['Department', 'Name', 'Period', 'Status', 'Reason']);
+		const sheets = [...byDate.entries()]
+			.map(([date, sheetRows]) => {
+				const dataRows = sheetRows
+					.map((r) => rowXml([r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? '']))
+					.join('');
+				// Excel sheet names are capped at 31 chars / no : \ / ? * [ ] — a
+				// YYYY-MM-DD date is safe on both counts.
+				return `<Worksheet ss:Name="${xmlEscape(date)}"><Table>${header}${dataRows}</Table></Worksheet>`;
+			})
+			.join('');
+		const workbook =
+			`<?xml version="1.0" encoding="UTF-8"?>\n` +
+			`<?mso-application progid="Excel.Sheet"?>\n` +
+			`<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"` +
+			` xmlns:o="urn:schemas-microsoft-com:office:office"` +
+			` xmlns:x="urn:schemas-microsoft-com:office:excel"` +
+			` xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"` +
+			` xmlns:html="http://www.w3.org/TR/REC-html40">` +
+			sheets +
+			`</Workbook>`;
+
+		const rangeTag = start === end ? start : `${start}_to_${end}`;
+		const deptTag = dept ? `_${dept}` : '';
 		const sent = await tgSendDocument(
 			env.BOT_TOKEN,
 			user.telegram_id,
-			`parade-state_${date}.csv`,
-			csv,
-			`📄 Parade state for ${date} (${rows.length} entries)`,
+			`parade-state_${rangeTag}${deptTag}.xls`,
+			workbook,
+			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''} — ${byDate.size} date tab(s), ${rows.length} entries`,
+			'application/vnd.ms-excel',
 		);
 		if (!sent) return json({ error: 'send_failed' }, { status: 502 });
-		return json({ ok: true, rows: rows.length });
+		return json({ ok: true, rows: rows.length, sheets: byDate.size });
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });

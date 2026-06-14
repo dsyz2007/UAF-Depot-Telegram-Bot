@@ -104,11 +104,12 @@ export async function tgSendDocument(
 	filename: string,
 	content: string,
 	caption?: string,
+	contentType = 'text/csv',
 ): Promise<boolean> {
 	const form = new FormData();
 	form.append('chat_id', String(chatId));
 	if (caption) form.append('caption', caption);
-	form.append('document', new Blob([content], { type: 'text/csv' }), filename);
+	form.append('document', new Blob([content], { type: contentType }), filename);
 	const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
 		method: 'POST',
 		body: form,

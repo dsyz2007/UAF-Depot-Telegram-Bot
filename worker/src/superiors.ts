@@ -54,6 +54,12 @@ export async function approverTidsFor(env: Env, u: ApproverTarget): Promise<stri
 
 // True if `approver` may approve a request from a user in unit (reqDepartment,
 // reqSub). Mirrors approverTidsFor's routing so the inbox/auth stays consistent.
+//
+// An appointment-holder approves their own unit. Superadmins are only the
+// FALLBACK approver — for orphan requesters (no department) or units that have
+// no appointment-holder of their own. A superadmin who holds NO appointment in
+// a unit that DOES have holders can only VIEW those requests, not approve them:
+// the unit's own WOIC/2IC/PC are the proper approvers (and the ones DM'd).
 export async function canApprove(
 	env: Env,
 	approver: { id: number; user_role: string; appointment: string | null; department: string | null; sub_department: string | null },
@@ -63,11 +69,11 @@ export async function canApprove(
 ): Promise<boolean> {
 	const isSuper = approver.user_role === 'superadmin';
 	const appointed = !!approver.appointment;
-	const sameUnit =
+	const inUnit =
 		!!reqDepartment &&
 		reqDepartment === approver.department &&
 		(approver.sub_department ?? '') === (reqSub ?? '');
-	if ((isSuper || appointed) && sameUnit) return true;
+	if (appointed && inUnit) return true;
 	if (isSuper) {
 		if (!reqDepartment) return true; // no-department orphan → all superadmins
 		// A unit with no OTHER active appointment-holder also falls back to all
@@ -83,4 +89,20 @@ export async function canApprove(
 		if (!holder) return true;
 	}
 	return false;
+}
+
+// Departments that currently have at least one appointment-holder. Lets the
+// approvals/recent endpoints compute view-vs-action authority in batch (one
+// query) instead of a per-row holder probe. (Doesn't exclude any requester, so
+// it's a touch more conservative than canApprove for the rare unit whose sole
+// holder is the requester — acceptable: it only ever hides an action button the
+// server would still honour, never shows one it would reject.)
+export async function departmentsWithHolders(env: Env): Promise<Set<string>> {
+	const { results } = await env.depot_db
+		.prepare(
+			`SELECT DISTINCT department FROM users
+			 WHERE appointment IN ('WOIC','2IC','PC') AND department IS NOT NULL AND full_name NOT LIKE 'PENDING:%'`,
+		)
+		.all<{ department: string }>();
+	return new Set((results ?? []).map((r) => r.department));
 }

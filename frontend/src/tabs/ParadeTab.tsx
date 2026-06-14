@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
-import { api, alertDialog, deptLabel, type Me, type RouteAction } from '../lib/api';
+import { api, alertDialog, deptLabel, DEPARTMENTS, type Me, type RouteAction } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface Entry {
@@ -1017,27 +1017,48 @@ function SubmitModal({
 	);
 }
 
+// Max days per Excel export — one worksheet (tab) per date, so this also caps
+// the number of tabs. Mirrors EXPORT_MAX_DAYS on the worker.
+const EXPORT_MAX_DAYS = 31;
+
 function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; minIso: string; maxIso: string }) {
 	// Picker spans the whole calendar window (±2 months). Future dates export the
-	// already-submitted forecast; past dates beyond the 5-day retention prune come
-	// back empty (that data has been deleted).
+	// already-submitted forecast; dates beyond the retention window come back empty.
 	const clamp = (d: string) => (d < minIso ? minIso : d > maxIso ? maxIso : d);
-	const [date, setDate] = useState(clamp(selectedDate));
+	const [start, setStart] = useState(clamp(selectedDate));
+	const [end, setEnd] = useState(clamp(selectedDate));
+	const [dept, setDept] = useState('all');
+	const [busy, setBusy] = useState(false);
 
 	useEffect(() => {
-		setDate(clamp(selectedDate));
+		const d = clamp(selectedDate);
+		setStart(d);
+		setEnd(d);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [selectedDate]);
 
-	const [busy, setBusy] = useState(false);
+	const validRange = !!start && !!end && start <= end;
+	const dayCount = validRange
+		? Math.floor((new Date(`${end}T00:00:00`).getTime() - new Date(`${start}T00:00:00`).getTime()) / 86_400_000) + 1
+		: 0;
+	const tooLong = dayCount > EXPORT_MAX_DAYS;
+	const rangeLabel = start === end ? start : `${start} → ${end}`;
 
-	async function exportCsv() {
+	async function exportXls() {
 		setBusy(true);
 		try {
-			const res = await api.post<{ ok: boolean; rows: number }>('/api/parade/export', { date });
-			alertDialog(
-				`📄 CSV for ${date} (${res.rows} entries) sent to your Telegram chat with the bot. Excel opens it directly.`,
-			);
+			const res = await api.post<{ ok: boolean; rows: number; sheets: number }>('/api/parade/export', {
+				start,
+				end,
+				department: dept,
+			});
+			if (res.rows === 0) {
+				alertDialog(`No parade entries found for ${rangeLabel}${dept === 'all' ? '' : ` (${dept})`}.`);
+			} else {
+				alertDialog(
+					`📊 Excel sent to your Telegram chat — ${res.sheets} date tab(s), ${res.rows} entries.\n\nOpen it in Excel. If it asks whether to open because the format/extension don't match, tap Yes — each date is its own tab inside.`,
+				);
+			}
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {
@@ -1047,14 +1068,33 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 
 	return (
 		<div className="card" style={{ marginTop: 12 }}>
-			<h4 style={{ marginTop: 0 }}>Export CSV (Admin/Superadmin)</h4>
+			<h4 style={{ marginTop: 0 }}>Export to Excel (Admin/Superadmin)</h4>
 			<p className="muted" style={{ marginTop: 0 }}>
-				Single-date export, grouped by department. Sent to your chat with the bot — Excel opens it directly.
-				Any date in the calendar (±2 months) works — parade data is retained for the whole calendar window.
+				One worksheet (tab) per date, for all departments or a single one. Sent to your chat with the bot.
+				Up to {EXPORT_MAX_DAYS} days per export (parade data is kept for the ±2-month calendar window).
 			</p>
-			<input type="date" value={date} min={minIso} max={maxIso} onChange={(e) => setDate(e.target.value)} />
-			<button className="btn" disabled={busy} onClick={exportCsv}>
-				{busy ? 'Sending…' : `📤 Send CSV for ${date}`}
+			<label>Start date<input
+				type="date"
+				value={start}
+				min={minIso}
+				max={maxIso}
+				onChange={(e) => {
+					const v = e.target.value;
+					setStart(v);
+					if (!end || end < v) setEnd(v);
+				}}
+			/></label>
+			<label>End date<input type="date" value={end} min={start || minIso} max={maxIso} onChange={(e) => setEnd(e.target.value)} /></label>
+			<label>Department
+				<select value={dept} onChange={(e) => setDept(e.target.value)}>
+					<option value="all">All departments</option>
+					{DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
+				</select>
+			</label>
+			{!validRange && <p className="muted danger" style={{ marginBottom: 6 }}>End date must be on or after start date.</p>}
+			{tooLong && <p className="muted danger" style={{ marginBottom: 6 }}>Max {EXPORT_MAX_DAYS} days per export — narrow the range (you picked {dayCount}).</p>}
+			<button className="btn" disabled={busy || !validRange || tooLong} onClick={exportXls}>
+				{busy ? 'Sending…' : `📤 Send Excel for ${rangeLabel}`}
 			</button>
 		</div>
 	);
