@@ -10,6 +10,7 @@ import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive } from '../types';
 import { canApprove } from '../superiors';
+import { setParadeForOff } from '../api/off';
 
 // Half-day (AM/PM) off costs 0.5 credits per day; full day (FD) costs 1.
 function offDays(start: string, end: string, period: string): number {
@@ -149,13 +150,16 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
+		// Reflect the approved off on the parade calendar (covers Off-page requests;
+		// parade-initiated ones are already painted — re-paint is a harmless no-op).
+		await setParadeForOff(env, row.user_id, row.requester_dept, row.startdate, row.enddate, row.period);
 		await ctx.editMessageText(
 			`✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'})${periodSuffix} — approved by ${superior.full_name}.`,
 		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your off (${row.startdate} → ${row.enddate}) was approved by ${superior.full_name}.`,
+			text: `✅ Your off (${row.startdate} → ${row.enddate}) was approved by ${superior.full_name}.\nYour parade state for ${row.startdate} → ${row.enddate} now shows OFF.`,
 		});
 	});
 

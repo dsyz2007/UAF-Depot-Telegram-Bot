@@ -250,6 +250,20 @@ function buildStrengthReport(amUsers: StrengthRow[], pmUsers: StrengthRow[], per
 	// both half-days (AM / PM / FD) so a full-day picture is shown.
 	const users = period === 'AM' ? amUsers : pmUsers;
 	const lines: string[] = [];
+
+	// Not-submitted (blank) — listed FIRST and prominently so it's the first thing
+	// seen. "Blank" = no parade entry for this half-day (status is null).
+	const blanks = users.filter((u) => u.status === null).sort((a, b) => a.full_name.localeCompare(b.full_name));
+	lines.push(`⚠️ NOT SUBMITTED — ${period} (${blanks.length})`);
+	if (blanks.length) {
+		for (const u of blanks) lines.push(`• ${u.full_name}`);
+	} else {
+		lines.push('(everyone submitted 🎉)');
+	}
+	lines.push('');
+	lines.push('━━━━━━━━━━━━━━');
+	lines.push('');
+
 	lines.push(`*${period} Present Strength*`);
 	lines.push('');
 
@@ -325,6 +339,7 @@ function buildStrengthReport(amUsers: StrengthRow[], pmUsers: StrengthRow[], per
 				: users.filter((u) => u.status === s).length;
 		lines.push(`${s}: ${n}`);
 	}
+	lines.push(`Not submitted (blank): ${blanks.length}`);
 	lines.push(`Total absent: ${totalRegistered - totalPresent}`);
 
 	return lines.join('\n');
@@ -881,7 +896,10 @@ function SubmitModal({
 				return;
 			}
 			if (!target && res.blocked_sick) {
-				onRoute({ kind: 'sick', sickType: res.blocked_sick });
+				// Carry the reason the user typed for the RSI/RSO cell over to the Sick
+				// page so they don't have to retype it (reason is compulsory there too).
+				const sickReason = entries.find((e) => e.status === res.blocked_sick)?.reason ?? undefined;
+				onRoute({ kind: 'sick', sickType: res.blocked_sick, reason: sickReason ?? undefined });
 				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
 				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar — report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
 				return;
@@ -908,7 +926,12 @@ function SubmitModal({
 			alertDialog(msg);
 		} catch (e) {
 			setBusy(false);
-			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			const emsg = e instanceof Error ? e.message : String(e);
+			alertDialog(
+				emsg.includes('overlapping_request')
+					? '⚠ You already have a pending or approved leave/MA that overlaps those dates — it’s awaiting approval. Manage it from the Pending page instead of re-requesting.'
+					: `Failed: ${emsg}`,
+			);
 		}
 	}
 
@@ -1019,8 +1042,9 @@ function SubmitModal({
 }
 
 // Max days per Excel export — one worksheet (tab) per date, so this also caps
-// the number of tabs. Mirrors EXPORT_MAX_DAYS on the worker.
-const EXPORT_MAX_DAYS = 31;
+// the number of tabs. Mirrors EXPORT_MAX_DAYS on the worker (7 = up to a week,
+// which keeps the build well within the free-tier CPU budget).
+const EXPORT_MAX_DAYS = 7;
 
 // Compact label-beside-field rows for the export box (keeps it from getting tall).
 const EXPORT_FIELD_ROW: CSSProperties = { display: 'flex', alignItems: 'center', gap: 10 };
@@ -1066,7 +1090,12 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 				);
 			}
 		} catch (e) {
-			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			const msg = e instanceof Error ? e.message : String(e);
+			alertDialog(
+				msg.includes('too_many_rows')
+					? '⚠ Too many entries for one file — narrow to a single department, or pick a shorter date range, then try again.'
+					: `Failed: ${msg}`,
+			);
 		} finally {
 			setBusy(false);
 		}

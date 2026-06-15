@@ -5,10 +5,11 @@
 //   0 10 * * *       → 18:00 prev day      parade-state nudge for tomorrow (if working day)
 //   30 21 * * *      → 05:30 same day      AM update nudge (everyone, with reassurance)
 //   0 5,23 * * *     → 07:00 SGT (23:00 UTC, AM flag) and 13:00 SGT (05:00 UTC, PM flag)
-//   0 4 * * *        → 12:00 same day      PM update nudge + holiday refresh + ORD scan + parade prune
+//   0 4 * * *        → 12:00 same day      PM update nudge + ORD scan + parade prune
 
 import { tgSendMessage, sendThrottled } from './tg';
-import { getDayWorkInfo, slotWorking, refreshHolidays, sgtToday, sgtDateAddDays } from './holidays';
+import { getDayWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from './holidays';
+import { dayCountInclusive } from './types';
 
 // Inline keyboard with a single WebApp button that deep-links to a tab.
 // Optional `date` (YYYY-MM-DD) pre-selects that date on the Parade calendar —
@@ -57,11 +58,15 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 			await paradeNudge(env, 'morning_am');
 			return;
 		case '0 4 * * *':
-			// 12:00 SGT — bundle PM nudge + holiday refresh + ORD scan + prune
-			// into a single cron to stay under Cloudflare's 5-trigger cap.
+			// 12:00 SGT — bundle PM nudge + ORD scan + prune into a single cron to
+			// stay under Cloudflare's 5-trigger cap. (Public-holiday refresh is NOT
+			// run here — it only happens when a superadmin presses force-fetch in
+			// Admin, to avoid hitting nager.date every day for no change.)
 			await paradeNudge(env, 'noon_pm');
+			// Refund expired-pending offs BEFORE the retention prune runs, so an old
+			// pending off can't be deleted before its credits are returned.
+			await runOffExpiry(env);
 			await Promise.allSettled([
-				runHolidayRefresh(env),
 				runOrdReminders(env),
 				runParadePrune(env),
 				runRetentionPrune(env),
@@ -352,6 +357,40 @@ async function runOrdReminders(env: Env): Promise<void> {
 	await Promise.allSettled(sends);
 }
 
+// Auto-expire pending off requests whose dates have fully passed without ever
+// being approved: refund the reserved credits and close them out (off_status
+// 'cancelled'). Mirrors a user cancel (no parade rewrite) — without this, the
+// credits would stay reserved forever on an off that can never happen. Runs daily.
+function offCreditDays(start: string, end: string, period: string): number {
+	const d = dayCountInclusive(start, end);
+	return period === 'AM' || period === 'PM' ? d * 0.5 : d;
+}
+async function runOffExpiry(env: Env): Promise<void> {
+	const today = sgtToday();
+	const { results } = await env.depot_db
+		.prepare(
+			`SELECT o.id, o.user_id, o.startdate, o.enddate, o.period, u.telegram_id
+			 FROM off_requests o JOIN users u ON u.id = o.user_id
+			 WHERE o.off_status = 'pending' AND o.enddate < ?`,
+		)
+		.bind(today)
+		.all<{ id: number; user_id: number; startdate: string; enddate: string; period: string; telegram_id: string }>();
+	for (const o of results ?? []) {
+		// Atomic flip so we never double-refund if it's actioned concurrently.
+		const flip = await env.depot_db
+			.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_at = datetime('now') WHERE id = ? AND off_status = 'pending'`)
+			.bind(o.id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) continue;
+		const days = offCreditDays(o.startdate, o.enddate, o.period);
+		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, o.user_id).run();
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: o.telegram_id,
+			text: `⌛ Your pending off (${o.startdate} → ${o.enddate}) expired — it was never approved and the dates have passed. 🪙 ${days} credit(s) refunded.`,
+		});
+	}
+}
+
 async function runParadePrune(env: Env): Promise<void> {
 	const today = sgtToday();
 	await env.depot_db.batch([
@@ -399,10 +438,3 @@ async function runRetentionPrune(env: Env): Promise<void> {
 	]);
 }
 
-async function runHolidayRefresh(env: Env): Promise<void> {
-	try {
-		await refreshHolidays(env);
-	} catch (e) {
-		console.error('holiday refresh failed', e);
-	}
-}

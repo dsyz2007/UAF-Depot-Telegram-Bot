@@ -34,10 +34,14 @@ function sgtPastSickCutoff(): boolean {
 export function SickTab({
 	me,
 	initialSick,
+	initialReason,
 	onConsumed,
 }: {
 	me: Me;
 	initialSick?: 'RSI' | 'RSO' | null;
+	// Reason pre-filled when routed here from the Parade calendar (RSI/RSO needs a
+	// compulsory reason there; we carry it over so the user doesn't retype it).
+	initialReason?: string;
 	onConsumed?: () => void;
 }) {
 	const selfManaged = !!me.self_managed;
@@ -54,8 +58,9 @@ export function SickTab({
 	const [endDate, setEndDate] = useState('');
 	const [location, setLocation] = useState('');
 	const [approxTime, setApproxTime] = useState('');
-	// Optional reason / symptoms captured at report time, shown to the approver.
-	const [reportReason, setReportReason] = useState('');
+	// Reason / symptoms captured at report time, shown to the approver. Pre-filled
+	// from the Parade-calendar reason when routed here.
+	const [reportReason, setReportReason] = useState(initialReason ?? '');
 
 	function refresh() {
 		setLoadError(null);
@@ -80,10 +85,13 @@ export function SickTab({
 	useEffect(() => {
 		if (initialSick && !routeHandled.current) {
 			routeHandled.current = true;
+			// Carry the calendar reason over (covers the case where this tab was
+			// already mounted when the route fired).
+			if (initialReason) setReportReason(initialReason);
 			onConsumed?.();
 		}
 		if (!initialSick) routeHandled.current = false;
-	}, [initialSick, onConsumed]);
+	}, [initialSick, initialReason, onConsumed]);
 
 	async function report(case_type: 'RSI' | 'RSO') {
 		setBusy(true);
@@ -134,7 +142,7 @@ export function SickTab({
 		}
 		setBusy(true);
 		try {
-			await api.post('/api/sick/update', {
+			const res = await api.post<{ ok: boolean; mc_dates?: string[] }>('/api/sick/update', {
 				id: open.id,
 				num_of_mc_days: Number(mcDays),
 				mc_start_date: mcDays >= 1 ? startDate : null,
@@ -148,7 +156,13 @@ export function SickTab({
 			setLocation('');
 			setApproxTime('');
 			await refresh();
-			alertDialog('Update sent.');
+			const mc = res.mc_dates ?? [];
+			if (mc.length > 0) {
+				const range = mc.length === 1 ? mc[0] : `${mc[0]} → ${mc[mc.length - 1]}`;
+				alertDialog(`Update sent.\n\n🗓 The bot set your Parade State to MC for ${range} (${mc.length} working day${mc.length === 1 ? '' : 's'}). Your RSI/RSO half-day is kept as-is.`);
+			} else {
+				alertDialog('Update sent.');
+			}
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		} finally {

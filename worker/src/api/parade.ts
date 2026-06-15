@@ -3,17 +3,21 @@ import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, DEPARTMENTS, autoApprovesOwn
 import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
 import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
+import { buildXlsx } from '../xlsx';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
 // Max days per Excel export. One worksheet (tab) per date, so this also caps the
-// number of tabs. 31 = a clean monthly report; small enough that Excel stays
-// snappy and the build stays well under the Workers free-tier CPU budget.
-const EXPORT_MAX_DAYS = 31;
-
-function xmlEscape(s: string): string {
-	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
-}
+// number of tabs. 7 = up to a week — small enough that building the workbook
+// (pure synchronous CPU: string-building + one CRC32 pass) stays trivially within
+// the Workers free-tier ~10ms budget even for an all-departments pull
+// (7 × ~100 people × 2 ≈ 1.4k rows, a few ms).
+const EXPORT_MAX_DAYS = 7;
+// Belt-and-suspenders cap on total cells. With the 7-day limit a realistic export
+// is far below this, so it should never trigger in practice — it just stops a
+// pathological pull (a very large unit) from approaching the CPU cap. Above it we
+// refuse and ask them to narrow the range or pick one department.
+const EXPORT_MAX_ROWS = 7000;
 
 // Sentinel "status" meaning: clear (delete) this period's entry so the day
 // reverts to the original empty/blank state. Not a real parade status.
@@ -524,11 +528,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		// Telegram's in-app WebView blocks browser downloads, so we push the file
 		// into the user's chat with the bot via sendDocument.
 		//
-		// Format = SpreadsheetML 2003 (a plain-XML workbook Excel opens with tabs).
-		// We deliberately DON'T build a real .xlsx: that's a ZIP needing a CRC32
-		// pass over the whole file, which could blow the Workers free-tier ~10ms
-		// CPU budget on a big range. SpreadsheetML is pure string-building, so the
-		// CPU cost stays tiny regardless of range size.
+		// Format = a real .xlsx (OOXML) with one worksheet per date — see xlsx.ts.
+		// (We previously emitted SpreadsheetML 2003, which modern Excel began
+		// flagging as "corrupted" with multiple sheets.) Building it is pure
+		// synchronous CPU; the ≤7-day range cap (+ EXPORT_MAX_ROWS) keeps the cost
+		// comfortably within the free-tier budget.
 		if (!isAdminish(user.user_role)) return json({ error: 'forbidden' }, { status: 403 });
 		const body = (await request.json().catch(() => ({}))) as { start?: string; end?: string; department?: string };
 		const start = body.start ?? '';
@@ -566,6 +570,10 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		// Nothing to export — tell the caller so the UI can show a friendly note
 		// (don't send an empty file).
 		if (rows.length === 0) return json({ ok: true, rows: 0, sheets: 0 });
+		// Safety net: refuse an over-large pull rather than risk the CPU cap.
+		if (rows.length > EXPORT_MAX_ROWS) {
+			return json({ error: 'too_many_rows', rows: rows.length, max_rows: EXPORT_MAX_ROWS }, { status: 400 });
+		}
 
 		// One worksheet per date that actually has entries (skips blank weekends),
 		// in chronological order.
@@ -576,39 +584,23 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			byDate.set(r.parade_state_date, arr);
 		}
 
-		const cell = (v: string) => `<Cell><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`;
-		const rowXml = (cells: string[]) => `<Row>${cells.map(cell).join('')}</Row>`;
-		const header = rowXml(['Department', 'Name', 'Period', 'Status', 'Reason']);
-		const sheets = [...byDate.entries()]
-			.map(([date, sheetRows]) => {
-				const dataRows = sheetRows
-					.map((r) => rowXml([r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? '']))
-					.join('');
-				// Excel sheet names are capped at 31 chars / no : \ / ? * [ ] — a
-				// YYYY-MM-DD date is safe on both counts.
-				return `<Worksheet ss:Name="${xmlEscape(date)}"><Table>${header}${dataRows}</Table></Worksheet>`;
-			})
-			.join('');
-		const workbook =
-			`<?xml version="1.0" encoding="UTF-8"?>\n` +
-			`<?mso-application progid="Excel.Sheet"?>\n` +
-			`<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"` +
-			` xmlns:o="urn:schemas-microsoft-com:office:office"` +
-			` xmlns:x="urn:schemas-microsoft-com:office:excel"` +
-			` xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"` +
-			` xmlns:html="http://www.w3.org/TR/REC-html40">` +
-			sheets +
-			`</Workbook>`;
+		// One worksheet per date; header row + one row per (dept, name, period).
+		const header = ['Department', 'Name', 'Period', 'Status', 'Reason'];
+		const sheets = [...byDate.entries()].map(([date, sheetRows]) => ({
+			name: date, // YYYY-MM-DD — safe as a sheet name (<=31 chars, no special chars)
+			rows: [header, ...sheetRows.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''])],
+		}));
+		const workbook = buildXlsx(sheets);
 
 		const rangeTag = start === end ? start : `${start}_to_${end}`;
 		const deptTag = dept ? `_${dept}` : '';
 		const sent = await tgSendDocument(
 			env.BOT_TOKEN,
 			user.telegram_id,
-			`parade-state_${rangeTag}${deptTag}.xls`,
+			`parade-state_${rangeTag}${deptTag}.xlsx`,
 			workbook,
 			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''} — ${byDate.size} date tab(s), ${rows.length} entries`,
-			'application/vnd.ms-excel',
+			'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 		);
 		if (!sent) return json({ error: 'send_failed' }, { status: 502 });
 		return json({ ok: true, rows: rows.length, sheets: byDate.size });

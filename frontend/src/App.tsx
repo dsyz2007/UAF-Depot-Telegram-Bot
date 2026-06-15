@@ -81,6 +81,7 @@ export default function App() {
 					<SickTab
 						me={me}
 						initialSick={routeAction?.kind === 'sick' ? routeAction.sickType : null}
+						initialReason={routeAction?.kind === 'sick' ? routeAction.reason : undefined}
 						onConsumed={() => setRouteAction(null)}
 					/>
 				)}

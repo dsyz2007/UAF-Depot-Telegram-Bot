@@ -12,6 +12,8 @@ import { dayCountInclusive } from '../types';
 import { canApprove, sameUnit, departmentsWithHolders } from '../superiors';
 import { approveLeave, setParadeForLeave } from './leave';
 import { setParadeForSick } from './sick';
+import { setParadeForOff } from './off';
+import { sgtToday } from '../holidays';
 
 // Credit-days for an off request: half-day (AM/PM) = 0.5 per day, full day = 1.
 function offCreditDays(start: string, end: string, period: string): number {
@@ -444,9 +446,13 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipApprove.meta.changes ?? 0) === 0) return false;
+		// Reflect the approved off on the parade calendar (covers offs requested from
+		// the Off page; parade-initiated ones are already painted — re-paint is a
+		// harmless no-op).
+		await setParadeForOff(env, row.user_id, row.department, row.startdate, row.enddate, row.period);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your off (${range}) was approved by ${approver.full_name}.`,
+			text: `✅ Your off (${range}) was approved by ${approver.full_name}.\nYour parade state for ${range} now shows OFF.`,
 		});
 		return true;
 	}
@@ -498,15 +504,20 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipSickA.meta.changes ?? 0) === 0) return false;
-		// Schedule the 3h/6h personnel + 8h superior-flag reminders.
+		// Schedule the 3h/6h personnel + 8h superior-flag reminders. For a case dated
+		// LATER than today (i.e. reported for tomorrow), anchor the timers to 08:00
+		// SGT of the sick day instead of approval time — so an evening approval
+		// doesn't fire (and flag) the user the night before. 08:00 SGT = 00:00 UTC,
+		// so the base is '<sick_date> 00:00:00'; a same-day case counts from 'now'.
+		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} 00:00:00` : 'now';
 		const stmt = env.depot_db.prepare(
 			`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
-			 VALUES (?, 'sick_case', ?, datetime('now', ?), ?)`,
+			 VALUES (?, 'sick_case', ?, datetime(?, ?), ?)`,
 		);
 		await env.depot_db.batch([
-			stmt.bind(row.user_id, id, '+3 hours', 'sick_update_personnel'),
-			stmt.bind(row.user_id, id, '+6 hours', 'sick_update_personnel_2'),
-			stmt.bind(row.user_id, id, '+8 hours', 'sick_update_superior_flag'),
+			stmt.bind(row.user_id, id, anchor, '+3 hours', 'sick_update_personnel'),
+			stmt.bind(row.user_id, id, anchor, '+6 hours', 'sick_update_personnel_2'),
+			stmt.bind(row.user_id, id, anchor, '+8 hours', 'sick_update_superior_flag'),
 		]);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,

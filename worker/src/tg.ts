@@ -102,7 +102,7 @@ export async function tgSendDocument(
 	botToken: string,
 	chatId: number | string,
 	filename: string,
-	content: string,
+	content: string | Uint8Array,
 	caption?: string,
 	contentType = 'text/csv',
 ): Promise<boolean> {

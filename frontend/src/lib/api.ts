@@ -61,7 +61,7 @@ export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 
 // Sick tab and open the matching apply form.
 export type RouteAction =
 	| { kind: 'off'; start: string; end: string }
-	| { kind: 'sick'; sickType: 'RSI' | 'RSO' };
+	| { kind: 'sick'; sickType: 'RSI' | 'RSO'; reason?: string };
 
 export type PersonnelType = 'NSF' | 'Regular';
 export const PERSONNEL_TYPES: readonly PersonnelType[] = ['NSF', 'Regular'];

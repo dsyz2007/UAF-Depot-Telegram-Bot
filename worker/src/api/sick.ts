@@ -2,7 +2,56 @@ import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { autoApprovesOwn } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
-import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, slotWorking } from '../holidays';
+import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, getRangeWorkInfo, slotWorking } from '../holidays';
+
+function expandRange(start: string, end: string): string[] {
+	const out: string[] = [];
+	const cur = new Date(`${start}T00:00:00Z`);
+	const stop = new Date(`${end}T00:00:00Z`);
+	while (cur <= stop && out.length < 95) {
+		out.push(cur.toISOString().slice(0, 10));
+		cur.setUTCDate(cur.getUTCDate() + 1);
+	}
+	return out;
+}
+
+// After a user records MC days, paint MC onto the parade calendar across the MC
+// date range — every WORKING slot, for the user's department. Keeps any existing
+// RSI/RSO cell (the reported half-day) intact, and caps the range to ~2 months
+// ahead (the calendar window) so a long MC can't paint beyond what's viewable.
+// Returns the distinct dates actually touched (for the user-facing confirmation).
+async function setParadeForMc(env: Env, userId: number, dept: string | null, mcStart: string, mcEnd: string): Promise<string[]> {
+	// Cap to the calendar window (~2 months ahead). Never paint into the past.
+	const today = sgtToday();
+	const cap = sgtDateAddDays(today, 62);
+	const start = mcStart < today ? today : mcStart;
+	const end = mcEnd > cap ? cap : mcEnd;
+	if (start > end) return [];
+	const dates = expandRange(start, end);
+	const info = await getRangeWorkInfo(env, dates);
+	const reason = `${mcStart} → ${mcEnd} MC`;
+	const stmt = env.depot_db.prepare(
+		`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+		 VALUES (?, ?, ?, 'MC', ?)
+		 ON CONFLICT(user_id, parade_state_date, period)
+		 DO UPDATE SET parade_status = 'MC', reason = excluded.reason
+		   WHERE parade_state_entries.parade_status NOT IN ('RSI','RSO')`,
+	);
+	const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+	const touched = new Set<string>();
+	for (const d of dates) {
+		const di = info.get(d);
+		if (!di) continue;
+		for (const p of ['AM', 'PM'] as const) {
+			if (slotWorking(di, dept, p)) {
+				ops.push(stmt.bind(userId, d, p, reason));
+				touched.add(d);
+			}
+		}
+	}
+	if (ops.length) await env.depot_db.batch(ops);
+	return [...touched].sort();
+}
 
 // Optimistically set a user's parade state for `date` to the sick status
 // (RSI/RSO) when they report — shown even before approval. Bypasses the normal
@@ -185,8 +234,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const row = await env.depot_db
 			.prepare(
 				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.superior_user_id,
-				        sup.telegram_id AS superior_tid
-				 FROM sick_cases s LEFT JOIN users sup ON sup.id = s.superior_user_id
+				        sup.telegram_id AS superior_tid, u.department AS requester_dept
+				 FROM sick_cases s
+				 JOIN users u ON u.id = s.user_id
+				 LEFT JOIN users sup ON sup.id = s.superior_user_id
 				 WHERE s.id = ?`,
 			)
 			.bind(body.id)
@@ -197,6 +248,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				reportsick_status: string;
 				superior_user_id: number | null;
 				superior_tid: string | null;
+				requester_dept: string | null;
 			}>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_case' }, { status: 403 });
@@ -240,13 +292,21 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.bind(row.id)
 			.run();
 
+		// Auto-fill the parade calendar with MC across the MC date range (working
+		// days only, capped to the calendar window, keeping the reported RSI/RSO
+		// half-day cell). Tell the user which dates the bot updated.
+		let mcDates: string[] = [];
+		if (body.num_of_mc_days >= 1 && startDate && endDate) {
+			mcDates = await setParadeForMc(env, row.user_id, row.requester_dept, startDate, endDate);
+		}
+
 		if (row.superior_tid) {
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.superior_tid,
 				text: `✅ ${user.full_name} updated their ${row.case_type}: ${updatedStatusSummary}`,
 			});
 		}
-		return json({ ok: true });
+		return json({ ok: true, mc_dates: mcDates });
 	}
 
 	// Requester cancels/undoes their OWN sick case in one step. Normally only a

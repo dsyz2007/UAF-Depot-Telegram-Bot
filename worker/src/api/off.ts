@@ -1,7 +1,53 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
-import { dayCountInclusive, autoApprovesOwn } from '../types';
+import { dayCountInclusive, autoApprovesOwn, periodsOverlap } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
+import { getRangeWorkInfo, slotWorking } from '../holidays';
+
+function expandRange(start: string, end: string): string[] {
+	const out: string[] = [];
+	const cur = new Date(`${start}T00:00:00Z`);
+	const stop = new Date(`${end}T00:00:00Z`);
+	while (cur <= stop && out.length < 95) {
+		out.push(cur.toISOString().slice(0, 10));
+		cur.setUTCDate(cur.getUTCDate() + 1);
+	}
+	return out;
+}
+
+// Paint the parade calendar OFF for an approved off — every working slot of the
+// off's period(s) in the range, for the requester's department. Idempotent
+// (upsert). This makes an off requested from the OFF PAGE show on the calendar
+// once it's approved; offs initiated from the parade calendar are already painted
+// at submit time, so re-painting them here is a harmless no-op.
+export async function setParadeForOff(
+	env: Env,
+	userId: number,
+	dept: string | null,
+	start: string,
+	end: string,
+	period: string,
+): Promise<void> {
+	const dates = expandRange(start, end);
+	const info = await getRangeWorkInfo(env, dates);
+	const periods: ('AM' | 'PM')[] = period === 'AM' || period === 'PM' ? [period] : ['AM', 'PM'];
+	const stmt = env.depot_db.prepare(
+		`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+		 VALUES (?, ?, ?, 'OFF', NULL)
+		 ON CONFLICT(user_id, parade_state_date, period)
+		 DO UPDATE SET parade_status = 'OFF', reason = NULL
+		   WHERE parade_state_entries.parade_status NOT IN ('RSI','RSO','MC')`,
+	);
+	const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+	for (const d of dates) {
+		const di = info.get(d);
+		if (!di) continue;
+		for (const p of periods) {
+			if (slotWorking(di, dept, p)) ops.push(stmt.bind(userId, d, p));
+		}
+	}
+	if (ops.length) await env.depot_db.batch(ops);
+}
 
 interface SummaryRow {
 	id: number;
@@ -130,18 +176,38 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	// -------- request off (uses credits) -----------------------------------
 	if (request.method === 'POST' && sub === '/request') {
 		const body = (await request.json()) as { startdate?: string; enddate?: string; reason?: string; period?: string };
-		if (!isValidDate(body.startdate) || !isValidDate(body.enddate) || !body.reason?.trim()) {
+		if (!isValidDate(body.startdate) || !isValidDate(body.enddate)) {
 			return json({ error: 'invalid_body' }, { status: 400 });
 		}
 		if (body.startdate > body.enddate) return json({ error: 'bad_range' }, { status: 400 });
 		// Guard against a fat-fingered year deducting thousands of credits.
 		if (dayCountInclusive(body.startdate, body.enddate) > 95) return json({ error: 'range_too_long' }, { status: 400 });
 
+		// Reason is OPTIONAL for an off request. (off_requests.reason is NOT NULL, so
+		// store '' when omitted.) Crediting off-days keeps its own compulsory reason.
+		const reason = body.reason?.trim() || '';
 		// Half-day (AM/PM) costs 0.5 credits per day; full day (FD) costs 1.
 		const period = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
 		const days = offDays(body.startdate, body.enddate, period);
 		const range = `${body.startdate} → ${body.enddate}`;
 		// Off-credit balance is allowed to go negative — no sufficiency block.
+
+		// Dedup: refuse if this user already has an overlapping pending/approved off
+		// for the same half/period. Prevents (a) an auto-approver nullifying a
+		// superior's revert by simply resubmitting (the reverted off is back to
+		// 'pending', so it blocks here), and (b) double-reserving credits / duplicate
+		// inbox items from an accidental re-request. A rejected/cancelled/reverted-
+		// then-cleared off is NOT in this set, so a denied request can be retried.
+		const { results: dupRows } = await env.depot_db
+			.prepare(
+				`SELECT id, period FROM off_requests
+				 WHERE user_id = ? AND off_status IN ('pending','approved')
+				   AND startdate <= ? AND enddate >= ?`,
+			)
+			.bind(user.id, body.enddate, body.startdate)
+			.all<{ id: number; period: string }>();
+		const clash = (dupRows ?? []).find((d) => periodsOverlap(d.period, period));
+		if (clash) return json({ error: 'overlapping_request', id: clash.id }, { status: 409 });
 
 		// Self-managed users and appointment-holders skip approval — the off is
 		// recorded as approved immediately and credits deducted.
@@ -153,9 +219,11 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 						   (user_id, requested_by_user_id, startdate, enddate, period, reason, off_status, approved_by, approved_date)
 						 VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, datetime('now'))`,
 					)
-					.bind(user.id, user.id, body.startdate, body.enddate, period, body.reason.trim(), user.id),
+					.bind(user.id, user.id, body.startdate, body.enddate, period, reason, user.id),
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id),
 			]);
+			// Auto-approved → reflect OFF on the parade calendar right away.
+			await setParadeForOff(env, user.id, user.department, body.startdate, body.enddate, period);
 			return json({ ok: true, auto_approved: true, days_requested: days, balance_after: user.off_credits - days });
 		}
 
@@ -166,7 +234,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				 VALUES (?, ?, ?, ?, ?, ?, 'pending')
 				 RETURNING id`,
 			)
-			.bind(user.id, user.id, body.startdate, body.enddate, period, body.reason.trim())
+			.bind(user.id, user.id, body.startdate, body.enddate, period, reason)
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
@@ -183,7 +251,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
-				text: `🟡 <b>Off request</b>\n${user.full_name}: ${range} (${days} day${days === 1 ? '' : 's'})${periodSuffix(period)}\nBalance (credits already reserved): ${user.off_credits - days}\nReason: ${body.reason}`,
+				text: `🟡 <b>Off request</b>\n${user.full_name}: ${range} (${days} day${days === 1 ? '' : 's'})${periodSuffix(period)}\nBalance (credits already reserved): ${user.off_credits - days}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
 					inline_keyboard: [
@@ -371,7 +439,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
 			.prepare(
-				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.approved_by,
+				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.period, o.approved_by,
 				        u.telegram_id AS requester_tid, u.full_name AS requester_name,
 				        u.department AS requester_dept, u.sub_department AS requester_sub,
 				        a.telegram_id AS approver_tid, a.full_name AS approver_name
@@ -387,6 +455,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				off_status: string;
 				startdate: string;
 				enddate: string;
+				period: string;
 				approved_by: number | null;
 				requester_tid: string;
 				requester_name: string;
@@ -414,7 +483,21 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.run();
 		if ((flipRevert.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
 
-		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again.`;
+		// Blank the OFF cells painted at approval so the reverted-pending off no longer
+		// LOOKS approved on the calendar (a merely-pending off-page off isn't painted;
+		// re-approval re-paints). Period-scoped, OFF-only.
+		const revHalfDay = row.period === 'AM' || row.period === 'PM';
+		await env.depot_db
+			.prepare(
+				revHalfDay
+					? `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF' AND period = ?`
+					: `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF'`,
+			)
+			.bind(...(revHalfDay ? [row.user_id, row.startdate, row.enddate, row.period] : [row.user_id, row.startdate, row.enddate]))
+			.run();
+
+		const revertDays = offDays(row.startdate, row.enddate, row.period);
+		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again. Your parade state for those days is blank until it's re-approved.\n\n🪙 ${revertDays} credit(s) are STILL RESERVED while it's pending. If you no longer want this off, CANCEL it on the Off page to get the credit(s) back.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {
 			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `↩ Off for ${row.requester_name} (${row.startdate} → ${row.enddate}) reverted to pending by ${user.full_name}.` }));

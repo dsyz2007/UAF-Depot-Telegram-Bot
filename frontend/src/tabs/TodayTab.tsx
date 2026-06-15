@@ -1,6 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { api, alertDialog, confirmDialog, deptLabel, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
+
+// Pill-style toggle used by the Pending page type filter.
+function chipStyle(active: boolean): CSSProperties {
+	return {
+		padding: '4px 10px',
+		borderRadius: 999,
+		fontSize: 12,
+		cursor: 'pointer',
+		border: '1px solid var(--tg-theme-section-separator-color, #ccc)',
+		background: active ? 'var(--depot-info, #0288d1)' : 'transparent',
+		color: active ? '#fff' : 'inherit',
+	};
+}
+type InboxTypeFilter = 'all' | 'off' | 'sick' | 'leave' | 'ma' | 'grant' | 'parade';
 
 const DEPT_ORDER: readonly string[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others', 'Unassigned'];
 interface HasDept { department: string | null; sub_department: string | null }
@@ -58,6 +72,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	// Normal users → their own requests; superadmins → all depts (that's where
 	// the units they're the fallback approver for live); appointment-holders → dept.
 	const [scope, setScope] = useState<InboxScope>(!canSeeOthers ? 'mine' : me.user_role === 'superadmin' ? 'all' : 'dept');
+	const [typeFilter, setTypeFilter] = useState<InboxTypeFilter>('all');
 	const [data, setData] = useState<ApprovalsPayload | null>(null);
 	const [busy, setBusy] = useState(false);
 
@@ -71,6 +86,24 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	// New requests arrive as Telegram DMs; sync the inbox when the superior
 	// returns to the app.
 	useFocusRefresh(refresh);
+	// If the selected type empties (e.g. after approving the last item of that
+	// type), fall back to All so remaining pending items don't get hidden.
+	useEffect(() => {
+		if (!data || typeFilter === 'all') return;
+		const c =
+			typeFilter === 'off'
+				? data.offs.length
+				: typeFilter === 'sick'
+					? data.sick.length
+					: typeFilter === 'grant'
+						? data.grants.length
+						: typeFilter === 'parade'
+							? data.parade.length
+							: typeFilter === 'ma'
+								? data.leave.filter((l) => l.leave_type === 'MA').length
+								: data.leave.filter((l) => l.leave_type !== 'MA').length;
+		if (c === 0) setTypeFilter('all');
+	}, [data, typeFilter]);
 
 	async function act(actions: ActionItem[], label: string) {
 		if (actions.length === 0) return;
@@ -99,6 +132,30 @@ function ApprovalsInbox({ me }: { me: Me }) {
 			? 'Nothing pending in your department. 🎉'
 			: 'Nothing pending anywhere. 🎉';
 
+	// Leave and MA share the leave_requests table but are filtered separately.
+	const leaveOnly = data.leave.filter((l) => l.leave_type !== 'MA');
+	const maItems = data.leave.filter((l) => l.leave_type === 'MA');
+	const counts: Record<Exclude<InboxTypeFilter, 'all'>, number> = {
+		off: data.offs.length,
+		sick: data.sick.length,
+		leave: leaveOnly.length,
+		ma: maItems.length,
+		grant: data.grants.length,
+		parade: data.parade.length,
+	};
+	const FILTERS: { key: Exclude<InboxTypeFilter, 'all'>; label: string }[] = [
+		{ key: 'off', label: 'Off' },
+		{ key: 'sick', label: 'Sick' },
+		{ key: 'leave', label: 'Leave' },
+		{ key: 'ma', label: 'MA' },
+		{ key: 'grant', label: 'Credit' },
+		{ key: 'parade', label: 'Parade' },
+	];
+	const available = FILTERS.filter((f) => counts[f.key] > 0);
+	const show = (k: Exclude<InboxTypeFilter, 'all'>) => typeFilter === 'all' || typeFilter === k;
+	// If the active filter's type emptied out (e.g. after a refresh), nothing renders.
+	const filterEmpty = total > 0 && typeFilter !== 'all' && counts[typeFilter] === 0;
+
 	return (
 		<div style={{ marginBottom: 18 }}>
 			<h3>{mineView ? `🗂 My pending requests (${total})` : `✅ Pending approvals (${total})`}</h3>
@@ -109,11 +166,23 @@ function ApprovalsInbox({ me }: { me: Me }) {
 					<button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}>All depts</button>
 				</div>
 			)}
+			{available.length > 1 && (
+				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+					<button style={chipStyle(typeFilter === 'all')} onClick={() => setTypeFilter('all')}>All ({total})</button>
+					{available.map((f) => (
+						<button key={f.key} style={chipStyle(typeFilter === f.key)} onClick={() => setTypeFilter(f.key)}>
+							{f.label} ({counts[f.key]})
+						</button>
+					))}
+				</div>
+			)}
 			{total === 0 ? (
 				<p className="muted">{emptyMsg}</p>
+			) : filterEmpty ? (
+				<p className="muted">Nothing of this type pending.</p>
 			) : (
 				<>
-					{data.offs.length > 0 && (
+					{data.offs.length > 0 && show('off') && (
 						<ApprovalGroup
 							title={`Off requests (${data.offs.length})`}
 							type="off"
@@ -130,7 +199,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 							}))}
 						/>
 					)}
-					{data.sick.length > 0 && (
+					{data.sick.length > 0 && show('sick') && (
 						<ApprovalGroup
 							title={`Sick — RSI/RSO (${data.sick.length})`}
 							type="sick"
@@ -147,7 +216,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 							}))}
 						/>
 					)}
-					{data.grants.length > 0 && (
+					{data.grants.length > 0 && show('grant') && (
 						<ApprovalGroup
 							title={`Off-credit grants (${data.grants.length})`}
 							type="grant"
@@ -164,7 +233,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 							}))}
 						/>
 					)}
-					{data.parade.length > 0 && (
+					{data.parade.length > 0 && show('parade') && (
 						<ApprovalGroup
 							title={`Late parade changes (${data.parade.length})`}
 							type="parade"
@@ -181,17 +250,34 @@ function ApprovalsInbox({ me }: { me: Me }) {
 							}))}
 						/>
 					)}
-					{data.leave.length > 0 && (
+					{leaveOnly.length > 0 && show('leave') && (
 						<ApprovalGroup
-							title={`Leave / MA requests (${data.leave.length})`}
+							title={`Leave requests (${leaveOnly.length})`}
 							type="leave"
 							chip="Leave"
 							busy={busy}
-							onApproveAll={() => act(data.leave.filter((l) => l.can_action).map((l) => ({ type: 'leave', id: l.id, action: 'approve' })), 'Approve all leave')}
-							rows={sortByDept(data.leave).map((l) => ({
+							onApproveAll={() => act(leaveOnly.filter((l) => l.can_action).map((l) => ({ type: 'leave', id: l.id, action: 'approve' })), 'Approve all leave')}
+							rows={sortByDept(leaveOnly).map((l) => ({
 								id: l.id,
 								canAct: l.can_action,
 								main: `${deptLabel(l.department, l.sub_department)} · ${l.full_name} · ${leaveLabel(l.leave_type, l.period)} · ${l.startdate === l.enddate ? l.startdate : `${l.startdate}→${l.enddate}`}`,
+								sub: l.reason ?? '',
+								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
+								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
+							}))}
+						/>
+					)}
+					{maItems.length > 0 && show('ma') && (
+						<ApprovalGroup
+							title={`MA (medical appointment) requests (${maItems.length})`}
+							type="leave"
+							chip="MA"
+							busy={busy}
+							onApproveAll={() => act(maItems.filter((l) => l.can_action).map((l) => ({ type: 'leave', id: l.id, action: 'approve' })), 'Approve all MA')}
+							rows={sortByDept(maItems).map((l) => ({
+								id: l.id,
+								canAct: l.can_action,
+								main: `${deptLabel(l.department, l.sub_department)} · ${l.full_name} · ${l.period && l.period !== 'FD' ? `${l.period} ` : ''}MA · ${l.startdate === l.enddate ? l.startdate : `${l.startdate}→${l.enddate}`}`,
 								sub: l.reason ?? '',
 								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
@@ -482,6 +568,11 @@ interface SickRow {
 	num_of_mc_days: number | null;
 	mc_start_date: string | null;
 	mc_end_date: string | null;
+	reason: string | null;
+	location: string | null;
+	approx_time: string | null;
+	updated_status: string | null;
+	approved_by_name: string | null;
 }
 
 interface TodayPayload {
@@ -566,12 +657,17 @@ export function TodayTab({ me }: { me: Me }) {
 													{s.case_type} · {s.reportsick_status.replace(/_/g, ' ')}
 												</span>
 											</div>
+											{s.reason && <div className="muted">Reason: {s.reason}</div>}
 											{s.num_of_mc_days != null && s.num_of_mc_days >= 1 && (
 												<div className="muted">
 													{s.num_of_mc_days} day(s) MC — {s.mc_start_date} → {s.mc_end_date}
 												</div>
 											)}
-											{s.approved_at && <div className="muted">Approved {s.approved_at}</div>}
+											{s.location && <div className="muted">Location: {s.location}</div>}
+											{s.approx_time && <div className="muted">Time: {s.approx_time}</div>}
+											{s.updated_status && <div className="muted">Update: {s.updated_status}</div>}
+											{s.approved_by_name && <div className="muted">Approved by {s.approved_by_name}{s.approved_at ? ` · ${s.approved_at}` : ''}</div>}
+											{!s.approved_by_name && s.approved_at && <div className="muted">Approved {s.approved_at}</div>}
 										</div>
 									))}
 								</div>

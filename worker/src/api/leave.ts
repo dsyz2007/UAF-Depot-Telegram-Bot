@@ -10,7 +10,7 @@
 
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
-import { autoApprovesOwn, isLeaveStatus } from '../types';
+import { autoApprovesOwn, isLeaveStatus, periodsOverlap } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
 
@@ -169,6 +169,22 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		const period: LeavePeriod = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
 		const range = rangeLabel(startdate, enddate);
 		const what = `${periodTag(period)} ${leaveType}`;
+
+		// Dedup: refuse if this user already has an overlapping pending/approved
+		// leave/MA for the same half/period. Stops an auto-approver from nullifying a
+		// superior's revert by resubmitting (the reverted leave is back to 'pending',
+		// so it blocks here) and prevents duplicate inbox entries. Rejected/cancelled
+		// leave is not in this set, so a denied request can still be retried.
+		const { results: dupRows } = await env.depot_db
+			.prepare(
+				`SELECT id, period FROM leave_requests
+				 WHERE user_id = ? AND status IN ('pending','approved')
+				   AND startdate <= ? AND enddate >= ?`,
+			)
+			.bind(user.id, enddate, startdate)
+			.all<{ id: number; period: string }>();
+		const clash = (dupRows ?? []).find((d) => periodsOverlap(d.period, period));
+		if (clash) return json({ error: 'overlapping_request', id: clash.id }, { status: 409 });
 
 		// Appointment-holders / self-managed auto-approve their own leave.
 		if (autoApprovesOwn(user)) {

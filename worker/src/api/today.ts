@@ -27,6 +27,11 @@ interface SickRow {
 	mc_start_date: string | null;
 	mc_end_date: string | null;
 	medicine_prescribed: string | null;
+	reason: string | null;
+	location: string | null;
+	approx_time: string | null;
+	updated_status: string | null;
+	approved_by_name: string | null;
 }
 
 export async function handleToday(actx: AuthedContext): Promise<Response> {
@@ -60,9 +65,11 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 		.prepare(
 			`SELECT s.id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.created_at,
 			        s.approved_at, s.num_of_mc_days, s.mc_start_date, s.mc_end_date,
-			        s.medicine_prescribed
+			        s.medicine_prescribed, s.reason, s.location, s.approx_time, s.updated_status,
+			        ab.full_name AS approved_by_name
 			 FROM sick_cases s
 			 JOIN users u ON u.id = s.user_id
+			 LEFT JOIN users ab ON ab.id = s.superior_user_id
 			 WHERE s.reportsick_status IN ('approved','updated','flagged')
 			   AND (s.mc_end_date IS NULL OR s.mc_end_date >= ?)
 			 ORDER BY s.created_at DESC`,

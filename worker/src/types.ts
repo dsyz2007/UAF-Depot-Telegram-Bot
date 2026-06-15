@@ -171,6 +171,12 @@ export function autoApprovesOwn(u: { self_managed?: number | boolean | null; app
 	return !!u.self_managed || !!u.appointment;
 }
 
+// Two period selections (FD / AM / PM) clash if either is full-day, or they're
+// the same half. Used to dedup overlapping off / leave requests.
+export function periodsOverlap(a: string, b: string): boolean {
+	return a === 'FD' || b === 'FD' || a === b;
+}
+
 export function dayCountInclusive(startdate: string, enddate: string): number {
 	const a = new Date(`${startdate}T00:00:00Z`).getTime();
 	const b = new Date(`${enddate}T00:00:00Z`).getTime();

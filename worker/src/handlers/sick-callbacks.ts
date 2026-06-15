@@ -5,6 +5,7 @@
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
 import { canApprove } from '../superiors';
+import { sgtToday } from '../holidays';
 
 interface SickRow {
 	id: number;
@@ -94,15 +95,19 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 			return;
 		}
 
-		// D1 supports batched prepared statements — one round-trip.
+		// D1 supports batched prepared statements — one round-trip. For a case dated
+		// later than today (reported for tomorrow), anchor the timers to 08:00 SGT of
+		// the sick day (= 00:00 UTC) so an evening approval doesn't flag the user the
+		// night before; a same-day case counts from approval ('now').
+		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} 00:00:00` : 'now';
 		const stmt = env.depot_db.prepare(
 			`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
-			 VALUES (?, 'sick_case', ?, datetime('now', ?), ?)`,
+			 VALUES (?, 'sick_case', ?, datetime(?, ?), ?)`,
 		);
 		await env.depot_db.batch([
-			stmt.bind(row.user_id, sickId, '+3 hours', 'sick_update_personnel'),
-			stmt.bind(row.user_id, sickId, '+6 hours', 'sick_update_personnel_2'),
-			stmt.bind(row.user_id, sickId, '+8 hours', 'sick_update_superior_flag'),
+			stmt.bind(row.user_id, sickId, anchor, '+3 hours', 'sick_update_personnel'),
+			stmt.bind(row.user_id, sickId, anchor, '+6 hours', 'sick_update_personnel_2'),
+			stmt.bind(row.user_id, sickId, anchor, '+8 hours', 'sick_update_superior_flag'),
 		]);
 
 		await ctx.editMessageText(`✅ ${row.personnel_name}'s ${row.case_type} approved by ${superior.full_name}.`);

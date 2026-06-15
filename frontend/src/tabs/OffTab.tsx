@@ -173,7 +173,7 @@ export function OffTab({
 		}
 	}
 	async function revertApproval(id: number) {
-		const ok = await confirmDialog('Revert this approval back to pending? Credits are returned until it is approved again.');
+		const ok = await confirmDialog('Revert this approval back to pending? Credits stay reserved while it awaits re-approval (refunded only if it is then rejected or cancelled).');
 		if (!ok) return;
 		try {
 			await api.post('/api/off/revert', { id });
@@ -391,7 +391,6 @@ function RequestOffModal({
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (!reason.trim()) hint = 'Reason is required.';
 
 	async function submit() {
 		setBusy(true);
@@ -406,7 +405,12 @@ function RequestOffModal({
 			);
 		} catch (e) {
 			setBusy(false);
-			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+			const msg = e instanceof Error ? e.message : String(e);
+			alertDialog(
+				msg.includes('overlapping_request')
+					? '⚠ You already have a pending or approved off that overlaps those dates — manage it in your list below instead of re-requesting.'
+					: `Failed: ${msg}`,
+			);
 		}
 	}
 
@@ -433,11 +437,11 @@ function RequestOffModal({
 						<button type="button" className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM only</button>
 					</div>
 				</label>
-				<label>Reason<textarea value={reason} onChange={(e) => setReason(e.target.value)} /></label>
+				<label>Reason <span className="muted">(optional)</span><textarea value={reason} onChange={(e) => setReason(e.target.value)} /></label>
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
 				<button
 					className="btn"
-					disabled={busy || !datesValid || !reason.trim()}
+					disabled={busy || !datesValid}
 					onClick={submit}
 				>
 					{busy ? 'Submitting…' : 'Submit'}
