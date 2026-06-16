@@ -73,7 +73,11 @@ export default function App() {
 				{tab === 'off' && (
 					<OffTab
 						me={me}
-						initialOff={routeAction?.kind === 'off' ? { start: routeAction.start, end: routeAction.end } : null}
+						initialOff={
+							routeAction?.kind === 'off'
+								? { start: routeAction.start, end: routeAction.end, period: routeAction.period, reason: routeAction.reason }
+								: null
+						}
 						onConsumed={() => setRouteAction(null)}
 					/>
 				)}

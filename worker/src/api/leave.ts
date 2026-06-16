@@ -228,12 +228,7 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 				text: `${leaveIcon(leaveType)} <b>${isMa(leaveType) ? 'Medical appointment (MA) request' : 'Leave request'}</b>\n${user.full_name}: ${what}\n${range}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
-					inline_keyboard: [
-						[
-							{ text: '✅ Approve', callback_data: `leave:approve:${ins.id}` },
-							{ text: '❌ Reject', callback_data: `leave:reject:${ins.id}` },
-						],
-					],
+					inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
 				},
 			});
 			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);

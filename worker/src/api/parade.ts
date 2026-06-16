@@ -18,6 +18,15 @@ const EXPORT_MAX_DAYS = 7;
 // pathological pull (a very large unit) from approaching the CPU cap. Above it we
 // refuse and ask them to narrow the range or pick one department.
 const EXPORT_MAX_ROWS = 7000;
+// Statuses that count as "present" for the export's green/red highlight (mirrors
+// the strength report's present-ish set: Present + the on-the-ground duties).
+// Everything else — OFF, MC, leave, sick, MA, Course, AO, Unfilled… — is red.
+const EXPORT_PRESENT = new Set<string>([
+	'Present',
+	'Incoming Opr', 'Outgoing Opr', 'Incoming ADS', 'Outgoing ADS',
+	'Incoming DS', 'Outgoing DS', 'Incoming DO', 'Outgoing DO',
+	'NTM Swap-In', 'NTM Swap-Out',
+]);
 
 // Sentinel "status" meaning: clear (delete) this period's entry so the day
 // reverts to the original empty/blank state. Not a real parade status.
@@ -149,18 +158,18 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		return json({ all: false, ids: [] as number[] });
 	}
 
-	// View ONE person's month forecast (admin/superadmin only), rate-limited per
-	// viewer per day: users cannot, admins 40/day, superadmins 300/day.
+	// View ONE person's forecast for the NEXT 30 DAYS (today inclusive onwards),
+	// admin/superadmin only, rate-limited per viewer per day: users cannot,
+	// admins 40/day, superadmins 500/day. (ym is accepted but ignored — the
+	// window is always today..today+29 SGT.)
 	if (request.method === 'GET' && sub === '/user-month') {
 		if (user.user_role !== 'admin' && user.user_role !== 'superadmin') {
 			return json({ error: 'forbidden' }, { status: 403 });
 		}
 		const targetId = Number(url.searchParams.get('user_id'));
-		const ym = url.searchParams.get('ym') ?? '';
 		if (!Number.isInteger(targetId)) return json({ error: 'bad_user' }, { status: 400 });
-		if (!/^\d{4}-\d{2}$/.test(ym)) return json({ error: 'bad_ym' }, { status: 400 });
 
-		const cap = user.user_role === 'superadmin' ? 300 : 40;
+		const cap = user.user_role === 'superadmin' ? 500 : 40;
 		const today = sgtToday();
 		const usedRow = await env.depot_db
 			.prepare(`SELECT count FROM forecast_views WHERE viewer_id = ? AND view_date = ?`)
@@ -181,15 +190,15 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			.bind(user.id, today)
 			.run();
 
-		const start = `${ym}-01`;
+		const windowEnd = sgtDateAddDays(today, 29); // today + next 29 days = 30 days inclusive
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT parade_state_date, period, parade_status, reason
 				 FROM parade_state_entries
-				 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date < date(?, '+1 month')
+				 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ?
 				 ORDER BY parade_state_date, period`,
 			)
-			.bind(targetId, start, start)
+			.bind(targetId, today, windowEnd)
 			.all<{ parade_state_date: string; period: 'AM' | 'PM'; parade_status: string; reason: string | null }>();
 		return json({ full_name: target.full_name, entries: results ?? [], cap, remaining: cap - used - 1 });
 	}
@@ -304,29 +313,45 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const skippedWeekends = notPast.length - dates.length;
 
 		// Compulsory backing for OFF (self-edits only): OFF needs an off request
-		// covering every OFF date. If it's missing we save NOTHING and tell the
-		// frontend to route the user to the Off page to apply first. (RSI/RSO was
-		// already stripped + routed to the Sick page above.)
-		if (editingSelf && dates.length > 0) {
-			if (clean.some((e) => e.status === 'OFF')) {
-				const { results: offReqs } = await env.depot_db
-					.prepare(
-						`SELECT startdate, enddate FROM off_requests
-						 WHERE user_id = ? AND off_status IN ('pending','approved')
-						   AND startdate <= ? AND enddate >= ?`,
-					)
-					.bind(user.id, body.enddate, body.startdate)
-					.all<{ startdate: string; enddate: string }>();
-				const covered = (d: string) => (offReqs ?? []).some((r) => r.startdate <= d && d <= r.enddate);
-				// Only require backing for dates where an OFF entry actually lands on a
-				// working slot (a per-department override can make one half non-working,
-				// in which case that OFF is skipped and needs no off request).
-				const needsBacking = (d: string) =>
-					clean.some((e) => e.status === 'OFF' && slotWorking(workInfo.get(d)!, targetDept, e.period));
-				const uncovered = dates.filter((d) => needsBacking(d) && !covered(d));
-				if (uncovered.length > 0) {
-					return json({ ok: true, applied: 0, pending: 0, skipped_weekends: skippedWeekends, skipped_past: skippedPast, blocked_off: true, uncovered_dates: uncovered });
+		// covering every OFF date. If some OFF date is unbacked we DON'T drop the
+		// whole submit — we strip the OFF entries (so any other half, e.g. Present,
+		// still saves in one shot) and route the user to the Off page to request the
+		// off. (RSI/RSO was already stripped + routed to the Sick page above.)
+		let routeOff = false;
+		let uncoveredDates: string[] = [];
+		let offRoutePeriod: 'FD' | 'AM' | 'PM' = 'FD';
+		if (editingSelf && dates.length > 0 && clean.some((e) => e.status === 'OFF')) {
+			const { results: offReqs } = await env.depot_db
+				.prepare(
+					`SELECT startdate, enddate FROM off_requests
+					 WHERE user_id = ? AND off_status IN ('pending','approved')
+					   AND startdate <= ? AND enddate >= ?`,
+				)
+				.bind(user.id, body.enddate, body.startdate)
+				.all<{ startdate: string; enddate: string }>();
+			const covered = (d: string) => (offReqs ?? []).some((r) => r.startdate <= d && d <= r.enddate);
+			// Only require backing for dates where an OFF entry actually lands on a
+			// working slot (a per-department override can make one half non-working,
+			// in which case that OFF is skipped and needs no off request).
+			const needsBacking = (d: string) =>
+				clean.some((e) => e.status === 'OFF' && slotWorking(workInfo.get(d)!, targetDept, e.period));
+			const uncovered = dates.filter((d) => needsBacking(d) && !covered(d));
+			if (uncovered.length > 0) {
+				// Which half-day(s) actually need an off request (working OFF slots on
+				// the uncovered dates) — so the Off form is pre-filled with the right
+				// period and doesn't over-charge when one half is a non-working override.
+				const periodsNeeded = new Set<'AM' | 'PM'>();
+				for (const d of uncovered) {
+					for (const e of clean) {
+						if (e.status === 'OFF' && (e.period === 'AM' || e.period === 'PM') && slotWorking(workInfo.get(d)!, targetDept, e.period)) {
+							periodsNeeded.add(e.period);
+						}
+					}
 				}
+				offRoutePeriod = periodsNeeded.size >= 2 ? 'FD' : periodsNeeded.has('PM') ? 'PM' : 'AM';
+				routeOff = true;
+				uncoveredDates = uncovered;
+				clean = clean.filter((e) => e.status !== 'OFF');
 			}
 		}
 
@@ -424,12 +449,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,
 					parse_mode: 'HTML',
 					reply_markup: {
-						inline_keyboard: [
-							[
-								{ text: '✅ Approve', callback_data: `paradechg:approve:${ins.id}` },
-								{ text: '❌ Reject', callback_data: `paradechg:reject:${ins.id}` },
-							],
-						],
+						inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
 					},
 				});
 				if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
@@ -486,6 +506,12 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			// saved (see `applied`), and the frontend routes the user to the Sick page
 			// to report the RSI/RSO.
 			blocked_sick: routeSick ?? undefined,
+			// Set when an unbacked OFF half was stripped: the rest was saved, and the
+			// frontend routes the user to the Off page to request the off (pre-filled
+			// with off_period — the half-day(s) that actually need backing).
+			blocked_off: routeOff || undefined,
+			uncovered_dates: routeOff ? uncoveredDates : undefined,
+			off_period: routeOff ? offRoutePeriod : undefined,
 			target_user_id: target.id,
 		});
 	}
@@ -555,41 +581,73 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			qbinds.push(dept);
 		}
 
-		type ExportRow = { full_name: string; department: string | null; parade_state_date: string; period: string; parade_status: string; reason: string | null };
-		const { results } = await env.depot_db
+		// All active people (filtered by dept) — so anyone who never submitted still
+		// appears, labelled "Unfilled". (No alias here, so a separate dept clause.)
+		let userDeptClause = '';
+		const ubinds: (string | number)[] = [];
+		if (dept === 'DSP') userDeptClause = ` AND department IN ('DSP','STG')`;
+		else if (dept) {
+			userDeptClause = ` AND department = ?`;
+			ubinds.push(dept);
+		}
+		const { results: userRows } = await env.depot_db
+			.prepare(`SELECT id, full_name, department FROM users WHERE full_name NOT LIKE 'PENDING:%'${userDeptClause} ORDER BY department, full_name`)
+			.bind(...ubinds)
+			.all<{ id: number; full_name: string; department: string | null }>();
+		const users = userRows ?? [];
+
+		// Their parade entries across the range.
+		const { results: entryRows } = await env.depot_db
 			.prepare(
-				`SELECT u.full_name, u.department, p.parade_state_date, p.period, p.parade_status, p.reason
-				 FROM parade_state_entries p
-				 JOIN users u ON u.id = p.user_id
-				 WHERE p.parade_state_date >= ? AND p.parade_state_date <= ?${deptClause}
-				 ORDER BY p.parade_state_date, u.department, u.full_name, p.period`,
+				`SELECT p.user_id, p.parade_state_date, p.period, p.parade_status
+				 FROM parade_state_entries p JOIN users u ON u.id = p.user_id
+				 WHERE p.parade_state_date >= ? AND p.parade_state_date <= ?
+				   AND u.full_name NOT LIKE 'PENDING:%'${deptClause}`,
 			)
 			.bind(...qbinds)
-			.all<ExportRow>();
-		const rows = results ?? [];
-		// Nothing to export — tell the caller so the UI can show a friendly note
-		// (don't send an empty file).
-		if (rows.length === 0) return json({ ok: true, rows: 0, sheets: 0 });
-		// Safety net: refuse an over-large pull rather than risk the CPU cap.
-		if (rows.length > EXPORT_MAX_ROWS) {
-			return json({ error: 'too_many_rows', rows: rows.length, max_rows: EXPORT_MAX_ROWS }, { status: 400 });
+			.all<{ user_id: number; parade_state_date: string; period: 'AM' | 'PM'; parade_status: string }>();
+		const entries = entryRows ?? [];
+		// Nothing submitted in the range — friendly note, no file (we only make a
+		// sheet for dates that have at least one submission).
+		if (entries.length === 0) return json({ ok: true, rows: 0, sheets: 0 });
+
+		// Pivot: byDate[date][user_id] = { AM?, PM? }.
+		const byDate = new Map<string, Map<number, { AM?: string; PM?: string }>>();
+		for (const e of entries) {
+			let perUser = byDate.get(e.parade_state_date);
+			if (!perUser) {
+				perUser = new Map();
+				byDate.set(e.parade_state_date, perUser);
+			}
+			const cur = perUser.get(e.user_id) ?? {};
+			cur[e.period] = e.parade_status;
+			perUser.set(e.user_id, cur);
+		}
+		const sheetDates = [...byDate.keys()].sort();
+
+		// Safety net: (dates with submissions) × (all people).
+		const totalRows = sheetDates.length * users.length;
+		if (totalRows > EXPORT_MAX_ROWS) {
+			return json({ error: 'too_many_rows', rows: totalRows, max_rows: EXPORT_MAX_ROWS }, { status: 400 });
 		}
 
-		// One worksheet per date that actually has entries (skips blank weekends),
-		// in chronological order.
-		const byDate = new Map<string, ExportRow[]>();
-		for (const r of rows) {
-			const arr = byDate.get(r.parade_state_date) ?? [];
-			arr.push(r);
-			byDate.set(r.parade_state_date, arr);
-		}
-
-		// One worksheet per date; header row + one row per (dept, name, period).
-		const header = ['Department', 'Name', 'Period', 'Status', 'Reason'];
-		const sheets = [...byDate.entries()].map(([date, sheetRows]) => ({
-			name: date, // YYYY-MM-DD — safe as a sheet name (<=31 chars, no special chars)
-			rows: [header, ...sheetRows.map((r) => [r.department ?? '', r.full_name, r.period, r.parade_status, r.reason ?? ''])],
-		}));
+		// One worksheet per date; one row per person with AM & PM side-by-side.
+		// Green = present-ish, red = everything else (incl. Unfilled). No reason
+		// column (kept lean / not data-overload).
+		const cellFor = (status: string | undefined): { v: string; s: number } => {
+			const v = status ?? 'Unfilled';
+			return { v, s: EXPORT_PRESENT.has(v) ? 1 : 2 };
+		};
+		const header = ['Department', 'Name', 'AM', 'PM'];
+		const sheets = sheetDates.map((date) => {
+			const perUser = byDate.get(date)!;
+			const rows: (string | { v: string; s: number })[][] = [header];
+			for (const u of users) {
+				const e = perUser.get(u.id);
+				rows.push([u.department ?? '', u.full_name, cellFor(e?.AM), cellFor(e?.PM)]);
+			}
+			return { name: date, rows };
+		});
 		const workbook = buildXlsx(sheets);
 
 		const rangeTag = start === end ? start : `${start}_to_${end}`;
@@ -599,11 +657,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			user.telegram_id,
 			`parade-state_${rangeTag}${deptTag}.xlsx`,
 			workbook,
-			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''} — ${byDate.size} date tab(s), ${rows.length} entries`,
+			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''} — ${sheets.length} date tab(s), ${users.length} people`,
 			'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 		);
 		if (!sent) return json({ error: 'send_failed' }, { status: 502 });
-		return json({ ok: true, rows: rows.length, sheets: byDate.size });
+		return json({ ok: true, rows: totalRows, sheets: sheets.length });
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });

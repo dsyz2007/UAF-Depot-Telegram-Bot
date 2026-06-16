@@ -88,7 +88,7 @@ export function OffTab({
 	onConsumed,
 }: {
 	me: Me;
-	initialOff?: { start: string; end: string } | null;
+	initialOff?: { start: string; end: string; period?: 'FD' | 'AM' | 'PM'; reason?: string } | null;
 	onConsumed?: () => void;
 }) {
 	const [summary, setSummary] = useState<SummaryRow[]>([]);
@@ -98,7 +98,7 @@ export function OffTab({
 	const [grants, setGrants] = useState<GrantRow[]>([]);
 	const [credits, setCredits] = useState<number>(me.off_credits);
 	const [showRequest, setShowRequest] = useState(false);
-	const [reqPrefill, setReqPrefill] = useState<{ start: string; end: string } | null>(null);
+	const [reqPrefill, setReqPrefill] = useState<{ start: string; end: string; period?: 'FD' | 'AM' | 'PM'; reason?: string } | null>(null);
 	const [showGive, setShowGive] = useState(false);
 	// Everyone's off library is hidden until explicitly shown (declutters the page).
 	const [showEveryone, setShowEveryone] = useState(false);
@@ -161,8 +161,12 @@ export function OffTab({
 		void Promise.all([loadMine(), loadGrants(), loadMyCredits()]);
 	});
 
-	async function cancelMine(id: number) {
-		const ok = await confirmDialog('Cancel this off request?');
+	async function cancelMine(id: number, approved: boolean) {
+		const ok = await confirmDialog(
+			approved
+				? 'Cancel this approved off? Your credits will be refunded and the superior who approved it will be told.'
+				: 'Cancel this off request? Your reserved credits will be refunded.',
+		);
 		if (!ok) return;
 		try {
 			await api.post('/api/off/cancel', { id });
@@ -248,7 +252,7 @@ export function OffTab({
 			</div>
 
 			<div className="actions" style={{ marginTop: 10 }}>
-				<button className="btn" onClick={() => setShowRequest(true)}>+ Request Off</button>
+				<button className="btn" onClick={() => setShowRequest(true)}>+ Take Off</button>
 				<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Credit Off(s)</button>
 			</div>
 
@@ -284,9 +288,9 @@ export function OffTab({
 									{m.approved_by_name && <span>✓ {m.approved_by_name}</span>}
 								</div>
 								{m.reason && <div className="entry-reason">{m.reason}</div>}
-								{m.off_status === 'pending' && (
+								{(m.off_status === 'pending' || m.off_status === 'approved') && (
 									<div className="entry-actions">
-										<button className="btn-link danger" onClick={() => cancelMine(m.id)}>🗑 Cancel</button>
+										<button className="btn-link danger" onClick={() => cancelMine(m.id, m.off_status === 'approved')}>🗑 Cancel</button>
 									</div>
 								)}
 							</div>
@@ -351,6 +355,8 @@ export function OffTab({
 					balance={credits}
 					initialStart={reqPrefill?.start}
 					initialEnd={reqPrefill?.end}
+					initialPeriod={reqPrefill?.period}
+					initialReason={reqPrefill?.reason}
 					onClose={() => {
 						setShowRequest(false);
 						setReqPrefill(null);
@@ -369,28 +375,34 @@ function RequestOffModal({
 	balance,
 	initialStart,
 	initialEnd,
+	initialPeriod,
+	initialReason,
 	onClose,
 	onDone,
 }: {
 	balance: number;
 	initialStart?: string;
 	initialEnd?: string;
+	initialPeriod?: 'FD' | 'AM' | 'PM';
+	initialReason?: string;
 	onClose: () => void;
 	onDone: () => Promise<void>;
 }) {
 	const [startdate, setStart] = useState(initialStart ?? '');
 	const [enddate, setEnd] = useState(initialEnd ?? '');
-	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>('FD');
-	const [reason, setReason] = useState('');
+	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>(initialPeriod ?? 'FD');
+	const [reason, setReason] = useState(initialReason ?? '');
 	const [busy, setBusy] = useState(false);
 
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
 	// A half-day (AM/PM) costs 0.5 credits per day; full day costs 1.
 	const creditDays = datesValid ? offDays(startdate, enddate, period) : 0;
-	// Balance may go negative — no sufficiency check at all.
+	// Balance can't go negative — a take-off can't cost more than you have.
+	const insufficient = creditDays > balance;
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
+	else if (insufficient) hint = `Not enough credits — this costs ${creditDays} but you have ${balance}.`;
 
 	async function submit() {
 		setBusy(true);
@@ -417,8 +429,8 @@ function RequestOffModal({
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3>Request Off</h3>
-				<div className="muted">Balance: 🪙 {balance} · This request: {creditDays} credit{creditDays === 1 ? '' : 's'}</div>
+				<h3>Take Off</h3>
+				<div className="muted">Balance: 🪙 {balance} · This take-off: {creditDays} credit{creditDays === 1 ? '' : 's'}</div>
 				<label>Start date<input
 					type="date"
 					value={startdate}
@@ -441,7 +453,7 @@ function RequestOffModal({
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
 				<button
 					className="btn"
-					disabled={busy || !datesValid}
+					disabled={busy || !datesValid || insufficient}
 					onClick={submit}
 				>
 					{busy ? 'Submitting…' : 'Submit'}

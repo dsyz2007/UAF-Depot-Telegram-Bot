@@ -60,7 +60,7 @@ export const DEPARTMENTS: readonly Department[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 
 // marks OFF / RSI / RSO without having applied, so App can switch to the Off /
 // Sick tab and open the matching apply form.
 export type RouteAction =
-	| { kind: 'off'; start: string; end: string }
+	| { kind: 'off'; start: string; end: string; period?: 'FD' | 'AM' | 'PM'; reason?: string }
 	| { kind: 'sick'; sickType: 'RSI' | 'RSO'; reason?: string };
 
 export type PersonnelType = 'NSF' | 'Regular';

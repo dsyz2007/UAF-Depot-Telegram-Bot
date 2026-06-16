@@ -58,10 +58,36 @@ function sanitizeSheetName(name: string, fallback: string): string {
 	return n || fallback;
 }
 
+// A cell is either a plain string (default style) or { v, s } where s is a
+// cellXfs index from STYLES_XML below: 1 = green fill, 2 = red fill.
+export type XlsxCell = string | { v: string; s: number };
 export interface XlsxSheet {
 	name: string;
-	rows: string[][]; // every row (caller includes its own header row first)
+	rows: XlsxCell[][]; // every row (caller includes its own header row first)
 }
+
+// Styles part: 3 cell formats — 0 default (no fill), 1 green fill, 2 red fill.
+// Standard Excel "Good"/"Bad" pastel fills. fills index 0/1 are reserved by
+// convention (none + gray125), so green/red are fills 2/3, referenced by cellXfs.
+const STYLES_XML =
+	`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+	`<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+	`<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>` +
+	`<fills count="4">` +
+	`<fill><patternFill patternType="none"/></fill>` +
+	`<fill><patternFill patternType="gray125"/></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>` +
+	`</fills>` +
+	`<borders count="1"><border/></borders>` +
+	`<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+	`<cellXfs count="3">` +
+	`<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+	`<xf numFmtId="0" fontId="0" fillId="2" borderId="0" xfId="0" applyFill="1"/>` +
+	`<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1"/>` +
+	`</cellXfs>` +
+	`<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>` +
+	`</styleSheet>`;
 
 // Cell `r` references (A1/B1…) are OPTIONAL in OOXML — Excel and openpyxl infer
 // position from order — so we omit them (no per-cell colRef work, smaller XML).
@@ -73,7 +99,12 @@ function sheetXml(sheet: XlsxSheet): string {
 		const cells = sheet.rows[r];
 		let cs = '';
 		for (let c = 0; c < cells.length; c++) {
-			cs += `<c t="inlineStr"><is><t>${xmlEscape(cells[c])}</t></is></c>`;
+			const cell = cells[c];
+			if (typeof cell === 'string') {
+				cs += `<c t="inlineStr"><is><t>${xmlEscape(cell)}</t></is></c>`;
+			} else {
+				cs += `<c t="inlineStr" s="${cell.s}"><is><t>${xmlEscape(cell.v)}</t></is></c>`;
+			}
 		}
 		rows += `<row r="${r + 1}">${cs}</row>`;
 	}
@@ -152,7 +183,7 @@ export function buildXlsx(sheetsIn: XlsxSheet[]): Uint8Array {
 		.join('');
 	add(
 		'[Content_Types].xml',
-		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${overrides}</Types>`,
+		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${overrides}</Types>`,
 	);
 	add(
 		'_rels/.rels',
@@ -163,13 +194,15 @@ export function buildXlsx(sheetsIn: XlsxSheet[]): Uint8Array {
 		'xl/workbook.xml',
 		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheetTags}</sheets></workbook>`,
 	);
-	const rels = sheets
+	const sheetRels = sheets
 		.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`)
 		.join('');
+	const stylesRel = `<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`;
 	add(
 		'xl/_rels/workbook.xml.rels',
-		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels}</Relationships>`,
+		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheetRels}${stylesRel}</Relationships>`,
 	);
+	add('xl/styles.xml', STYLES_XML);
 	sheets.forEach((s, i) => add(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s)));
 
 	return zipStore(files);

@@ -190,12 +190,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				text: `🟡 <b>${body.case_type}</b> request from ${user.full_name}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
-					inline_keyboard: [
-						[
-							{ text: '✅ Approve', callback_data: `sick:approve:${ins.id}` },
-							{ text: '❌ Reject', callback_data: `sick:reject:${ins.id}` },
-						],
-					],
+					inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
 				},
 			});
 			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);

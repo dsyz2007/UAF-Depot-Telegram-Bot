@@ -209,6 +209,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const clash = (dupRows ?? []).find((d) => periodsOverlap(d.period, period));
 		if (clash) return json({ error: 'overlapping_request', id: clash.id }, { status: 409 });
 
+		// No negative balances: a take-off can't cost more credits than the person
+		// currently has (credits are reserved at request time). This also prevents
+		// painting OFF on the parade calendar for an unaffordable range — the parade
+		// OFF needs this backing request, which we're refusing here.
+		if (days > user.off_credits) {
+			return json({ error: 'insufficient_credits', balance: user.off_credits, needed: days }, { status: 409 });
+		}
+
 		// Self-managed users and appointment-holders skip approval — the off is
 		// recorded as approved immediately and credits deducted.
 		if (autoApprovesOwn(user)) {
@@ -253,15 +261,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				chat_id: tid,
 				text: `🟡 <b>Off request</b>\n${user.full_name}: ${range} (${days} day${days === 1 ? '' : 's'})${periodSuffix(period)}\nBalance (credits already reserved): ${user.off_credits - days}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
-				reply_markup: {
-					inline_keyboard: [
-						[
-							{ text: '✅ Approve', callback_data: `off:approve:${ins.id}` },
-							{ text: '❌ Reject', callback_data: `off:reject:${ins.id}` },
-						],
-						[{ text: '📅 Open Off page', web_app: { url: `${env.WEBAPP_URL}?tab=off` } }],
-					],
-				},
+				// Approvals happen in the app (the Pending page), not via chat buttons.
+				reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
 			});
 			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
 		}
@@ -367,14 +368,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				chat_id: tid,
 				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${days} day(s)\nReason: ${reason}`,
 				parse_mode: 'HTML',
-				reply_markup: {
-					inline_keyboard: [
-						[
-							{ text: '✅ Approve', callback_data: `grant:approve:${ins.id}` },
-							{ text: '❌ Reject', callback_data: `grant:reject:${ins.id}` },
-						],
-					],
-				},
+				// Approvals happen in the app (the Pending page), not via chat buttons.
+				reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
 			});
 			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
 		}
@@ -396,40 +391,68 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, id: ins.id, recipient_name: staff.full_name });
 	}
 
-	// -------- cancel own pending request ---------------------------------
+	// -------- cancel own off (pending OR approved) — no superior needed -------
+	// The requester may cancel their own off at any point (pending or already
+	// approved); credits are refunded and the OFF calendar cells blanked. If it
+	// was already approved, the superior who approved it is informed.
 	if (request.method === 'POST' && sub === '/cancel') {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
 			.prepare(
-				`SELECT id, user_id, off_status, startdate, enddate, period FROM off_requests WHERE id = ?`,
+				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.period, o.approved_by,
+				        a.telegram_id AS approver_tid, a.full_name AS approver_name
+				 FROM off_requests o LEFT JOIN users a ON a.id = o.approved_by WHERE o.id = ?`,
 			)
 			.bind(body.id)
-			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string }>();
+			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string; approved_by: number | null; approver_tid: string | null; approver_name: string | null }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
-		if (row.off_status !== 'pending') return json({ error: 'not_pending' }, { status: 409 });
+		if (row.off_status !== 'pending' && row.off_status !== 'approved') {
+			return json({ error: 'not_cancellable', state: row.off_status }, { status: 409 });
+		}
+		const wasApproved = row.off_status === 'approved';
 
-		// Refund the credits reserved at request time (matching the half/full-day rate).
+		// Refund the credits (reserved at request time; still reserved while approved).
 		const refundDays = offDays(row.startdate, row.enddate, row.period);
-		// Atomic flip so a cancel racing with a reject can't double-refund.
+		// Atomic flip so a cancel racing with a reject/revert can't double-refund.
 		const flip = await env.depot_db
-			.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND off_status = 'pending'`)
+			.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND off_status IN ('pending','approved')`)
 			.bind(user.id, body.id)
 			.run();
-		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_pending' }, { status: 409 });
+		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_cancellable' }, { status: 409 });
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(refundDays, row.user_id).run();
+		// Blank the OFF parade cells for the range (period-scoped) — a cancelled off
+		// isn't off any more.
+		const halfDay = row.period === 'AM' || row.period === 'PM';
+		await env.depot_db
+			.prepare(
+				halfDay
+					? `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF' AND period = ?`
+					: `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF'`,
+			)
+			.bind(...(halfDay ? [row.user_id, row.startdate, row.enddate, row.period] : [row.user_id, row.startdate, row.enddate]))
+			.run();
 
-		const approverTids = await approverTidsFor(env, user);
-		await Promise.allSettled(
-			approverTids.map((tid) =>
-				tgSendMessage(env.BOT_TOKEN, {
-					chat_id: tid,
-					text: `🚫 ${user.full_name} cancelled their off request (${row.startdate} → ${row.enddate}).`,
-				}),
-			),
-		);
-		return json({ ok: true });
+		const range = `${row.startdate} → ${row.enddate}`;
+		if (wasApproved) {
+			// Inform the superior who approved it (unless that was the requester).
+			if (row.approver_tid && row.approver_tid !== user.telegram_id) {
+				await tgSendMessage(env.BOT_TOKEN, {
+					chat_id: row.approver_tid,
+					text: `🚫 ${user.full_name} cancelled their off (${range}) that you approved. 🪙 ${refundDays} credit(s) refunded to them.`,
+				});
+			}
+		} else {
+			// Still pending — let the unit's approvers know it's off their inbox.
+			const approverTids = await approverTidsFor(env, user);
+			await Promise.allSettled(
+				approverTids.map((tid) =>
+					tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text: `🚫 ${user.full_name} cancelled their off request (${range}).` }),
+				),
+			);
+		}
+		return json({ ok: true, refunded: refundDays });
 	}
 
 	// -------- revert an approved off (refund credits) --------------------

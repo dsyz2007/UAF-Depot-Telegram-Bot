@@ -373,6 +373,7 @@ function RecentApprovals({ me }: { me: Me }) {
 	// every unit (and may have no department of their own) → default all-depts;
 	// appointment-holders default to their department.
 	const [scope, setScope] = useState<RecentScope>(!canSeeOthers ? 'mine' : me.user_role === 'superadmin' ? 'all' : 'dept');
+	const [recentType, setRecentType] = useState<'all' | 'off' | 'grant' | 'leave' | 'ma' | 'sick'>('all');
 	const [data, setData] = useState<RecentPayload | null>(null);
 	const [busy, setBusy] = useState(false);
 
@@ -384,6 +385,19 @@ function RecentApprovals({ me }: { me: Me }) {
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [status, scope]);
 	useFocusRefresh(refresh);
+	// If the selected type empties (e.g. after switching status/scope), fall back to All.
+	useEffect(() => {
+		if (!data || recentType === 'all') return;
+		const maN = data.leave.filter((l) => l.leave_type === 'MA').length;
+		const leaveN = data.leave.length - maN;
+		const c =
+			recentType === 'off' ? data.offs.length
+				: recentType === 'grant' ? data.grants.length
+					: recentType === 'sick' ? data.sick.length
+						: recentType === 'ma' ? maN
+							: leaveN;
+		if (c === 0) setRecentType('all');
+	}, [data, recentType]);
 
 	const isRejected = status === 'rejected';
 	const actorLabel = isRejected ? 'Rejected by' : 'Approved by';
@@ -433,7 +447,29 @@ function RecentApprovals({ me }: { me: Me }) {
 			<span className="muted" style={{ fontSize: 12 }}>view only</span>
 		);
 
-	const empty = data.offs.length + data.sick.length + data.grants.length + data.leave.length === 0;
+	// Type filter (Leave and MA shown separately — they are different types).
+	const leaveOnly = data.leave.filter((l) => l.leave_type !== 'MA');
+	const maItems = data.leave.filter((l) => l.leave_type === 'MA');
+	type RT = 'off' | 'grant' | 'leave' | 'ma' | 'sick';
+	const rCounts: Record<RT, number> = {
+		off: data.offs.length,
+		grant: data.grants.length,
+		leave: leaveOnly.length,
+		ma: maItems.length,
+		sick: data.sick.length,
+	};
+	const RFILTERS: { key: RT; label: string }[] = [
+		{ key: 'off', label: 'Take Off' },
+		{ key: 'sick', label: 'Sick' },
+		{ key: 'leave', label: 'Leave' },
+		{ key: 'ma', label: 'MA' },
+		{ key: 'grant', label: 'Credit' },
+	];
+	const rAvailable = RFILTERS.filter((f) => rCounts[f.key] > 0);
+	const showT = (k: RT) => recentType === 'all' || recentType === k;
+	const total = data.offs.length + data.sick.length + data.grants.length + data.leave.length;
+	const empty = total === 0;
+	const filterEmpty = !empty && recentType !== 'all' && rCounts[recentType] === 0;
 
 	const whoText =
 		scope === 'mine'
@@ -459,6 +495,16 @@ function RecentApprovals({ me }: { me: Me }) {
 					<button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}>All depts</button>
 				</div>
 			)}
+			{rAvailable.length > 1 && (
+				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+					<button style={chipStyle(recentType === 'all')} onClick={() => setRecentType('all')}>All ({total})</button>
+					{rAvailable.map((f) => (
+						<button key={f.key} style={chipStyle(recentType === f.key)} onClick={() => setRecentType(f.key)}>
+							{f.label} ({rCounts[f.key]})
+						</button>
+					))}
+				</div>
+			)}
 			<p className="muted" style={{ marginTop: -2 }}>
 				{isRejected ? 'Rejections' : 'Approvals'} in the last 14 days{whoText}.
 				{' '}
@@ -475,9 +521,11 @@ function RecentApprovals({ me }: { me: Me }) {
 						? `You have no ${isRejected ? 'rejected' : 'approved'} requests in the last 14 days.`
 						: `No ${isRejected ? 'rejections' : 'approvals'} match this view.`}
 				</p>
+			) : filterEmpty ? (
+				<p className="muted">Nothing of this type in this view.</p>
 			) : (
 				<>
-					{data.offs.map((o) => (
+					{showT('off') && data.offs.map((o) => (
 						<div key={`o${o.id}`} className="entry-card acc-off">
 							<div className="entry-head">
 								<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -492,7 +540,7 @@ function RecentApprovals({ me }: { me: Me }) {
 							<FieldLine label={actorLabel} value={o.approved_by_name} />
 						</div>
 					))}
-					{data.sick.map((s) => (
+					{showT('sick') && data.sick.map((s) => (
 						<div key={`s${s.id}`} className="entry-card acc-sick">
 							<div className="entry-head">
 								<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -509,7 +557,7 @@ function RecentApprovals({ me }: { me: Me }) {
 							<FieldLine label={actorLabel} value={s.approved_by_name} />
 						</div>
 					))}
-					{data.grants.map((g) => (
+					{showT('grant') && data.grants.map((g) => (
 						<div key={`g${g.id}`} className="entry-card acc-grant">
 							<div className="entry-head">
 								<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -523,16 +571,31 @@ function RecentApprovals({ me }: { me: Me }) {
 							<FieldLine label={actorLabel} value={g.approved_by_name} />
 						</div>
 					))}
-					{data.leave.map((l) => (
+					{showT('leave') && leaveOnly.map((l) => (
 						<div key={`l${l.id}`} className="entry-card acc-leave">
 							<div className="entry-head">
 								<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-									<span className="type-chip leave">{l.leave_type === 'MA' ? 'MA' : 'Leave'}</span>
+									<span className="type-chip leave">Leave</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{l.full_name}</span>
 								</span>
-								{undoBtn('leave', l.id, l.leave_type === 'MA' ? 'MA request' : 'leave', l.can_undo)}
+								{undoBtn('leave', l.id, 'leave', l.can_undo)}
 							</div>
 							<FieldLine label="Type" value={leaveLabel(l.leave_type, l.period)} />
+							<FieldLine label="Dates" value={l.startdate === l.enddate ? l.startdate : `${l.startdate} → ${l.enddate}`} />
+							<FieldLine label="Reason" value={l.reason} />
+							<FieldLine label={actorLabel} value={l.approved_by_name} />
+						</div>
+					))}
+					{showT('ma') && maItems.map((l) => (
+						<div key={`l${l.id}`} className="entry-card acc-leave">
+							<div className="entry-head">
+								<span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+									<span className="type-chip leave">MA</span>
+									<span className="entry-title" style={{ fontSize: 14 }}>{l.full_name}</span>
+								</span>
+								{undoBtn('leave', l.id, 'MA request', l.can_undo)}
+							</div>
+							<FieldLine label="Type" value={l.period && l.period !== 'FD' ? `${l.period} MA` : 'MA'} />
 							<FieldLine label="Dates" value={l.startdate === l.enddate ? l.startdate : `${l.startdate} → ${l.enddate}`} />
 							<FieldLine label="Reason" value={l.reason} />
 							<FieldLine label={actorLabel} value={l.approved_by_name} />
@@ -584,97 +647,110 @@ interface TodayPayload {
 }
 
 export function TodayTab({ me }: { me: Me }) {
-	// The /api/today dashboard (who's on off / open sick cases unit-wide) is
-	// approver-only (403 for normal users), so only approvers fetch it. Normal
-	// users still get the page — their own pending + processed requests below.
+	// Three switchable views (one at a time, so the page doesn't grow into one long
+	// scroll): Pending approvals (default), Recent (processed), and Active Today.
+	// "Active Today" (/api/today: who's on off / open sick unit-wide) is approver-
+	// only, so normal users only get Pending + Recent (their own requests).
 	const canSeeOthers = me.is_approver;
+	const [view, setView] = useState<'pending' | 'recent' | 'active'>('pending');
 	const [data, setData] = useState<TodayPayload | null>(null);
 	const [error, setError] = useState<string | null>(null);
 
 	function loadToday() {
 		if (!canSeeOthers) return Promise.resolve();
+		setError(null);
 		return api
 			.get<TodayPayload>('/api/today')
 			.then(setData)
 			.catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
 	}
+	// Fetch Active Today lazily — only when that view is opened.
 	useEffect(() => {
-		loadToday();
+		if (view === 'active') loadToday();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, []);
-	useFocusRefresh(loadToday);
+	}, [view]);
+	useFocusRefresh(() => (view === 'active' ? loadToday() : Promise.resolve()));
 
 	return (
 		<div>
-			<ApprovalsInbox me={me} />
-			<RecentApprovals me={me} />
+			<div className="seg" style={{ marginBottom: 12 }}>
+				<button className={view === 'pending' ? 'active' : ''} onClick={() => setView('pending')}>🗂 Pending</button>
+				<button className={view === 'recent' ? 'active' : ''} onClick={() => setView('recent')}>↩ Recent</button>
+				{canSeeOthers && (
+					<button className={view === 'active' ? 'active' : ''} onClick={() => setView('active')}>📊 Active Today</button>
+				)}
+			</div>
 
-			{canSeeOthers && error && (
-				<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
-					<h3>⚠ Couldn't load today</h3>
-					<p className="muted">{error}</p>
-				</div>
-			)}
+			{view === 'pending' && <ApprovalsInbox me={me} />}
+			{view === 'recent' && <RecentApprovals me={me} />}
 
-			{canSeeOthers && !error && data && (
-				<>
-					<h3>📊 Today — {data.today}</h3>
+			{view === 'active' && canSeeOthers && (
+				error ? (
+					<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
+						<h3>⚠ Couldn't load Active Today</h3>
+						<p className="muted">{error}</p>
+					</div>
+				) : !data ? (
+					<div className="muted">Loading…</div>
+				) : (
+					<>
+						<h3>📊 Active Today — {data.today}</h3>
 
-					<Section title={`On Off (${data.offs_today.length})`} accent="success">
-						{data.offs_today.length === 0 ? (
-							<p className="muted">Nobody on approved off today.</p>
-						) : (
-							groupByDept(data.offs_today).map(([dept, rows]) => (
-								<div key={dept}>
-									<h5 className="section-title" style={{ margin: '8px 0 4px' }}>{dept} ({rows.length})</h5>
-									{rows.map((o) => (
-										<div key={o.id} className="card">
-											<div className="card-row">
-												<b>{o.full_name}</b>
-												<span className="muted">{rangeOrSingle(o.startdate, o.enddate)}</span>
-											</div>
-											<div className="muted">{o.reason}</div>
-											{o.approved_by_name && <div className="muted">Approved by {o.approved_by_name}</div>}
-										</div>
-									))}
-								</div>
-							))
-						)}
-					</Section>
-
-					<Section title={`Open Sick Cases (${data.sick_open.length})`} accent="danger">
-						{data.sick_open.length === 0 ? (
-							<p className="muted">No open RSI/RSO cases.</p>
-						) : (
-							groupByDept(data.sick_open).map(([dept, rows]) => (
-								<div key={dept}>
-									<h5 className="section-title" style={{ margin: '8px 0 4px' }}>{dept} ({rows.length})</h5>
-									{rows.map((s) => (
-										<div key={s.id} className="card">
-											<div className="card-row">
-												<b>{s.full_name}</b>
-												<span className={`badge status-${s.reportsick_status}`}>
-													{s.case_type} · {s.reportsick_status.replace(/_/g, ' ')}
-												</span>
-											</div>
-											{s.reason && <div className="muted">Reason: {s.reason}</div>}
-											{s.num_of_mc_days != null && s.num_of_mc_days >= 1 && (
-												<div className="muted">
-													{s.num_of_mc_days} day(s) MC — {s.mc_start_date} → {s.mc_end_date}
+						<Section title={`On Off (${data.offs_today.length})`} accent="success">
+							{data.offs_today.length === 0 ? (
+								<p className="muted">Nobody on approved off today.</p>
+							) : (
+								groupByDept(data.offs_today).map(([dept, rows]) => (
+									<div key={dept}>
+										<h5 className="section-title" style={{ margin: '8px 0 4px' }}>{dept} ({rows.length})</h5>
+										{rows.map((o) => (
+											<div key={o.id} className="card">
+												<div className="card-row">
+													<b>{o.full_name}</b>
+													<span className="muted">{rangeOrSingle(o.startdate, o.enddate)}</span>
 												</div>
-											)}
-											{s.location && <div className="muted">Location: {s.location}</div>}
-											{s.approx_time && <div className="muted">Time: {s.approx_time}</div>}
-											{s.updated_status && <div className="muted">Update: {s.updated_status}</div>}
-											{s.approved_by_name && <div className="muted">Approved by {s.approved_by_name}{s.approved_at ? ` · ${s.approved_at}` : ''}</div>}
-											{!s.approved_by_name && s.approved_at && <div className="muted">Approved {s.approved_at}</div>}
-										</div>
-									))}
-								</div>
-							))
-						)}
-					</Section>
-				</>
+												<div className="muted">{o.reason}</div>
+												{o.approved_by_name && <div className="muted">Approved by {o.approved_by_name}</div>}
+											</div>
+										))}
+									</div>
+								))
+							)}
+						</Section>
+
+						<Section title={`Open Sick Cases (${data.sick_open.length})`} accent="danger">
+							{data.sick_open.length === 0 ? (
+								<p className="muted">No open RSI/RSO cases.</p>
+							) : (
+								groupByDept(data.sick_open).map(([dept, rows]) => (
+									<div key={dept}>
+										<h5 className="section-title" style={{ margin: '8px 0 4px' }}>{dept} ({rows.length})</h5>
+										{rows.map((s) => (
+											<div key={s.id} className="card">
+												<div className="card-row">
+													<b>{s.full_name}</b>
+													<span className={`badge status-${s.reportsick_status}`}>
+														{s.case_type} · {s.reportsick_status.replace(/_/g, ' ')}
+													</span>
+												</div>
+												{s.reason && <div className="muted">Reason: {s.reason}</div>}
+												{s.num_of_mc_days != null && s.num_of_mc_days >= 1 && (
+													<div className="muted">
+														{s.num_of_mc_days} day(s) MC — {s.mc_start_date} → {s.mc_end_date}
+													</div>
+												)}
+												{s.location && <div className="muted">Location: {s.location}</div>}
+												{s.approx_time && <div className="muted">Time: {s.approx_time}</div>}
+												{s.approved_by_name && <div className="muted">Approved by {s.approved_by_name}{s.approved_at ? ` · ${s.approved_at}` : ''}</div>}
+												{!s.approved_by_name && s.approved_at && <div className="muted">Approved {s.approved_at}</div>}
+											</div>
+										))}
+									</div>
+								))
+							)}
+						</Section>
+					</>
+				)
 			)}
 		</div>
 	);

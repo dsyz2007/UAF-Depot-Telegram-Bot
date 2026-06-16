@@ -652,7 +652,7 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 											<button
 												className="btn-link"
 												style={{ marginLeft: 4 }}
-												title="View this person's month forecast"
+												title="View this person's next-30-days forecast"
 												onClick={() => setForecastTarget({ id: u.id, name: u.full_name })}
 											>
 												📅
@@ -846,9 +846,27 @@ function SubmitModal({
 		if (!canSave) return;
 		setBusy(true);
 		try {
-			// Leave (LL/OL/Leave Others) goes through the dedicated approval flow,
-			// not the parade calendar write.
+			// Leave / MA (LL/OL/Leave Others/MA) goes through the dedicated approval
+			// flow, not the parade calendar write.
 			if (isLeaveRequest && leaveSel) {
+				// One-shot: save any NON-routed, no-approval half submitted alongside
+				// (e.g. PM=Present) via the normal parade write so the user doesn't have
+				// to submit twice. OFF/RSI/RSO are EXCLUDED — they need their own
+				// backing/routing (the worker would just strip them here, silently), so
+				// we don't pre-save them and instead warn the user to do that half
+				// separately on the Off/Sick page.
+				const NEEDS_OWN_FLOW = new Set(['OFF', 'RSI', 'RSO']);
+				const nonRouted = entries.filter((e) => !APPROVAL_ROUTED_SET.has(e.status) && !NEEDS_OWN_FLOW.has(e.status));
+				const droppedOther = entries.some((e) => NEEDS_OWN_FLOW.has(e.status));
+				let savedOther = false;
+				if (nonRouted.length > 0) {
+					try {
+						const pr = await api.post<{ applied: number }>('/api/parade/submit', { startdate, enddate, entries: nonRouted });
+						savedOther = (pr.applied ?? 0) > 0;
+					} catch {
+						// Non-fatal — the leave request still proceeds.
+					}
+				}
 				const lres = await api.post<{ auto_approved?: boolean }>('/api/leave/request', {
 					leave_type: leaveSel.type,
 					period: leaveSel.period,
@@ -860,17 +878,20 @@ function SubmitModal({
 				onClose();
 				const lrange = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
 				const half = leaveSel.period === 'FD' ? 'full-day' : `${leaveSel.period} half-day`;
+				const otherNote =
+					(savedOther ? '\n\n(Your other half-day status was also saved.)' : '') +
+					(droppedOther ? '\n\n⚠ An OFF / RSI / RSO half can’t be set together with leave — set that half separately on the Off / Sick page.' : '');
 				if (isMaRequest) {
 					alertDialog(
-						lres.auto_approved
+						(lres.auto_approved
 							? `🩺 ${half} MA applied for ${lrange} (no approval needed).`
-							: `🩺 Your ${half} MA (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.`,
+							: `🩺 Your ${half} MA (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.`) + otherNote,
 					);
 				} else {
 					alertDialog(
-						lres.auto_approved
+						(lres.auto_approved
 							? `✅ ${half} ${leaveSel.type} leave applied for ${lrange} (no approval needed).\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`
-							: `🏝️ Your ${half} ${leaveSel.type} leave (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`,
+							: `🏝️ Your ${half} ${leaveSel.type} leave (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`) + otherNote,
 					);
 				}
 				return;
@@ -884,15 +905,25 @@ function SubmitModal({
 				skipped_past?: number;
 				blocked_off?: boolean;
 				blocked_sick?: 'RSI' | 'RSO' | null;
+				off_period?: 'FD' | 'AM' | 'PM';
 			}>('/api/parade/submit', payload);
 			await onDone();
 			onClose();
-			// COMPULSORY backing: OFF / RSI / RSO weren't saved because there's no
-			// matching application yet — route to the apply form first. (Self only;
-			// staff edits never block.) Navigate first, then alert.
+			// COMPULSORY backing: an OFF / RSI / RSO half had no matching application
+			// yet, so it was stripped — any OTHER half was still saved (res.applied).
+			// Route to the apply form (pre-filled). (Self only; staff edits never block.)
 			if (!target && res.blocked_off) {
-				onRoute({ kind: 'off', start: startdate, end: enddate });
-				alertDialog(`⚠ Your OFF was NOT saved — you must request these dates off first. Opening the Off page; submit the request, then set OFF again.`);
+				// Derive the off period (FD if both halves OFF, else the one half) and
+				// carry the reason so the Off form is pre-filled.
+				// Prefer the worker's computed period (accounts for per-dept overrides that
+				// make one half non-working); fall back to deriving from the submitted halves.
+				const amOff = entries.some((e) => e.period === 'AM' && e.status === 'OFF');
+				const pmOff = entries.some((e) => e.period === 'PM' && e.status === 'OFF');
+				const offPeriod: 'FD' | 'AM' | 'PM' = res.off_period ?? (amOff && pmOff ? 'FD' : amOff ? 'AM' : 'PM');
+				const offReason = entries.find((e) => e.status === 'OFF')?.reason ?? undefined;
+				onRoute({ kind: 'off', start: startdate, end: enddate, period: offPeriod, reason: offReason });
+				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
+				alertDialog(`⚠ OFF needs an approved Take Off first — opening the Off page (pre-filled). Submit it there; once approved your parade state will show OFF.${savedNote}`);
 				return;
 			}
 			if (!target && res.blocked_sick) {
@@ -1086,7 +1117,7 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 				alertDialog(`No parade entries found for ${rangeLabel}${dept === 'all' ? '' : ` (${dept})`}.`);
 			} else {
 				alertDialog(
-					`📊 Excel sent to your Telegram chat — ${res.sheets} date tab(s), ${res.rows} entries.\n\nOpen it in Excel. If it asks whether to open because the format/extension don't match, tap Yes — each date is its own tab inside.`,
+					`📊 Excel (.xlsx) sent to your Telegram chat — ${res.sheets} date tab(s). Each date is its own tab; one row per person with AM/PM side-by-side (Present = green, otherwise red; Unfilled = red).`,
 				);
 			}
 		} catch (e) {
@@ -1216,7 +1247,7 @@ function ForecastModal({ target, ym, onClose }: { target: { id: number; name: st
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — {ym}</h3>
+				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — next 30 days</h3>
 				{err ? (
 					<p className="muted danger">{limitHit ? "You've hit your daily forecast-view limit. Try again tomorrow." : err}</p>
 				) : !data ? (
@@ -1225,7 +1256,7 @@ function ForecastModal({ target, ym, onClose }: { target: { id: number; name: st
 					<>
 						<p className="muted" style={{ marginTop: 0 }}>{data.remaining} view{data.remaining === 1 ? '' : 's'} left today.</p>
 						{dates.length === 0 ? (
-							<p className="muted">No parade state submitted for this month.</p>
+							<p className="muted">No parade state submitted in the next 30 days.</p>
 						) : (
 							<table>
 								<thead><tr><th>Date</th><th>AM</th><th>PM</th></tr></thead>
