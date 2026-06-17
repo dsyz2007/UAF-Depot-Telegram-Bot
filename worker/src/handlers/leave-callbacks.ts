@@ -44,13 +44,6 @@ export function registerLeaveCallbacks(bot: Bot, env: Env): void {
 			await ctx.answerCallbackQuery({ text: 'Already handled or not found.' });
 			return;
 		}
-		// MA rides the same flow but isn't "leave" — drop the word for it.
-		const noun = res.leave_type === 'MA' ? '' : ' leave';
-		await ctx.editMessageText(
-			action === 'approve'
-				? `✅ ${res.leave_type}${noun} (${res.range}) — approved by ${approver.full_name}.`
-				: `❌ ${res.leave_type}${noun} (${res.range}) — rejected by ${approver.full_name}.`,
-		);
 		await ctx.answerCallbackQuery({ text: action === 'approve' ? 'Approved.' : 'Rejected.' });
 	});
 }

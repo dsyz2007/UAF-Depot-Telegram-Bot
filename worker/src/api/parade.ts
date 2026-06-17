@@ -4,6 +4,7 @@ import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
 import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
 import { buildXlsx } from '../xlsx';
+import { packApprovalMsgs, resolveApprovalDms, type MsgPair } from '../approval-dms';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
@@ -18,15 +19,6 @@ const EXPORT_MAX_DAYS = 7;
 // pathological pull (a very large unit) from approaching the CPU cap. Above it we
 // refuse and ask them to narrow the range or pick one department.
 const EXPORT_MAX_ROWS = 7000;
-// Statuses that count as "present" for the export's green/red highlight (mirrors
-// the strength report's present-ish set: Present + the on-the-ground duties).
-// Everything else — OFF, MC, leave, sick, MA, Course, AO, Unfilled… — is red.
-const EXPORT_PRESENT = new Set<string>([
-	'Present',
-	'Incoming Opr', 'Outgoing Opr', 'Incoming ADS', 'Outgoing ADS',
-	'Incoming DS', 'Outgoing DS', 'Incoming DO', 'Outgoing DO',
-	'NTM Swap-In', 'NTM Swap-Out',
-]);
 
 // Sentinel "status" meaning: clear (delete) this period's entry so the day
 // reverts to the original empty/blank state. Not a real parade status.
@@ -190,7 +182,11 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			.bind(user.id, today)
 			.run();
 
-		const windowEnd = sgtDateAddDays(today, 29); // today + next 29 days = 30 days inclusive
+		// ?range=next (default) → today..today+29; ?range=past → the previous 30 days
+		// (today-30..yesterday). The frontend lazily fetches 'past' only when toggled.
+		const range = url.searchParams.get('range') === 'past' ? 'past' : 'next';
+		const windowStart = range === 'past' ? sgtDateAddDays(today, -30) : today;
+		const windowEnd = range === 'past' ? sgtDateAddDays(today, -1) : sgtDateAddDays(today, 29);
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT parade_state_date, period, parade_status, reason
@@ -198,9 +194,9 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ?
 				 ORDER BY parade_state_date, period`,
 			)
-			.bind(targetId, today, windowEnd)
+			.bind(targetId, windowStart, windowEnd)
 			.all<{ parade_state_date: string; period: 'AM' | 'PM'; parade_status: string; reason: string | null }>();
-		return json({ full_name: target.full_name, entries: results ?? [], cap, remaining: cap - used - 1 });
+		return json({ full_name: target.full_name, entries: results ?? [], cap, remaining: cap - used - 1, range });
 	}
 
 	// Deprecated — keep until any cached old WebApp bundles roll over. New
@@ -421,13 +417,26 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		// (user, date, period) so the superior only ever sees the latest one.
 		const pendingIds: number[] = [];
 		for (const p of pendingPayloads) {
-			await env.depot_db
+			const superseded = await env.depot_db
 				.prepare(
 					`UPDATE parade_change_requests SET status = 'cancelled'
-					 WHERE user_id = ? AND parade_state_date = ? AND period = ? AND status = 'pending'`,
+					 WHERE user_id = ? AND parade_state_date = ? AND period = ? AND status = 'pending'
+					 RETURNING id`,
 				)
 				.bind(user.id, p.date, p.period)
-				.run();
+				.all<{ id: number }>();
+			// Clear the now-superseded request's stale Approve/Reject buttons on every
+			// superior's copy — otherwise tapping the old message just yields an
+			// "Already cancelled." toast while the live buttons linger forever.
+			for (const old of superseded.results ?? []) {
+				await resolveApprovalDms(
+					env,
+					'parade_change_requests',
+					'approval_message_id',
+					old.id,
+					`⤴️ Superseded — ${user.full_name} submitted a newer ${p.period} change for ${p.date}.`,
+				);
+			}
 			const ins = await env.depot_db
 				.prepare(
 					`INSERT INTO parade_change_requests
@@ -440,25 +449,28 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			if (!ins) continue;
 			pendingIds.push(ins.id);
 
-			// Per-request DM with inline buttons to EACH superior (either may approve).
+			// Per-request DM with inline Approve/Reject to EACH superior; store all
+			// (chat,msg) pairs so a decision edits every copy.
 			const cutoff = p.period === 'AM' ? '07:00' : '13:00';
-			let firstMsgId: string | undefined;
+			const msgPairs: MsgPair[] = [];
 			for (const tid of approverTids) {
 				const msg = await tgSendMessage(env.BOT_TOKEN, {
 					chat_id: tid,
 					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,
 					parse_mode: 'HTML',
 					reply_markup: {
-						inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
+						inline_keyboard: [
+							[
+								{ text: '✅ Approve', callback_data: `paradechg:approve:${ins.id}` },
+								{ text: '❌ Reject', callback_data: `paradechg:reject:${ins.id}` },
+							],
+						],
 					},
 				});
-				if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+				if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
 			}
-			if (firstMsgId) {
-				await env.depot_db
-					.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`)
-					.bind(firstMsgId, ins.id)
-					.run();
+			if (msgPairs.length) {
+				await env.depot_db.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`).bind(packApprovalMsgs(msgPairs), ins.id).run();
 			}
 		}
 
@@ -632,11 +644,13 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		}
 
 		// One worksheet per date; one row per person with AM & PM side-by-side.
-		// Green = present-ish, red = everything else (incl. Unfilled). No reason
-		// column (kept lean / not data-overload).
-		const cellFor = (status: string | undefined): { v: string; s: number } => {
-			const v = status ?? 'Unfilled';
-			return { v, s: EXPORT_PRESENT.has(v) ? 1 : 2 };
+		// Highlight: ONLY a strict "Present" is green; every other status (incl. the
+		// duty statuses that officially count as present) is red; an Unfilled cell is
+		// left unhighlighted. No reason column (kept lean / not data-overload).
+		const cellFor = (status: string | undefined): string | { v: string; s: number } => {
+			if (status === undefined) return 'Unfilled'; // no highlight
+			if (status === 'Present') return { v: status, s: 1 }; // green
+			return { v: status, s: 2 }; // red — everything else
 		};
 		const header = ['Department', 'Name', 'AM', 'PM'];
 		const sheets = sheetDates.map((date) => {

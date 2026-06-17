@@ -4,7 +4,8 @@
 //   */5 * * * *      → every 5 min        drain reminders queue
 //   0 10 * * *       → 18:00 prev day      parade-state nudge for tomorrow (if working day)
 //   30 21 * * *      → 05:30 same day      AM update nudge (everyone, with reassurance)
-//   0 5,23 * * *     → 07:00 SGT (23:00 UTC, AM flag) and 13:00 SGT (05:00 UTC, PM flag)
+//   0 5,15,23 * * *  → 13:00 SGT (05:00 UTC, PM flag), 23:00 SGT (15:00 UTC, gentle
+//                      "tomorrow AM still blank" nudge), 07:00 SGT (23:00 UTC, AM flag)
 //   0 4 * * *        → 12:00 same day      PM update nudge + ORD scan + parade prune
 
 import { tgSendMessage, sendThrottled } from './tg';
@@ -72,14 +73,16 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 				runRetentionPrune(env),
 			]);
 			return;
-		case '0 5,23 * * *': {
-			// Fires twice a day — both at minute :00:
-			//   23:00 UTC = 07:00 SGT → AM flag
+		case '0 5,15,23 * * *': {
+			// One expression, three meaningful fires (no extra cron trigger used):
+			//   23:00 UTC = 07:00 SGT → AM flag (superiors DM'd if a half is missing)
 			//   05:00 UTC = 13:00 SGT → PM flag
-			// One expression, two meaningful fires, no no-ops. Stays within the
-			// 5-cron cap. scheduledTime tells the two apart (survives delays).
-			const period: 'AM' | 'PM' = new Date(event.scheduledTime).getUTCHours() === 23 ? 'AM' : 'PM';
-			await flagPeriodMissing(env, period);
+			//   15:00 UTC = 23:00 SGT → gentle "tomorrow AM still blank" nudge to the
+			//                           person (short; no current status).
+			// scheduledTime tells them apart (survives delays).
+			const utcHour = new Date(event.scheduledTime).getUTCHours();
+			if (utcHour === 15) await paradeNudge(env, 'evening_late_am');
+			else await flagPeriodMissing(env, utcHour === 23 ? 'AM' : 'PM');
 			return;
 		}
 		default:
@@ -90,6 +93,10 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 // ──────────────────────────────────────────────────────────────────────────
 // 1. Reminders queue drain (every 5 min)
 // ──────────────────────────────────────────────────────────────────────────
+// Cap drained reminders per invocation so the fan-out (1 SELECT + ≤2 status
+// fetches + ≤40 sends + a few batched writes) stays well under the Free-tier
+// 50-subrequest/invocation limit. Leftovers ride the next 5-min drain.
+const DRAIN_LIMIT = 40;
 async function drainReminders(env: Env): Promise<void> {
 	const { results } = await env.depot_db
 		.prepare(
@@ -102,30 +109,118 @@ async function drainReminders(env: Env): Promise<void> {
 			 LEFT JOIN sick_cases sc ON r.related_type = 'sick_case' AND sc.id = r.related_id
 			 LEFT JOIN users sa ON sa.id = sc.superior_user_id
 			 WHERE r.sent_at IS NULL AND r.due_at <= datetime('now')
-			 LIMIT 100`,
+			 ORDER BY r.due_at
+			 LIMIT ${DRAIN_LIMIT}`,
 		)
 		.all<DueRow>();
 	if (!results?.length) return;
 
+	// Parade-state nudges are fanned out THROUGH this queue (rather than sent inline
+	// in the cron) so a ~90-user broadcast is spread across several 5-min drains and
+	// no single invocation exceeds the 50-subrequest/invocation Free-tier cap. Their
+	// reminder_type packs the kind + target date: "paradenudge:<kind>:<date>".
+	const nudges = results.filter((r) => r.related_type === 'parade_nudge');
+	const others = results.filter((r) => r.related_type !== 'parade_nudge');
+
+	// Re-fetch current AM/PM status for the nudge users (grouped by target date, so
+	// at most ~2 queries) — gives a fresh status line AND lets us skip anyone who
+	// filled the slot in the gap between enqueue and send.
+	type ParsedNudge = { row: DueRow; kind: NudgeKind; date: string };
+	const KINDS = ['evening_prev_am', 'evening_late_am', 'morning_am', 'noon_pm'];
+	const parsed: ParsedNudge[] = [];
+	for (const r of nudges) {
+		const [, kind, date] = r.reminder_type.split(':');
+		if (KINDS.includes(kind) && date) parsed.push({ row: r, kind: kind as NudgeKind, date });
+	}
+	const statusByDate = new Map<string, Map<number, { am: string | null; pm: string | null }>>();
+	for (const d of [...new Set(parsed.map((x) => x.date))]) {
+		const ids = parsed.filter((x) => x.date === d).map((x) => x.row.user_id);
+		const { results: srows } = await env.depot_db
+			.prepare(
+				`SELECT user_id,
+				        MAX(CASE WHEN period = 'AM' THEN parade_status END) AS am_status,
+				        MAX(CASE WHEN period = 'PM' THEN parade_status END) AS pm_status
+				 FROM parade_state_entries
+				 WHERE parade_state_date = ? AND user_id IN (${ids.map(() => '?').join(',')})
+				 GROUP BY user_id`,
+			)
+			.bind(d, ...ids)
+			.all<{ user_id: number; am_status: string | null; pm_status: string | null }>();
+		const m = new Map<number, { am: string | null; pm: string | null }>();
+		for (const x of srows ?? []) m.set(x.user_id, { am: x.am_status, pm: x.pm_status });
+		statusByDate.set(d, m);
+	}
+	const stillUnfilled = (kind: NudgeKind, am: string | null, pm: string | null) =>
+		kind === 'evening_late_am' ? am === null : am === null || pm === null;
+
+	// Combined, ordered send list so settled[i] lines up with toSend[i].
+	type SendItem = { t: 'other'; row: DueRow } | { t: 'nudge'; p: ParsedNudge; am: string | null; pm: string | null };
+	const toSend: SendItem[] = others.map((row) => ({ t: 'other' as const, row }));
+	for (const x of parsed) {
+		const st = statusByDate.get(x.date)?.get(x.row.user_id) ?? { am: null, pm: null };
+		if (stillUnfilled(x.kind, st.am, st.pm)) toSend.push({ t: 'nudge', p: x, am: st.am, pm: st.pm });
+		// else: filled in the meantime — it'll just be marked sent below, no DM.
+	}
+
 	// Chunked send (10 at a time, ~2s pause) to stay under Telegram's rate limit.
-	const settled = await sendThrottled(results, (r) => {
-		const text = renderReminder(r);
-		const isSuperiorFlag = r.reminder_type === 'sick_update_superior_flag';
-		const targetTid = isSuperiorFlag && r.approver_tid ? r.approver_tid : r.telegram_id;
-		// Personnel-facing sick reminders deep-link to the Sick page; the
-		// 8h-flag DM to the superior is informational only — no button.
-		const reply_markup = isSuperiorFlag ? undefined : webAppButton(env, 'sick');
-		return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text, reply_markup });
+	const settled = await sendThrottled(toSend, (item) => {
+		if (item.t === 'other') {
+			const r = item.row;
+			const text = renderReminder(r);
+			const isSuperiorFlag = r.reminder_type === 'sick_update_superior_flag';
+			const targetTid = isSuperiorFlag && r.approver_tid ? r.approver_tid : r.telegram_id;
+			// Personnel-facing sick reminders deep-link to the Sick page; the
+			// 8h-flag DM to the superior is informational only — no button.
+			const reply_markup = isSuperiorFlag ? undefined : webAppButton(env, 'sick');
+			return tgSendMessage(env.BOT_TOKEN, { chat_id: targetTid, text, reply_markup });
+		}
+		const { p, am, pm } = item;
+		return tgSendMessage(env.BOT_TOKEN, {
+			chat_id: p.row.telegram_id,
+			text: nudgeText(p.kind, p.date, am, pm),
+			// Deep-link the calendar to the exact date this nudge is about.
+			reply_markup: webAppButton(env, 'parade', p.date),
+		});
 	});
 
-	const stmt = env.depot_db.prepare(`UPDATE reminders SET sent_at = datetime('now') WHERE id = ?`);
-	await env.depot_db.batch(results.map((r) => stmt.bind(r.id)));
+	// Mark EVERY drained reminder sent — including nudges skipped as already-filled,
+	// so they leave the queue. One batched round-trip.
+	const markStmt = env.depot_db.prepare(`UPDATE reminders SET sent_at = datetime('now') WHERE id = ?`);
+	await env.depot_db.batch(results.map((r) => markStmt.bind(r.id)));
 
-	settled.forEach((s, i) => {
-		if (s.status === 'rejected') console.error('reminder send failed', results[i].id, s.reason);
+	settled.forEach((sres, i) => {
+		if (sres.status === 'rejected') {
+			const item = toSend[i];
+			console.error('reminder send failed', item.t === 'other' ? item.row.id : item.p.row.id, sres.reason);
+		}
 	});
 
-	const flagIds = results
+	// Record each freshly-sent nudge's message so a later in-app parade update can
+	// edit it in place (see parade.ts /submit) instead of sending another DM.
+	const upsertStmt = env.depot_db.prepare(
+		`INSERT INTO parade_nudge_messages (user_id, target_date, chat_id, message_id, updated_at)
+		 VALUES (?, ?, ?, ?, datetime('now'))
+		 ON CONFLICT(user_id, target_date)
+		 DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, updated_at = datetime('now')`,
+	);
+	// Dedupe by (user_id, target_date) — two different nudge KINDS can share a date
+	// (evening_prev_am + evening_late_am → tomorrow; morning_am + noon_pm → today),
+	// and parade_nudge_messages is keyed on (user_id, target_date). Keep the most
+	// recently sent message (the one worth editing), so the batch never carries two
+	// rows for the same key.
+	const upsertByKey = new Map<string, ReturnType<typeof env.depot_db.prepare>>();
+	settled.forEach((sres, i) => {
+		const item = toSend[i];
+		if (item.t === 'nudge' && sres.status === 'fulfilled' && sres.value?.message_id) {
+			upsertByKey.set(
+				`${item.p.row.user_id}|${item.p.date}`,
+				upsertStmt.bind(item.p.row.user_id, item.p.date, item.p.row.telegram_id, String(sres.value.message_id)),
+			);
+		}
+	});
+	if (upsertByKey.size) await env.depot_db.batch([...upsertByKey.values()]);
+
+	const flagIds = others
 		.filter((r) => r.related_type === 'sick_case' && r.reminder_type === 'sick_update_superior_flag')
 		.map((r) => r.related_id);
 	if (flagIds.length) {
@@ -153,12 +248,13 @@ function renderReminder(r: DueRow): string {
 // ──────────────────────────────────────────────────────────────────────────
 // 2. Parade nudges
 // ──────────────────────────────────────────────────────────────────────────
-type NudgeKind = 'evening_prev_am' | 'morning_am' | 'noon_pm';
+type NudgeKind = 'evening_prev_am' | 'evening_late_am' | 'morning_am' | 'noon_pm';
 
 async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
-	// targetDate: which SGT date the nudge refers to
+	// targetDate: which SGT date the nudge refers to. The two evening nudges
+	// (18:00 + 23:00) are about TOMORROW's AM; the others are about today.
 	const today = sgtToday();
-	const targetDate = kind === 'evening_prev_am' ? sgtDateAddDays(today, 1) : today;
+	const targetDate = kind === 'evening_prev_am' || kind === 'evening_late_am' ? sgtDateAddDays(today, 1) : today;
 
 	// Which half-day this nudge is about (drives the per-department working check).
 	const period: 'AM' | 'PM' = kind === 'noon_pm' ? 'PM' : 'AM';
@@ -166,8 +262,8 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 	// Skip entirely if the whole day is non-working with no department exceptions.
 	if (info.baseNonWorking && info.overrides.length === 0) return;
 
-	// All three nudges share a single AM/PM-aware fetch so the message can show
-	// the user's actual current status, and so we can skip anyone already done.
+	// AM/PM-aware fetch so we can skip anyone already done and apply the per-dept
+	// working check. (The drain re-checks + renders the live status at send time.)
 	const { results: statusRows } = await env.depot_db
 		.prepare(
 			`SELECT u.id, u.telegram_id, u.full_name, u.department,
@@ -182,51 +278,29 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 		.bind(targetDate)
 		.all<UserRow & { department: string | null; am_status: string | null; pm_status: string | null }>();
 
-	type EnrichedRow = { user: UserRow; amStatus: string | null; pmStatus: string | null };
+	// The 23:00 nudge is strictly about a blank AM; the others nudge if either half
+	// is unset. Skip anyone whose relevant half-day is non-working for their dept.
+	const unfilled = (u: { am_status: string | null; pm_status: string | null }) =>
+		kind === 'evening_late_am' ? u.am_status === null : u.am_status === null || u.pm_status === null;
+	const targets = (statusRows ?? []).filter((u) => unfilled(u) && slotWorking(info, u.department, period));
+	if (!targets.length) return;
 
-	// Skip anyone who already has BOTH AM and PM filled for the target date, and
-	// anyone whose relevant half-day is non-working for their department.
-	const enriched: EnrichedRow[] = (statusRows ?? [])
-		.filter((u) => (u.am_status === null || u.pm_status === null) && slotWorking(info, u.department, period))
-		.map((u) => ({
-			user: { id: u.id, telegram_id: u.telegram_id, full_name: u.full_name },
-			amStatus: u.am_status,
-			pmStatus: u.pm_status,
-		}));
-
-	if (!enriched.length) return;
-
-	// Send, capturing each message_id so a later in-app parade-state update can
-	// edit the most-recent nudge in place (see parade.ts /submit) rather than
-	// sending another notification.
-	// Chunked send (10 at a time, ~2s pause) so a ~90-user nudge stays under
-	// Telegram's ~30 msg/sec limit.
-	const settled = await sendThrottled(enriched, (e) =>
-		tgSendMessage(env.BOT_TOKEN, {
-			chat_id: e.user.telegram_id,
-			text: nudgeText(kind, targetDate, e.amStatus, e.pmStatus),
-			// Deep-link the calendar to the exact date this reminder is about
-			// (tomorrow for the 9pm nudge, today for the others).
-			reply_markup: webAppButton(env, 'parade', targetDate),
-		}),
+	// Do NOT broadcast inline — ENQUEUE one reminder per user and let the every-5-min
+	// drain send them in capped batches, so this fan-out (up to ~90 users) never
+	// exceeds the 50-subrequest/invocation Free-tier cap. reminder_type packs the
+	// kind + target date; the drain re-checks fill status at send time. The whole
+	// enqueue is a single D1 round-trip (one subrequest).
+	const rt = `paradenudge:${kind}:${targetDate}`;
+	const insStmt = env.depot_db.prepare(
+		`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
+		 VALUES (?, 'parade_nudge', 0, datetime('now'), ?)`,
 	);
-	settled.forEach((s, i) => {
-		if (s.status === 'rejected') console.error('parade nudge send failed', enriched[i].user.telegram_id, s.reason);
-	});
-
-	const upsertStmt = env.depot_db.prepare(
-		`INSERT INTO parade_nudge_messages (user_id, target_date, chat_id, message_id, updated_at)
-		 VALUES (?, ?, ?, ?, datetime('now'))
-		 ON CONFLICT(user_id, target_date)
-		 DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, updated_at = datetime('now')`,
-	);
-	const upserts: ReturnType<typeof env.depot_db.prepare>[] = [];
-	settled.forEach((s, i) => {
-		if (s.status === 'fulfilled' && s.value?.message_id) {
-			upserts.push(upsertStmt.bind(enriched[i].user.id, targetDate, enriched[i].user.telegram_id, String(s.value.message_id)));
-		}
-	});
-	if (upserts.length) await env.depot_db.batch(upserts);
+	await env.depot_db.batch([
+		// Clear any still-unsent nudge of the same kind/date first, so a double cron
+		// fire can't double-nudge anyone (idempotent enqueue).
+		env.depot_db.prepare(`DELETE FROM reminders WHERE related_type = 'parade_nudge' AND reminder_type = ? AND sent_at IS NULL`).bind(rt),
+		...targets.map((u) => insStmt.bind(u.id, rt)),
+	]);
 }
 
 function fmtStatus(s: string | null): string {
@@ -237,6 +311,9 @@ function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: s
 	switch (kind) {
 		case 'evening_prev_am':
 			return `📋 Submit tomorrow's parade state (${targetDate}) in Depot App → 🪖 Parade.`;
+		case 'evening_late_am':
+			// Short, gentle, no current status (it's blank anyway).
+			return `⏰ Gentle reminder: tomorrow's (${targetDate}) AM parade state is still blank. Please fill it in. 🪖`;
 		case 'morning_am': {
 			// Show user's actual current AM/PM so they know if any update is
 			// needed at a glance.

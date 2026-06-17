@@ -13,6 +13,7 @@ import { tgSendMessage } from '../tg';
 import { autoApprovesOwn, isLeaveStatus, periodsOverlap } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
+import { packApprovalMsgs, resolveApprovalDms, type MsgPair } from '../approval-dms';
 
 function isValidDate(s: unknown): s is string {
 	return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -219,22 +220,28 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 			text: `${leaveIcon(leaveType)} Your ${what}${leaveNoun(leaveType)} (${range}) has been forwarded to your superior for approval.${isMa(leaveType) ? '' : `\n\n${ONENS_NOTE}`}`,
 		});
 
-		// DM each approver with inline approve/reject.
+		// DM each approver with inline Approve/Reject; store all (chat,msg) pairs so
+		// a decision edits every copy.
 		const approverTids = await approverTidsFor(env, user);
-		let firstMsgId: string | undefined;
+		const msgPairs: MsgPair[] = [];
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
 				text: `${leaveIcon(leaveType)} <b>${isMa(leaveType) ? 'Medical appointment (MA) request' : 'Leave request'}</b>\n${user.full_name}: ${what}\n${range}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
-					inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
+					inline_keyboard: [
+						[
+							{ text: '✅ Approve', callback_data: `leave:approve:${ins.id}` },
+							{ text: '❌ Reject', callback_data: `leave:reject:${ins.id}` },
+						],
+					],
 				},
 			});
-			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+			if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
 		}
-		if (firstMsgId) {
-			await env.depot_db.prepare('UPDATE leave_requests SET superior_message_id = ? WHERE id = ?').bind(firstMsgId, ins.id).run();
+		if (msgPairs.length) {
+			await env.depot_db.prepare('UPDATE leave_requests SET superior_message_id = ? WHERE id = ?').bind(packApprovalMsgs(msgPairs), ins.id).run();
 		}
 		return json({ ok: true, id: ins.id });
 	}
@@ -364,6 +371,8 @@ export async function approveLeave(
 		// Sync the calendar: blank the leave slots for the range (only those still
 		// set to this leave type, so it won't clobber a status the user changed).
 		await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
+		// Resolve every superior's chat copy (covers inbox + chat-button callers).
+		await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `❌ ${what}${noun} (${range}) — rejected by ${approver.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `❌ Your ${what}${noun} (${range}) was rejected by ${approver.full_name}.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -380,6 +389,7 @@ export async function approveLeave(
 	// working slot of the range (idempotent upsert; repairs the cell if the user
 	// changed it between request and approval).
 	await setParadeForLeave(env, row.user_id, row.requester_dept, row.startdate, row.enddate, row.leave_type, row.reason, row.period);
+	await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `✅ ${what}${noun} (${range}) — approved by ${approver.full_name}.`);
 	await tgSendMessage(env.BOT_TOKEN, {
 		chat_id: row.requester_tid,
 		text: `✅ Your ${what}${noun} (${range}) was approved by ${approver.full_name}.${isMa(row.leave_type) ? '' : `\n\n${ONENS_NOTE}`}`,

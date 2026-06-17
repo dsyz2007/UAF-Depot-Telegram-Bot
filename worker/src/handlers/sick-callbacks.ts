@@ -5,6 +5,7 @@
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
 import { canApprove } from '../superiors';
+import { resolveApprovalDms } from '../approval-dms';
 import { sgtToday } from '../holidays';
 
 interface SickRow {
@@ -72,8 +73,8 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 					.bind(row.user_id, row.sick_date, row.case_type)
 					.run();
 			}
-			await ctx.editMessageText(`❌ ${row.personnel_name}'s ${row.case_type} request was rejected by ${superior.full_name}.`);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', sickId, `❌ ${row.personnel_name}'s ${row.case_type} request was rejected by ${superior.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.personnel_tid,
 				text: `❌ Your ${row.case_type} request was rejected by ${superior.full_name}.${row.sick_date ? `\nYour parade status for ${row.sick_date} is now blank (unfilled).` : ''}`,
@@ -110,8 +111,8 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 			stmt.bind(row.user_id, sickId, anchor, '+8 hours', 'sick_update_superior_flag'),
 		]);
 
-		await ctx.editMessageText(`✅ ${row.personnel_name}'s ${row.case_type} approved by ${superior.full_name}.`);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', sickId, `✅ ${row.personnel_name}'s ${row.case_type} approved by ${superior.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.personnel_tid,
 			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.`,

@@ -3,6 +3,7 @@ import { tgSendMessage } from '../tg';
 import { dayCountInclusive, autoApprovesOwn, periodsOverlap } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
+import { packApprovalMsgs, type MsgPair } from '../approval-dms';
 
 function expandRange(start: string, end: string): string[] {
 	const out: string[] = [];
@@ -251,26 +252,29 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// Refunded if the request is rejected or cancelled.
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id).run();
 
-		// Per-request DM with inline buttons — sent to EACH of the user's
-		// superiors (either may approve). The inbox sync edits the primary
-		// superior's stored message; the others are idempotent if tapped later.
+		// Per-request DM with inline Approve/Reject to EACH superior (either may
+		// action). We store ALL their (chat,msg) pairs so that when one decides, the
+		// callback / in-app action edits EVERY copy (see resolveApprovalDms).
 		const approverTids = await approverTidsFor(env, user);
-		let firstMsgId: string | undefined;
+		const msgPairs: MsgPair[] = [];
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
 				text: `🟡 <b>Off request</b>\n${user.full_name}: ${range} (${days} day${days === 1 ? '' : 's'})${periodSuffix(period)}\nBalance (credits already reserved): ${user.off_credits - days}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
-				// Approvals happen in the app (the Pending page), not via chat buttons.
-				reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
+				reply_markup: {
+					inline_keyboard: [
+						[
+							{ text: '✅ Approve', callback_data: `off:approve:${ins.id}` },
+							{ text: '❌ Reject', callback_data: `off:reject:${ins.id}` },
+						],
+					],
+				},
 			});
-			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+			if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
 		}
-		if (firstMsgId) {
-			await env.depot_db
-				.prepare('UPDATE off_requests SET superior_message_id = ? WHERE id = ?')
-				.bind(firstMsgId, ins.id)
-				.run();
+		if (msgPairs.length) {
+			await env.depot_db.prepare('UPDATE off_requests SET superior_message_id = ? WHERE id = ?').bind(packApprovalMsgs(msgPairs), ins.id).run();
 		}
 		return json({ ok: true, id: ins.id, days_requested: days, balance_after: user.off_credits - days });
 	}
@@ -359,25 +363,29 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
-		// Per-request DM with inline buttons to EACH of the recipient's superiors.
+		// Per-request DM with inline Approve/Reject to EACH superior; store all
+		// (chat,msg) pairs so a decision edits every copy.
 		const approverTids = await approverTidsFor(env, staff);
 		const whoLine = isSelf ? `${staff.full_name} (self-credit)` : `${user.full_name} → ${staff.full_name}`;
-		let firstMsgId: string | undefined;
+		const msgPairs: MsgPair[] = [];
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
 				text: `🪙 <b>Off-credit request</b>\n${whoLine}: ${days} day(s)\nReason: ${reason}`,
 				parse_mode: 'HTML',
-				// Approvals happen in the app (the Pending page), not via chat buttons.
-				reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
+				reply_markup: {
+					inline_keyboard: [
+						[
+							{ text: '✅ Approve', callback_data: `grant:approve:${ins.id}` },
+							{ text: '❌ Reject', callback_data: `grant:reject:${ins.id}` },
+						],
+					],
+				},
 			});
-			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+			if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
 		}
-		if (firstMsgId) {
-			await env.depot_db
-				.prepare('UPDATE off_credit_grants SET approval_message_id = ? WHERE id = ?')
-				.bind(firstMsgId, ins.id)
-				.run();
+		if (msgPairs.length) {
+			await env.depot_db.prepare('UPDATE off_credit_grants SET approval_message_id = ? WHERE id = ?').bind(packApprovalMsgs(msgPairs), ins.id).run();
 		}
 		// Notify the recipient ONLY when they didn't initiate it themselves and
 		// they aren't one of the approvers (avoids duplicate messages to a person).

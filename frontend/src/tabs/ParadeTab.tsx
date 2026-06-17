@@ -728,7 +728,7 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 			)}
 
 			{forecastTarget && (
-				<ForecastModal target={forecastTarget} ym={ymKey(month)} onClose={() => setForecastTarget(null)} />
+				<ForecastModal target={forecastTarget} onClose={() => setForecastTarget(null)} />
 			)}
 		</div>
 	);
@@ -1219,22 +1219,30 @@ function StrengthModal({ amUsers, pmUsers, date, onClose }: { amUsers: StrengthR
 	);
 }
 
-// Read-only month forecast for ONE person (admin/superadmin). Rate-limited
-// server-side per viewer per day; shows remaining quota and a clear message
-// when the limit is hit.
-function ForecastModal({ target, ym, onClose }: { target: { id: number; name: string }; ym: string; onClose: () => void }) {
-	const [data, setData] = useState<{ full_name: string; entries: MyMonthRow[]; cap: number; remaining: number } | null>(null);
+// Read-only forecast for ONE person (admin/superadmin). Default window is the
+// NEXT 30 days; switchable to the PAST 30 days. Each window is fetched lazily and
+// cached, so opening the modal costs one read and the past view costs another only
+// if actually toggled. Rate-limited server-side per viewer per day.
+type ForecastData = { full_name: string; entries: MyMonthRow[]; cap: number; remaining: number };
+function ForecastModal({ target, onClose }: { target: { id: number; name: string }; onClose: () => void }) {
+	const [range, setRange] = useState<'next' | 'past'>('next');
+	const [cache, setCache] = useState<{ next?: ForecastData; past?: ForecastData }>({});
 	const [err, setErr] = useState<string | null>(null);
+	const [loading, setLoading] = useState(false);
 
 	useEffect(() => {
+		setErr(null);
+		if (cache[range]) return; // lazily fetch each window once, then cache it
+		setLoading(true);
 		api
-			.get<{ full_name: string; entries: MyMonthRow[]; cap: number; remaining: number }>(
-				`/api/parade/user-month?user_id=${target.id}&ym=${ym}`,
-			)
-			.then(setData)
-			.catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)));
-	}, [target.id, ym]);
+			.get<ForecastData>(`/api/parade/user-month?user_id=${target.id}&range=${range}`)
+			.then((d) => setCache((c) => ({ ...c, [range]: d })))
+			.catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+			.finally(() => setLoading(false));
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [target.id, range]);
 
+	const data = cache[range];
 	const byDate = new Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>();
 	for (const e of data?.entries ?? []) {
 		const cur = byDate.get(e.parade_state_date) ?? {};
@@ -1243,20 +1251,25 @@ function ForecastModal({ target, ym, onClose }: { target: { id: number; name: st
 	}
 	const dates = [...byDate.keys()].sort();
 	const limitHit = err != null && (err.includes('view_limit') || err.includes('429'));
+	const label = range === 'next' ? 'next 30 days' : 'past 30 days';
 
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — next 30 days</h3>
+				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — {label}</h3>
+				<div className="seg" style={{ marginBottom: 8 }}>
+					<button className={range === 'next' ? 'active' : ''} onClick={() => setRange('next')}>Next 30 days</button>
+					<button className={range === 'past' ? 'active' : ''} onClick={() => setRange('past')}>Past 30 days</button>
+				</div>
 				{err ? (
 					<p className="muted danger">{limitHit ? "You've hit your daily forecast-view limit. Try again tomorrow." : err}</p>
-				) : !data ? (
+				) : loading || !data ? (
 					<p className="muted">Loading…</p>
 				) : (
 					<>
 						<p className="muted" style={{ marginTop: 0 }}>{data.remaining} view{data.remaining === 1 ? '' : 's'} left today.</p>
 						{dates.length === 0 ? (
-							<p className="muted">No parade state submitted in the next 30 days.</p>
+							<p className="muted">No parade state submitted in the {label}.</p>
 						) : (
 							<table>
 								<thead><tr><th>Date</th><th>AM</th><th>PM</th></tr></thead>

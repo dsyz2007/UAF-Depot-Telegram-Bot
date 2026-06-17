@@ -3,6 +3,7 @@ import { tgSendMessage } from '../tg';
 import { autoApprovesOwn } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, getRangeWorkInfo, slotWorking } from '../holidays';
+import { packApprovalMsgs, type MsgPair } from '../approval-dms';
 
 function expandRange(start: string, end: string): string[] {
 	const out: string[] = [];
@@ -181,25 +182,28 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		// Optimistically reflect it on the parade calendar right away (pending).
 		await setParadeForSick(env, user.id, user.department, sickDate, body.case_type);
 
-		// Per-request DM with inline buttons to EACH superior (either may approve).
+		// Per-request DM with inline Approve/Reject to EACH superior; store all
+		// (chat,msg) pairs so a decision edits every copy.
 		const approverTids = await approverTidsFor(env, user);
-		let firstMsgId: string | undefined;
+		const msgPairs: MsgPair[] = [];
 		for (const tid of approverTids) {
 			const msg = await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: tid,
 				text: `🟡 <b>${body.case_type}</b> request from ${user.full_name}${reason ? `\nReason: ${reason}` : ''}`,
 				parse_mode: 'HTML',
 				reply_markup: {
-					inline_keyboard: [[{ text: '🗂 Open Pending page', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]],
+					inline_keyboard: [
+						[
+							{ text: '✅ Approve', callback_data: `sick:approve:${ins.id}` },
+							{ text: '❌ Reject', callback_data: `sick:reject:${ins.id}` },
+						],
+					],
 				},
 			});
-			if (msg?.message_id && firstMsgId === undefined) firstMsgId = String(msg.message_id);
+			if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
 		}
-		if (firstMsgId) {
-			await env.depot_db
-				.prepare('UPDATE sick_cases SET approval_message_id = ? WHERE id = ?')
-				.bind(firstMsgId, ins.id)
-				.run();
+		if (msgPairs.length) {
+			await env.depot_db.prepare('UPDATE sick_cases SET approval_message_id = ? WHERE id = ?').bind(packApprovalMsgs(msgPairs), ins.id).run();
 		}
 		return json({ ok: true, id: ins.id, sick_date: sickDate });
 	}

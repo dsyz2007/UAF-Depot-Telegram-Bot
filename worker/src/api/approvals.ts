@@ -13,6 +13,7 @@ import { canApprove, sameUnit, departmentsWithHolders } from '../superiors';
 import { approveLeave, setParadeForLeave } from './leave';
 import { setParadeForSick } from './sick';
 import { setParadeForOff } from './off';
+import { resolveApprovalDms } from '../approval-dms';
 import { sgtToday } from '../holidays';
 
 // Credit-days for an off request: half-day (AM/PM) = 0.5 per day, full day = 1.
@@ -430,10 +431,13 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipReject.meta.changes ?? 0) === 0) return false;
+			// Durable side-effects (refund + clear OFF) BEFORE the best-effort DM edit,
+			// mirroring the chat-button path so ordering is consistent across paths.
 			await env.depot_db.batch([
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
 				clearOff,
 			]);
+			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `❌ ${row.full_name}'s off (${range}) — rejected by ${approver.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
 				text: `❌ Your off request (${range}) was rejected by ${approver.full_name}.\n🪙 ${days} credit(s) refunded.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -446,6 +450,7 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipApprove.meta.changes ?? 0) === 0) return false;
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `✅ ${row.full_name}'s off (${range}, ${days} day${days === 1 ? '' : 's'}) — approved by ${approver.full_name}.`);
 		// Reflect the approved off on the parade calendar (covers offs requested from
 		// the Off page; parade-initiated ones are already painted — re-paint is a
 		// harmless no-op).
@@ -486,6 +491,7 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipSickR.meta.changes ?? 0) === 0) return false;
+			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', id, `❌ ${row.full_name}'s ${row.case_type} request — rejected by ${approver.full_name}.`);
 			// Roll back the optimistic parade entry for that day (if still set).
 			if (row.sick_date) {
 				await env.depot_db
@@ -504,6 +510,7 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipSickA.meta.changes ?? 0) === 0) return false;
+		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', id, `✅ ${row.full_name}'s ${row.case_type} approved by ${approver.full_name}.`);
 		// Schedule the 3h/6h personnel + 8h superior-flag reminders. For a case dated
 		// LATER than today (i.e. reported for tomorrow), anchor the timers to 08:00
 		// SGT of the sick day instead of approval time — so an evening approval
@@ -559,6 +566,7 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipGrantR.meta.changes ?? 0) === 0) return false;
+			await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', id, `❌ Off-credit request rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`);
 			const sent = new Set<string>([approver.telegram_id]);
 			const notify = (tid: string, text: string) => (sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
 			await Promise.allSettled([
@@ -574,6 +582,7 @@ async function applyAction(
 		if ((flipGrantA.meta.changes ?? 0) === 0) return false;
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(row.num_days, row.user_id).run();
 		const bal = await env.depot_db.prepare(`SELECT off_credits FROM users WHERE id=?`).bind(row.user_id).first<{ off_credits: number }>();
+		await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', id, `✅ Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${bal?.off_credits ?? '?'}.`);
 		const sent = new Set<string>([approver.telegram_id]);
 		const notify = (tid: string, text: string) => (sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
 		await Promise.allSettled([
@@ -614,6 +623,7 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipParaR.meta.changes ?? 0) === 0) return false;
+			await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `❌ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) — rejected by ${approver.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.user_tid,
 				text: `❌ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was rejected by ${approver.full_name}.`,
@@ -625,6 +635,7 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipParaA.meta.changes ?? 0) === 0) return false;
+		await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `✅ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) — approved by ${approver.full_name}.`);
 		await env.depot_db
 			.prepare(
 				`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)

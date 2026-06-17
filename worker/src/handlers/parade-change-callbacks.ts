@@ -10,6 +10,7 @@
 import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
 import { canApprove } from '../superiors';
+import { resolveApprovalDms } from '../approval-dms';
 
 interface ChangeRow {
 	id: number;
@@ -77,10 +78,8 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 				await ctx.answerCallbackQuery({ text: 'Already handled.' });
 				return;
 			}
-			await ctx.editMessageText(
-				`❌ Late ${row.period} change rejected by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`,
-			);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', changeId, `❌ Late ${row.period} change rejected by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.user_tid,
 				text: `❌ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was rejected by ${approver.full_name}.`,
@@ -111,10 +110,8 @@ export function registerParadeChangeCallbacks(bot: Bot, env: Env): void {
 			.bind(row.user_id, row.parade_state_date, row.period, row.new_status, row.new_reason)
 			.run();
 
-		await ctx.editMessageText(
-			`✅ Late ${row.period} change approved by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`,
-		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', changeId, `✅ Late ${row.period} change approved by ${approver.full_name}: ${row.user_name} on ${row.parade_state_date} → ${row.new_status}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.user_tid,
 			text: `✅ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was approved by ${approver.full_name}.`,

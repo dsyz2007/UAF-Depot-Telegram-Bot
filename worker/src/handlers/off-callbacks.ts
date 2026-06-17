@@ -10,6 +10,7 @@ import type { Bot } from 'grammy';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive } from '../types';
 import { canApprove } from '../superiors';
+import { resolveApprovalDms } from '../approval-dms';
 import { setParadeForOff } from '../api/off';
 
 // Half-day (AM/PM) off costs 0.5 credits per day; full day (FD) costs 1.
@@ -130,8 +131,8 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
 				clearOff,
 			]);
-			await ctx.editMessageText(`❌ ${row.requester_name}'s off (${range})${periodSuffix} — rejected by ${superior.full_name}.`);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `❌ ${row.requester_name}'s off (${range})${periodSuffix} — rejected by ${superior.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
 				text: `❌ Your off request (${range})${periodSuffix} was rejected by ${superior.full_name}.\n🪙 ${days} credit(s) refunded.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -153,10 +154,8 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 		// Reflect the approved off on the parade calendar (covers Off-page requests;
 		// parade-initiated ones are already painted — re-paint is a harmless no-op).
 		await setParadeForOff(env, row.user_id, row.requester_dept, row.startdate, row.enddate, row.period);
-		await ctx.editMessageText(
-			`✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'})${periodSuffix} — approved by ${superior.full_name}.`,
-		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'})${periodSuffix} — approved by ${superior.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `✅ Your off (${row.startdate} → ${row.enddate}) was approved by ${superior.full_name}.\nYour parade state for ${row.startdate} → ${row.enddate} now shows OFF.`,
@@ -222,10 +221,8 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 				await ctx.answerCallbackQuery({ text: 'Already handled.' });
 				return;
 			}
-			await ctx.editMessageText(
-				`❌ Off-credit request rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`,
-			);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
+			await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', grantId, `❌ Off-credit request rejected by ${approver.full_name}: ${row.staff_name} (${row.num_days} day[s]).`);
 			const sent = new Set<string>([approverTid]); // approver already sees the edited msg
 			await Promise.allSettled([
 				notify(row.staff_tid, `❌ Your off-credit request (${row.num_days} day[s]) was rejected by ${approver.full_name}.`, sent),
@@ -257,10 +254,8 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 			.bind(row.user_id)
 			.first<{ off_credits: number }>();
 
-		await ctx.editMessageText(
-			`✅ Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${balanceAfter?.off_credits ?? '?'}.`,
-		);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
+		await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', grantId, `✅ Off-credit request approved by ${approver.full_name}: +${row.num_days} day(s) to ${row.staff_name}. Balance: ${balanceAfter?.off_credits ?? '?'}.`);
 		const sent = new Set<string>([approverTid]); // approver already sees the edited msg
 		await Promise.allSettled([
 			notify(
