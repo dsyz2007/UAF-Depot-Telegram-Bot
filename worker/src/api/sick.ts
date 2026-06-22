@@ -3,7 +3,7 @@ import { tgSendMessage } from '../tg';
 import { autoApprovesOwn } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, getRangeWorkInfo, slotWorking } from '../holidays';
-import { packApprovalMsgs, type MsgPair } from '../approval-dms';
+import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
 function expandRange(start: string, end: string): string[] {
 	const out: string[] = [];
@@ -124,6 +124,14 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				        num_of_mc_days, mc_start_date, mc_end_date, location, approx_time, mc_file_id, created_at
 				 FROM sick_cases
 				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','updated','flagged')
+				   -- A still-pending report whose date has already passed is stale: hide it
+				   -- from the Sick page immediately (the daily runSickExpiry cron then cancels
+				   -- it + blanks the optimistic parade cell).
+				   AND NOT (reportsick_status = 'pending_superior' AND sick_date IS NOT NULL AND date(sick_date) < date('now','+8 hours'))
+				   -- An approved/updated/flagged case also stops showing once its date is
+				   -- well past (3-day grace so a late MC can still be recorded the next day
+				   -- or two); otherwise an old never-updated case would linger forever.
+				   AND NOT (reportsick_status IN ('approved','updated','flagged') AND sick_date IS NOT NULL AND date(sick_date) < date('now','+8 hours','-3 days'))
 				 ORDER BY id DESC LIMIT 1`,
 			)
 			.bind(user.id)
@@ -221,6 +229,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		if (typeof body.num_of_mc_days !== 'number' || body.num_of_mc_days < 0) {
 			return json({ error: 'invalid_mc_days' }, { status: 400 });
 		}
+		// Location + approximate time are compulsory on every RSI/RSO status update.
+		if (!body.location || !body.location.trim() || !body.approx_time || !body.approx_time.trim()) {
+			return json({ error: 'location_time_required' }, { status: 400 });
+		}
 		if (body.num_of_mc_days >= 1) {
 			if (!isValidDate(body.mc_start_date) || !isValidDate(body.mc_end_date)) {
 				return json({ error: 'mc_dates_required' }, { status: 400 });
@@ -316,40 +328,58 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
-			.prepare(`SELECT id, user_id, case_type, reportsick_status, sick_date FROM sick_cases WHERE id = ?`)
+			.prepare(
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
+				        s.mc_start_date, s.mc_end_date, sup.telegram_id AS approver_tid
+				 FROM sick_cases s LEFT JOIN users sup ON sup.id = s.superior_user_id
+				 WHERE s.id = ?`,
+			)
 			.bind(body.id)
-			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null }>();
+			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; mc_start_date: string | null; mc_end_date: string | null; approver_tid: string | null }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_case' }, { status: 403 });
-		const isPending = row.reportsick_status === 'pending_superior';
-		const selfUndo = autoApprovesOwn(user) && ['approved', 'updated', 'flagged'].includes(row.reportsick_status);
-		if (!isPending && !selfUndo) {
+		// The requester may withdraw their OWN case in ANY state — pending, approved
+		// (incl. updated/flagged), or rejected (a private dismiss).
+		const cancellable = ['pending_superior', 'approved', 'updated', 'flagged', 'rejected'];
+		if (!cancellable.includes(row.reportsick_status)) {
 			return json({ error: 'not_cancellable', state: row.reportsick_status }, { status: 409 });
 		}
+		const fromState = row.reportsick_status;
+		const wasRejected = fromState === 'rejected';
+		const wasApproved = ['approved', 'updated', 'flagged'].includes(fromState);
 
-		await env.depot_db
-			.prepare(
-				`UPDATE sick_cases SET reportsick_status = 'cancelled',
-				   cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`,
-			)
-			.bind(user.id, body.id)
+		// Atomic flip guarded on the observed state (so a cancel racing an approve/
+		// reject/revert can't double-fire side-effects).
+		const flip = await env.depot_db
+			.prepare(`UPDATE sick_cases SET reportsick_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND reportsick_status = ?`)
+			.bind(user.id, body.id, fromState)
 			.run();
-		// Roll back the optimistic parade entry for that day + clear any reminders.
-		if (row.sick_date) await clearParadeForSick(env, user.id, row.sick_date, row.case_type);
-		await env.depot_db
-			.prepare(`DELETE FROM reminders WHERE related_type = 'sick_case' AND related_id = ? AND sent_at IS NULL`)
-			.bind(body.id)
-			.run();
+		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_cancellable' }, { status: 409 });
 
-		const approverTids = await approverTidsFor(env, user);
-		await Promise.allSettled(
-			approverTids.map((tid) =>
-				tgSendMessage(env.BOT_TOKEN, {
-					chat_id: tid,
-					text: `🚫 ${user.full_name} cancelled their ${row.case_type} request.`,
-				}),
-			),
-		);
+		// A rejected case already had its parade blanked + reminders cleared on
+		// rejection, and its approver DMs correctly show "rejected"; cancelling it is
+		// just a private dismiss, so there are no side-effects to undo there.
+		if (!wasRejected) {
+			// Roll back the optimistic RSI/RSO cell, any MC cells painted on update,
+			// and any still-pending reminders.
+			if (row.sick_date) await clearParadeForSick(env, user.id, row.sick_date, row.case_type);
+			if (row.mc_start_date && row.mc_end_date) {
+				await env.depot_db
+					.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'MC'`)
+					.bind(user.id, row.mc_start_date, row.mc_end_date)
+					.run();
+			}
+			await env.depot_db
+				.prepare(`DELETE FROM reminders WHERE related_type = 'sick_case' AND related_id = ? AND sent_at IS NULL`)
+				.bind(body.id)
+				.run();
+			// Sync every approver's DM copy → clears live buttons (pending) / shows withdrawn (approved).
+			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.case_type} — withdrawn by requester. No action needed.`);
+			// An edit doesn't push a notification; for an already-approved case ping the approver too.
+			if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
+				await tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `🚫 ${user.full_name} cancelled their ${row.case_type} that you approved.` });
+			}
+		}
 		return json({ ok: true });
 	}
 
@@ -413,6 +443,8 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			.bind(body.id)
 			.run();
 
+		// Re-arm the chat Approve/Reject buttons on every approver's DM.
+		await restoreApprovalDms(env, 'sick_cases', 'approval_message_id', body.id as number, `🟡 ${row.case_type} request (re-opened for approval): ${row.requester_name}`, 'sick');
 		const msg = `↩ ${user.full_name} reverted your approved ${row.case_type} — it's pending approval again.`;
 		const sends: Promise<unknown>[] = [
 			tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg }),

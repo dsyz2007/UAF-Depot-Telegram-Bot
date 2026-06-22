@@ -67,8 +67,10 @@ export interface XlsxSheet {
 }
 
 // Styles part: 3 cell formats — 0 default (no fill), 1 green fill, 2 red fill.
-// Standard Excel "Good"/"Bad" pastel fills. fills index 0/1 are reserved by
-// convention (none + gray125), so green/red are fills 2/3, referenced by cellXfs.
+// Bright/vivid green + red fills (brighter than Excel's pale "Good"/"Bad"
+// pastels) so Present vs not-Present pops at a glance; black text stays legible.
+// fills index 0/1 are reserved by convention (none + gray125), so green/red are
+// fills 2/3, referenced by cellXfs.
 const STYLES_XML =
 	`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
 	`<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
@@ -76,8 +78,8 @@ const STYLES_XML =
 	`<fills count="4">` +
 	`<fill><patternFill patternType="none"/></fill>` +
 	`<fill><patternFill patternType="gray125"/></fill>` +
-	`<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>` +
-	`<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FF92D050"/><bgColor indexed="64"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFFF5A5A"/><bgColor indexed="64"/></patternFill></fill>` +
 	`</fills>` +
 	`<borders count="1"><border/></borders>` +
 	`<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +

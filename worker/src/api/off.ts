@@ -1,9 +1,9 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive, autoApprovesOwn, periodsOverlap } from '../types';
-import { approverTidsFor, sameUnit } from '../superiors';
+import { approverTidsFor, sameUnit, departmentsWithHolders } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
-import { packApprovalMsgs, type MsgPair } from '../approval-dms';
+import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
 function expandRange(start: string, end: string): string[] {
 	const out: string[] = [];
@@ -48,6 +48,72 @@ export async function setParadeForOff(
 		}
 	}
 	if (ops.length) await env.depot_db.batch(ops);
+}
+
+// ── Mass-action helpers (superadmin Mass Credit / Mass Apply) ───────────────
+interface MassTarget {
+	id: number;
+	full_name: string;
+	telegram_id: string;
+	off_credits: number;
+	department: string | null;
+	sub_department: string | null;
+}
+
+const unitKey = (d: string | null, s: string | null) => `${d ?? ''}|${s ?? ''}`;
+
+// Paint OFF on the parade calendar for MANY users at once — one work-info fetch
+// for the range, then all upserts pushed through chunked batches (each batch is a
+// single D1 round-trip) so even a whole-depot apply stays well within the
+// 50-subrequest/invocation Free-tier cap. Mirrors setParadeForOff's preserve rules.
+async function bulkPaintOff(env: Env, targets: MassTarget[], dates: string[], period: string): Promise<void> {
+	if (!targets.length) return;
+	const info = await getRangeWorkInfo(env, dates);
+	const periods: ('AM' | 'PM')[] = period === 'AM' || period === 'PM' ? [period] : ['AM', 'PM'];
+	const stmt = env.depot_db.prepare(
+		`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
+		 VALUES (?, ?, ?, 'OFF', NULL)
+		 ON CONFLICT(user_id, parade_state_date, period)
+		 DO UPDATE SET parade_status = 'OFF', reason = NULL
+		   WHERE parade_state_entries.parade_status NOT IN ('RSI','RSO','MC')`,
+	);
+	const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+	for (const t of targets) {
+		for (const d of dates) {
+			const di = info.get(d);
+			if (!di) continue;
+			for (const p of periods) if (slotWorking(di, t.department, p)) ops.push(stmt.bind(t.id, d, p));
+		}
+	}
+	for (let i = 0; i < ops.length; i += 100) await env.depot_db.batch(ops.slice(i, i + 100));
+}
+
+// Tell each appointment-holder, in ONE summary DM, that mass-routed requests are
+// waiting in their in-app inbox. Bounded by the number of distinct holders (not by
+// the number of requests) so it never fans out — the inbox is the source of truth.
+async function notifyRoutedHolders(env: Env, routed: MassTarget[], label: string, initiatorName: string): Promise<void> {
+	if (!routed.length) return;
+	const { results: holders } = await env.depot_db
+		.prepare(`SELECT telegram_id, department, sub_department FROM users WHERE appointment IN ('WOIC','2IC','PC') AND full_name NOT LIKE 'PENDING:%'`)
+		.all<{ telegram_id: string; department: string | null; sub_department: string | null }>();
+	const byUnit = new Map<string, string[]>();
+	for (const h of holders ?? []) {
+		const k = unitKey(h.department, h.sub_department);
+		(byUnit.get(k) ?? byUnit.set(k, []).get(k)!).push(h.telegram_id);
+	}
+	const countByTid = new Map<string, number>();
+	for (const t of routed) {
+		const tids = byUnit.get(unitKey(t.department, t.sub_department)) ?? [];
+		for (const tid of new Set(tids)) countByTid.set(tid, (countByTid.get(tid) ?? 0) + 1);
+	}
+	await Promise.allSettled(
+		[...countByTid.entries()].map(([tid, n]) =>
+			tgSendMessage(env.BOT_TOKEN, {
+				chat_id: tid,
+				text: `📋 ${n} ${label} from a mass action by ${initiatorName} await your approval. Open the depot app → 🗂 Pending to review (you can Approve all).`,
+			}),
+		),
+	);
 }
 
 interface SummaryRow {
@@ -443,22 +509,17 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.run();
 
 		const range = `${row.startdate} → ${row.enddate}`;
-		if (wasApproved) {
-			// Inform the superior who approved it (unless that was the requester).
-			if (row.approver_tid && row.approver_tid !== user.telegram_id) {
-				await tgSendMessage(env.BOT_TOKEN, {
-					chat_id: row.approver_tid,
-					text: `🚫 ${user.full_name} cancelled their off (${range}) that you approved. 🪙 ${refundDays} credit(s) refunded to them.`,
-				});
-			}
-		} else {
-			// Still pending — let the unit's approvers know it's off their inbox.
-			const approverTids = await approverTidsFor(env, user);
-			await Promise.allSettled(
-				approverTids.map((tid) =>
-					tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text: `🚫 ${user.full_name} cancelled their off request (${range}).` }),
-				),
-			);
+		// Sync every appointment-holder's original DM → clears any still-live
+		// Approve/Reject buttons (pending) or rewrites the outcome (approved) to
+		// "withdrawn". Audience-correct: edits exactly who got the request DM.
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s off (${range}) — withdrawn by requester. 🪙 ${refundDays} credit(s) refunded. No action needed.`);
+		// An edit doesn't push a notification, so if it was already approved, also ping
+		// the approver who'll want to know their approval was undone.
+		if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
+			await tgSendMessage(env.BOT_TOKEN, {
+				chat_id: row.approver_tid,
+				text: `🚫 ${user.full_name} cancelled their off (${range}) that you approved. 🪙 ${refundDays} credit(s) refunded to them.`,
+			});
 		}
 		return json({ ok: true, refunded: refundDays });
 	}
@@ -527,6 +588,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.bind(...(revHalfDay ? [row.user_id, row.startdate, row.enddate, row.period] : [row.user_id, row.startdate, row.enddate]))
 			.run();
 
+		// Re-arm the chat Approve/Reject buttons on every appointment-holder's DM.
+		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🟡 Off request (re-opened for approval): ${row.requester_name} — ${row.startdate} → ${row.enddate}`, 'off');
 		const revertDays = offDays(row.startdate, row.enddate, row.period);
 		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again. Your parade state for those days is blank until it's re-approved.\n\n🪙 ${revertDays} credit(s) are STILL RESERVED while it's pending. If you no longer want this off, CANCEL it on the Off page to get the credit(s) back.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
@@ -583,6 +646,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// Plain subtraction (negative balances are allowed) so the clawback
 		// exactly mirrors the unclamped grant-add — keeps approve/revert reversible.
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(row.num_days, row.user_id).run();
+		await restoreApprovalDms(env, 'off_credit_grants', 'approval_message_id', body.id as number, `🟡 Off-credit request (re-opened for approval): ${row.staff_name} (+${row.num_days} day(s))`, 'grant');
 		const msg = `↩ Off-credit reverted by ${user.full_name}: −${row.num_days} day(s) from ${row.staff_name} (pending approval again).`;
 		const sent = new Set<string>([user.telegram_id]);
 		const notify = (tid: string | null) =>
@@ -618,6 +682,169 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			return json(results ?? []);
 		}
 		return json([]);
+	}
+
+	// ── MASS CREDIT / MASS APPLY (superadmin only) ─────────────────────────
+	// Targets: { mode:'all'|'dept'|'ids', dept?, ids? }. Per target, the action is
+	// applied INSTANTLY if the initiator may approve that target's unit (appointment-
+	// holder of it, or superadmin fallback for a holder-less unit), otherwise it's
+	// ROUTED as a pending request to that unit's appointment-holders (shown in their
+	// in-app inbox + a single summary DM). All DB writes are batched.
+	if (request.method === 'POST' && (sub === '/mass-credit' || sub === '/mass-apply')) {
+		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
+		const body = (await request.json()) as {
+			mode?: 'all' | 'dept' | 'ids';
+			dept?: string;
+			ids?: number[];
+			num_days?: number | string;
+			startdate?: string;
+			enddate?: string;
+			period?: string;
+			reason?: string;
+		};
+		// Resolve the target set (excluding PENDING stubs).
+		let clause = '';
+		let binds: (string | number)[] = [];
+		if (body.mode === 'dept') {
+			if (!body.dept) return json({ error: 'dept_required' }, { status: 400 });
+			clause = ' AND department = ?';
+			binds = [body.dept];
+		} else if (body.mode === 'ids') {
+			const ids = (body.ids ?? []).filter((n) => Number.isInteger(n));
+			if (!ids.length) return json({ error: 'no_targets' }, { status: 400 });
+			if (ids.length > 100) return json({ error: 'too_many_ids', max: 100 }, { status: 400 });
+			clause = ` AND id IN (${ids.map(() => '?').join(',')})`;
+			binds = ids;
+		} else if (body.mode !== 'all') {
+			return json({ error: 'bad_mode' }, { status: 400 });
+		}
+		const { results: targets } = await env.depot_db
+			.prepare(`SELECT id, full_name, telegram_id, off_credits, department, sub_department FROM users WHERE full_name NOT LIKE 'PENDING:%'${clause} ORDER BY full_name`)
+			.bind(...binds)
+			.all<MassTarget>();
+		if (!targets?.length) return json({ error: 'no_targets' }, { status: 400 });
+
+		// Instant vs routed — same routing as the inbox (canActOn). Initiator is a
+		// superadmin, so the fallback (holder-less / no-dept unit) also goes instant.
+		const holderDepts = await departmentsWithHolders(env);
+		const appointed = !!user.appointment;
+		const canActOn = (dept: string | null, sub: string | null): boolean =>
+			(appointed && sameUnit(user, dept, sub)) || dept == null || !holderDepts.has(dept);
+
+		if (sub === '/mass-credit') {
+			const days = Math.round(Number(body.num_days) * 10) / 10;
+			const reason = (body.reason ?? '').trim();
+			if (!Number.isFinite(days) || days <= 0) return json({ error: 'invalid_num_days' }, { status: 400 });
+			if (!reason) return json({ error: 'reason_required' }, { status: 400 });
+
+			const instant = targets.filter((t) => canActOn(t.department, t.sub_department));
+			const routed = targets.filter((t) => !canActOn(t.department, t.sub_department));
+
+			const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+			const approvedStmt = env.depot_db.prepare(
+				`INSERT INTO off_credit_grants (user_id, granted_by, num_days, reason, status, superior_user_id, approved_at)
+				 VALUES (?, ?, ?, ?, 'approved', ?, datetime('now'))`,
+			);
+			for (const t of instant) ops.push(approvedStmt.bind(t.id, user.id, days, reason, user.id));
+			// Bump credits in chunks of ≤90 ids so the bound-param count stays under
+			// D1's 100-per-statement cap (mode 'all' can be ~100 users).
+			for (let i = 0; i < instant.length; i += 90) {
+				const chunk = instant.slice(i, i + 90);
+				ops.push(
+					env.depot_db
+						.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id IN (${chunk.map(() => '?').join(',')})`)
+						.bind(days, ...chunk.map((t) => t.id)),
+				);
+			}
+			const pendingStmt = env.depot_db.prepare(
+				`INSERT INTO off_credit_grants (user_id, granted_by, num_days, reason, status) VALUES (?, ?, ?, ?, 'pending_superior')`,
+			);
+			for (const t of routed) ops.push(pendingStmt.bind(t.id, user.id, days, reason));
+			if (ops.length) await env.depot_db.batch(ops);
+
+			await notifyRoutedHolders(env, routed, `off-credit request(s) (+${days} day[s])`, user.full_name);
+			return json({ ok: true, instant: instant.length, routed: routed.length, total: targets.length });
+		}
+
+		// ── /mass-apply ──
+		const isDate = (x: unknown): x is string => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x);
+		const period = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
+		if (!isDate(body.startdate) || !isDate(body.enddate)) return json({ error: 'bad_dates' }, { status: 400 });
+		if (body.startdate > body.enddate) return json({ error: 'bad_range' }, { status: 400 });
+		const reason = (body.reason ?? '').trim() || 'Mass off (superadmin)';
+		const dates = expandRange(body.startdate, body.enddate);
+		// Guard the work volume so a huge (targets × days) combo can't blow the
+		// per-invocation budget. ~31 days for the whole depot is plenty.
+		if (targets.length * dates.length > 3000) {
+			return json({ error: 'too_large', hint: 'Narrow the date range or the selection.' }, { status: 400 });
+		}
+		const days = offDays(body.startdate, body.enddate, period);
+
+		// Skip anyone who already has an overlapping pending/approved off (so a
+		// re-run can't double-reserve) and anyone who can't afford it (no negatives).
+		// Fetch all pending/approved offs overlapping the range (no user IN-list, to
+		// dodge D1's 100-param cap) and filter to our targets in memory.
+		const { results: existing } = await env.depot_db
+			.prepare(`SELECT user_id, period FROM off_requests WHERE off_status IN ('pending','approved') AND startdate <= ? AND enddate >= ?`)
+			.bind(body.enddate, body.startdate)
+			.all<{ user_id: number; period: string }>();
+		const targetIds = new Set(targets.map((t) => t.id));
+		const clashIds = new Set(
+			(existing ?? []).filter((e) => targetIds.has(e.user_id) && periodsOverlap(e.period, period)).map((e) => e.user_id),
+		);
+
+		const alreadyOff = targets.filter((t) => clashIds.has(t.id)).map((t) => t.full_name);
+		const candidates = targets.filter((t) => !clashIds.has(t.id));
+
+		// Atomic per-row credit gate: deduct ONLY if the balance is still ≥ days at
+		// execution time, and RETURNING tells us exactly who was charged. This both
+		// hard-guarantees no negative balance AND closes the read-then-write race
+		// (no decision is made on a stale snapshot). Each statement is one row, so
+		// there's no IN-list param-cap concern either. Off rows are then created
+		// only for those actually charged — so a race loser is skipped cleanly,
+		// never left with an un-charged off.
+		const succeededIds = new Set<number>();
+		if (candidates.length) {
+			const deductStmt = env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ? AND off_credits >= ?`);
+			const res = await env.depot_db.batch(candidates.map((t) => deductStmt.bind(days, t.id, days)));
+			// meta.changes === 1 means the guarded deduct applied (balance was enough).
+			res.forEach((r, i) => {
+				if ((r.meta?.changes ?? 0) > 0) succeededIds.add(candidates[i].id);
+			});
+		}
+		const succeeded = candidates.filter((t) => succeededIds.has(t.id));
+		const insufficient = candidates.filter((t) => !succeededIds.has(t.id)).map((t) => t.full_name);
+
+		const instant = succeeded.filter((t) => canActOn(t.department, t.sub_department));
+		const routed = succeeded.filter((t) => !canActOn(t.department, t.sub_department));
+
+		// Create the off rows for the charged users only (instant=approved, routed=pending).
+		const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
+		const apprStmt = env.depot_db.prepare(
+			`INSERT INTO off_requests (user_id, requested_by_user_id, startdate, enddate, period, reason, off_status, approved_by, approved_date)
+			 VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, datetime('now'))`,
+		);
+		for (const t of instant) ops.push(apprStmt.bind(t.id, user.id, body.startdate, body.enddate, period, reason, user.id));
+		const pendStmt = env.depot_db.prepare(
+			`INSERT INTO off_requests (user_id, requested_by_user_id, startdate, enddate, period, reason, off_status)
+			 VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+		);
+		for (const t of routed) ops.push(pendStmt.bind(t.id, user.id, body.startdate, body.enddate, period, reason));
+		if (ops.length) await env.depot_db.batch(ops);
+
+		// Paint OFF for the instant (approved) ones now; routed ones paint on approval.
+		await bulkPaintOff(env, instant, dates, period);
+		await notifyRoutedHolders(env, routed, `off request(s) (${body.startdate} → ${body.enddate})`, user.full_name);
+
+		return json({
+			ok: true,
+			instant: instant.length,
+			routed: routed.length,
+			total: targets.length,
+			days_each: days,
+			insufficient,
+			already_off: alreadyOff,
+		});
 	}
 
 	return json({ error: 'not_found' }, { status: 404 });

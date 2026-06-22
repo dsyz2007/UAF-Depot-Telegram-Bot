@@ -60,3 +60,35 @@ export async function resolveApprovalDms(
 		/* best-effort — never let a DM-edit failure break the decision flow */
 	}
 }
+
+// Re-edit every stored copy of an approval DM BACK to a live Approve/Reject
+// prompt — used when a decision is UNDONE (reopened to pending via revert or
+// unreject) so each appointment-holder can action it again straight from chat.
+// callbackPrefix is the callback_data namespace the chat handlers expect
+// ('off' | 'sick' | 'leave' | 'grant' | 'paradechg'). Best-effort, never throws.
+export async function restoreApprovalDms(
+	env: Env,
+	table: 'off_requests' | 'sick_cases' | 'leave_requests' | 'off_credit_grants' | 'parade_change_requests',
+	col: 'superior_message_id' | 'approval_message_id',
+	id: number,
+	text: string,
+	callbackPrefix: 'off' | 'sick' | 'leave' | 'grant' | 'paradechg',
+): Promise<void> {
+	try {
+		const row = await env.depot_db.prepare(`SELECT ${col} AS m FROM ${table} WHERE id = ?`).bind(id).first<{ m: string | null }>();
+		const pairs = parsePairs(row?.m ?? null);
+		if (!pairs.length) return;
+		const safe = htmlEscape(text);
+		const reply_markup = {
+			inline_keyboard: [
+				[
+					{ text: '✅ Approve', callback_data: `${callbackPrefix}:approve:${id}` },
+					{ text: '❌ Reject', callback_data: `${callbackPrefix}:reject:${id}` },
+				],
+			],
+		};
+		await Promise.allSettled(pairs.map(([chatId, messageId]) => tgEditMessageText(env.BOT_TOKEN, chatId, messageId, safe, reply_markup)));
+	} catch {
+		/* best-effort — never let a DM-edit failure break the reopen flow */
+	}
+}

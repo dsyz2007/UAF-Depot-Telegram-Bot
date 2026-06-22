@@ -115,7 +115,7 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', sickId, `✅ ${row.personnel_name}'s ${row.case_type} approved by ${superior.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.personnel_tid,
-			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.`,
+			text: `✅ Your ${row.case_type} request was approved by ${superior.full_name}.\n\nOnce seen, update your status (MC days, dates, medicine) in Depot App → 🤒 Sick.\n\n📎 Got an MC? Just send the photo/PDF here in this chat (no upload in the app) — it auto-forwards to your superior.`,
 			reply_markup: {
 				inline_keyboard: [[{ text: '🤒 Open Sick page', web_app: { url: `${env.WEBAPP_URL}?tab=sick` } }]],
 			},

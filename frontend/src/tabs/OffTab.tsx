@@ -100,11 +100,17 @@ export function OffTab({
 	const [showRequest, setShowRequest] = useState(false);
 	const [reqPrefill, setReqPrefill] = useState<{ start: string; end: string; period?: 'FD' | 'AM' | 'PM'; reason?: string } | null>(null);
 	const [showGive, setShowGive] = useState(false);
+	// Superadmin-only mass actions (credit many / apply off to many).
+	const [showMass, setShowMass] = useState<null | 'credit' | 'apply'>(null);
 	// Everyone's off library is hidden until explicitly shown (declutters the page).
 	const [showEveryone, setShowEveryone] = useState(false);
 	const [everyoneSearch, setEveryoneSearch] = useState('');
 	// "My recent requests" shows only the latest 3 until expanded.
 	const [showAllMine, setShowAllMine] = useState(false);
+	// Per-person off history: render the latest 30 until "Show older" is tapped
+	// (records are kept 2 years, so the list can be long — the rows are already
+	// loaded in one indexed fetch; this just caps the rendered rows).
+	const [detailShowAll, setDetailShowAll] = useState(false);
 
 	// When routed here from the Parade tab (user marked OFF without applying),
 	// open the Request Off modal prefilled with the dates. The ref guards
@@ -145,6 +151,7 @@ export function OffTab({
 
 	useEffect(() => {
 		if (!detailUser) return;
+		setDetailShowAll(false);
 		api.get<DetailRow[]>(`/api/off/user?id=${detailUser.id}`).then(setDetails).catch(console.error);
 	}, [detailUser]);
 
@@ -193,6 +200,8 @@ export function OffTab({
 		// Total off-days used across all approved requests (one request can
 		// span multiple days; we sum each range inclusive).
 		const totalDaysUsed = details.reduce((sum, d) => sum + offDays(d.startdate, d.enddate, d.period), 0);
+		const DETAIL_CAP = 30;
+		const shownDetails = detailShowAll ? details : details.slice(0, DETAIL_CAP);
 		return (
 			<div>
 				<button className="btn btn-secondary" onClick={() => setDetailUser(null)}>← Back</button>
@@ -214,7 +223,7 @@ export function OffTab({
 							</tr>
 						</thead>
 						<tbody>
-							{details.map((d) => (
+							{shownDetails.map((d) => (
 								<tr key={d.id}>
 									<td>
 										{fmtDates(d)}{d.period === 'AM' || d.period === 'PM' ? ` (${d.period})` : ''}
@@ -236,6 +245,11 @@ export function OffTab({
 						</tbody>
 					</table>
 				)}
+				{!detailShowAll && details.length > DETAIL_CAP && (
+					<button className="btn-link" onClick={() => setDetailShowAll(true)}>
+						Show older ({details.length - DETAIL_CAP} more)
+					</button>
+				)}
 			</div>
 		);
 	}
@@ -255,6 +269,12 @@ export function OffTab({
 				<button className="btn" onClick={() => setShowRequest(true)}>+ Take Off</button>
 				<button className="btn btn-secondary" onClick={() => setShowGive(true)}>+ Credit Off(s)</button>
 			</div>
+			{me.user_role === 'superadmin' && (
+				<div className="actions" style={{ marginTop: 6 }}>
+					<button className="btn btn-secondary" onClick={() => setShowMass('credit')}>👥 Mass Credit</button>
+					<button className="btn btn-secondary" onClick={() => setShowMass('apply')}>👥 Mass Apply Off</button>
+				</div>
+			)}
 
 			{pendingGrants.length > 0 && (
 				<>
@@ -366,6 +386,9 @@ export function OffTab({
 			)}
 			{showGive && (
 				<CreditOffModal me={me} onClose={() => setShowGive(false)} onDone={refreshAll} />
+			)}
+			{showMass && (
+				<MassOffModal kind={showMass} onClose={() => setShowMass(null)} onDone={refreshAll} />
 			)}
 		</div>
 	);
@@ -622,6 +645,157 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 				</label>
 				<button className="btn" disabled={busy || !ok} onClick={submit}>
 					{busy ? 'Submitting…' : immediate ? 'Credit now' : 'Submit for superior approval'}
+				</button>
+			</div>
+		</div>
+	);
+}
+
+// Superadmin-only mass credit / mass apply. Targets: All, by department, or an
+// individual checkbox selection. Per target the worker applies it instantly (if
+// the superadmin may approve that unit) or routes it to that unit's appointment-
+// holders. Mass apply deducts credits and skips anyone who'd go negative.
+function MassOffModal({ kind, onClose, onDone }: { kind: 'credit' | 'apply'; onClose: () => void; onDone: () => Promise<void> }) {
+	const [staff, setStaff] = useState<StaffRow[]>([]);
+	const [mode, setMode] = useState<'all' | 'dept' | 'ids'>('dept');
+	const [dept, setDept] = useState('');
+	const [selected, setSelected] = useState<Set<number>>(new Set());
+	const [search, setSearch] = useState('');
+	const [numDays, setNumDays] = useState<number | ''>('');
+	const [reason, setReason] = useState('');
+	const [startDate, setStartDate] = useState('');
+	const [endDate, setEndDate] = useState('');
+	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>('FD');
+	const [busy, setBusy] = useState(false);
+
+	useEffect(() => {
+		api.get<StaffRow[]>('/api/off/staff').then(setStaff).catch(() => {});
+	}, []);
+
+	const depts = [...new Set(staff.map((s) => s.department).filter((d): d is string => !!d))];
+	useEffect(() => {
+		if (mode === 'dept' && !dept && depts.length) setDept(depts[0]);
+	}, [mode, depts, dept]);
+
+	const filtered = staff.filter((s) => s.full_name.toLowerCase().includes(search.toLowerCase()));
+	const targetCount = mode === 'all' ? staff.length : mode === 'dept' ? staff.filter((s) => s.department === dept).length : selected.size;
+	const toggle = (id: number) =>
+		setSelected((prev) => {
+			const n = new Set(prev);
+			if (n.has(id)) n.delete(id);
+			else n.add(id);
+			return n;
+		});
+
+	const ok =
+		targetCount > 0 &&
+		!!reason.trim() &&
+		(kind === 'credit' ? typeof numDays === 'number' && numDays > 0 : !!startDate && !!endDate && startDate <= endDate);
+
+	async function submit() {
+		if (!ok) return;
+		const range = startDate === endDate ? startDate : `${startDate} → ${endDate}`;
+		const confirmMsg =
+			kind === 'credit'
+				? `Credit ${numDays} off day(s) to ${targetCount} user(s)?`
+				: `Apply ${period} off (${range}) to ${targetCount} user(s)? Off credits will be deducted (anyone with too few is skipped).`;
+		if (!(await confirmDialog(confirmMsg))) return;
+		setBusy(true);
+		try {
+			const target: { mode: string; dept?: string; ids?: number[] } = { mode };
+			if (mode === 'dept') target.dept = dept;
+			if (mode === 'ids') target.ids = [...selected];
+			if (kind === 'credit') {
+				const res = await api.post<{ instant: number; routed: number; total: number }>('/api/off/mass-credit', {
+					...target,
+					num_days: Number(numDays),
+					reason: reason.trim(),
+				});
+				await onDone();
+				onClose();
+				alertDialog(`✅ Mass credit for ${res.total} user(s): ${res.instant} applied now, ${res.routed} sent to appointment-holders for approval.`);
+			} else {
+				const res = await api.post<{ instant: number; routed: number; total: number; insufficient: string[]; already_off: string[] }>('/api/off/mass-apply', {
+					...target,
+					startdate: startDate,
+					enddate: endDate,
+					period,
+					reason: reason.trim(),
+				});
+				await onDone();
+				onClose();
+				let msg = `✅ Mass apply: ${res.instant} applied now, ${res.routed} sent for approval (of ${res.total} selected).`;
+				if (res.insufficient?.length) msg += `\n\n⚠ Skipped — insufficient off credits: ${res.insufficient.join(', ')}.`;
+				if (res.already_off?.length) msg += `\n\n↩ Skipped — already had an overlapping off: ${res.already_off.join(', ')}.`;
+				alertDialog(msg);
+			}
+		} catch (e) {
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	return (
+		<div className="modal-backdrop" onClick={onClose}>
+			<div className="modal" onClick={(e) => e.stopPropagation()}>
+				<h3>{kind === 'credit' ? '👥 Mass Credit Off(s)' : '👥 Mass Apply Off'}</h3>
+				<p className="muted">Superadmin action. Each person is applied instantly where you can approve their unit, otherwise routed to that unit's appointment-holders.</p>
+
+				<label style={{ marginBottom: 6 }}>Who</label>
+				<div className="seg" style={{ marginBottom: 8 }}>
+					<button type="button" className={mode === 'all' ? 'active' : ''} onClick={() => setMode('all')}>Everyone</button>
+					<button type="button" className={mode === 'dept' ? 'active' : ''} onClick={() => setMode('dept')}>By dept</button>
+					<button type="button" className={mode === 'ids' ? 'active' : ''} onClick={() => setMode('ids')}>Pick people</button>
+				</div>
+				{mode === 'dept' && (
+					<select value={dept} onChange={(e) => setDept(e.target.value)} style={{ marginTop: 0, marginBottom: 6 }}>
+						{depts.map((d) => (
+							<option key={d} value={d}>{d}</option>
+						))}
+					</select>
+				)}
+				{mode === 'ids' && (
+					<>
+						<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔎 Search name" style={{ marginTop: 0, marginBottom: 6 }} />
+						<div className="credit-list">
+							{filtered.length === 0 ? (
+								<p className="muted" style={{ padding: '10px 12px', margin: 0 }}>No matching names.</p>
+							) : (
+								filtered.map((s) => (
+									<button type="button" key={s.id} className={`credit-option${selected.has(s.id) ? ' selected' : ''}`} onClick={() => toggle(s.id)}>
+										<span className="credit-option-name">
+											{selected.has(s.id) ? '☑' : '☐'} {s.full_name} <span className="muted">({deptLabel(s.department, null)})</span>
+										</span>
+										<span className="muted">🪙 {s.off_credits}</span>
+									</button>
+								))
+							)}
+						</div>
+					</>
+				)}
+				<p className="muted" style={{ marginTop: 4 }}>Affects <b>{targetCount}</b> user(s).</p>
+
+				{kind === 'credit' ? (
+					<label>Number of off days (half-days allowed, e.g. 3.5)
+						<input type="number" min={0.5} step={0.5} value={numDays} onChange={(e) => setNumDays(e.target.value === '' ? '' : Number(e.target.value))} placeholder="e.g. 3 or 3.5" />
+					</label>
+				) : (
+					<>
+						<label>Start date<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} /></label>
+						<label>End date<input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} /></label>
+						<div className="seg" style={{ margin: '6px 0' }}>
+							<button type="button" className={period === 'FD' ? 'active' : ''} onClick={() => setPeriod('FD')}>Full day</button>
+							<button type="button" className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>AM only</button>
+							<button type="button" className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM only</button>
+						</div>
+					</>
+				)}
+				<label>Reason
+					<textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder={kind === 'credit' ? 'e.g. Cohesion off in lieu' : 'e.g. Depot rest day'} />
+				</label>
+				<button className="btn" disabled={busy || !ok} onClick={submit}>
+					{busy ? 'Submitting…' : kind === 'credit' ? `Credit ${targetCount} user(s)` : `Apply off to ${targetCount} user(s)`}
 				</button>
 			</div>
 		</div>

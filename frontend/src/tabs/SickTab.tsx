@@ -45,9 +45,6 @@ export function SickTab({
 	onConsumed?: () => void;
 }) {
 	const selfManaged = !!me.self_managed;
-	// Appointment-holders & self-managed users auto-approve their own RSI/RSO, so
-	// they can also one-step-undo it (no separate superior to ask).
-	const autoApproves = !!me.self_managed || !!me.appointment;
 	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
 	// Which day a new RSI/RSO is for — defaults to tomorrow once it's past 17:30.
 	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(sgtPastSickCutoff() ? 'tomorrow' : 'today');
@@ -115,7 +112,7 @@ export function SickTab({
 		if (!open) return;
 		const isPending = open.reportsick_status === 'pending_superior';
 		const ok = await confirmDialog(
-			isPending ? 'Cancel this sick report?' : 'Undo this RSI/RSO? It will be removed and your parade status for that day reverted.',
+			isPending ? 'Cancel this sick report?' : 'Cancel this RSI/RSO? It will be withdrawn and your parade status for those days reverted.',
 		);
 		if (!ok) return;
 		setBusy(true);
@@ -140,6 +137,10 @@ export function SickTab({
 			alertDialog('Please enter MC start and end dates.');
 			return;
 		}
+		if (!location.trim() || !approxTime.trim()) {
+			alertDialog('Please enter both location and approximate time.');
+			return;
+		}
 		setBusy(true);
 		try {
 			const res = await api.post<{ ok: boolean; mc_dates?: string[] }>('/api/sick/update', {
@@ -159,7 +160,9 @@ export function SickTab({
 			const mc = res.mc_dates ?? [];
 			if (mc.length > 0) {
 				const range = mc.length === 1 ? mc[0] : `${mc[0]} → ${mc[mc.length - 1]}`;
-				alertDialog(`Update sent.\n\n🗓 The bot set your Parade State to MC for ${range} (${mc.length} working day${mc.length === 1 ? '' : 's'}). Your RSI/RSO half-day is kept as-is.`);
+				alertDialog(
+					`Update sent.\n\n🗓 The bot set your Parade State to MC for ${range} (${mc.length} working day${mc.length === 1 ? '' : 's'}). Your RSI/RSO half-day is kept as-is.\n\n📎 IMPORTANT: now SEND the MC photo/PDF as a message in your Telegram chat with this bot (there is no upload here)${selfManaged ? '.' : ' — it auto-forwards to your superior.'}`,
+				);
 			} else {
 				alertDialog('Update sent.');
 			}
@@ -259,10 +262,10 @@ export function SickTab({
 					</div>
 				)}
 				{(open.reportsick_status === 'pending_superior' ||
-					(autoApproves && ['approved', 'updated', 'flagged'].includes(open.reportsick_status))) && (
+					['approved', 'updated', 'flagged'].includes(open.reportsick_status)) && (
 					<div className="entry-actions">
 						<button className="btn-link danger" disabled={busy} onClick={cancelPending}>
-							{open.reportsick_status === 'pending_superior' ? '🗑 Cancel request' : '↩ Undo RSI/RSO'}
+							{open.reportsick_status === 'pending_superior' ? '🗑 Cancel request' : '🗑 Cancel RSI/RSO'}
 						</button>
 					</div>
 				)}
@@ -271,6 +274,17 @@ export function SickTab({
 			{showUpdateForm && (
 				<>
 					<h4 className="section-title">Update status</h4>
+					<div
+						style={{
+							margin: '0 0 12px',
+							padding: '10px 12px',
+							borderRadius: 12,
+							border: '2px dashed var(--depot-info, #0288d1)',
+							lineHeight: 1.45,
+						}}
+					>
+						📄 <b>Got an MC?</b> There is <u>no upload in this app</u>. Open your Telegram chat with this bot and <b>send the MC photo or PDF as a message</b> — {selfManaged ? 'the bot saves it to your latest RSI/RSO case.' : 'it auto-forwards to your superior and is saved to your latest RSI/RSO case.'} Fill the dates below too. <span className="muted">(No MC? Just enter 0 below.)</span>
+					</div>
 					<label>
 						Number of MC days *
 						<input
@@ -290,18 +304,19 @@ export function SickTab({
 									margin: '6px 0 12px',
 									padding: '12px 14px',
 									borderRadius: 12,
-									background: 'var(--depot-warning)',
+									background: 'var(--depot-danger)',
 									color: '#fff',
 									fontWeight: 600,
-									lineHeight: 1.4,
+									lineHeight: 1.45,
 								}}
 							>
-								📎 Attach your MC document now — send the <b>photo or PDF</b> of your MC <u>directly to this bot in the chat</u>. It auto-forwards to your superior.
+								📎 SEND YOUR MC NOW — not here. ⚠️ This app has <u>no upload</u>.<br />
+								Go to your <b>Telegram chat with this bot</b> and send the MC <b>photo or PDF as a normal message</b>. The bot replies “MC received”{selfManaged ? ' and attaches it to your case.' : ' and auto-forwards it to your superior.'}
 							</div>
 						</>
 					)}
 					<label>
-						Location
+						Location *
 						<input
 							value={location}
 							onChange={(e) => setLocation(e.target.value)}
@@ -309,14 +324,14 @@ export function SickTab({
 						/>
 					</label>
 					<label>
-						Approximate Time
+						Approximate Time *
 						<input
 							value={approxTime}
 							onChange={(e) => setApproxTime(e.target.value)}
 							placeholder="e.g. 0930"
 						/>
 					</label>
-					<button className="btn" disabled={busy || mcDays === ''} onClick={submitUpdate}>
+					<button className="btn" disabled={busy || mcDays === '' || !location.trim() || !approxTime.trim()} onClick={submitUpdate}>
 						{busy ? 'Saving…' : 'Submit update'}
 					</button>
 				</>

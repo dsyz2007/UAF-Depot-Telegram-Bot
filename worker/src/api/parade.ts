@@ -4,7 +4,7 @@ import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
 import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
 import { buildXlsx } from '../xlsx';
-import { packApprovalMsgs, resolveApprovalDms, type MsgPair } from '../approval-dms';
+import { informMaMcCombo } from '../ma-mc';
 
 const REASON_REQUIRED = new Set<string>(REASON_REQUIRED_STATUSES as readonly string[]);
 
@@ -380,7 +380,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const deleteStmt = env.depot_db.prepare(
 			`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND period = ?`,
 		);
-		const pendingPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
+		const informPayloads: { date: string; period: 'AM' | 'PM'; status: string; reason: string | null }[] = [];
 
 		for (const d of dates) {
 			for (const e of clean) {
@@ -398,12 +398,12 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 						(e.period === 'PM' && minutesNow >= PM_CUTOFF_MIN));
 				// Present / duty-style statuses apply directly even when late.
 				const noApprovalNeeded = e.status === 'Present' || e.status === 'Operator Off';
+				// INFORM-ONLY: apply every change immediately. A LATE non-Present change
+				// is additionally recorded so we DM the unit's appointment-holders an FYI
+				// afterwards (these no longer need approval).
+				directOps.push(upsertStmt.bind(target.id, d, e.period, e.status, e.reason));
 				if (isLate && !noApprovalNeeded) {
-					// Late non-Present → needs superior approval.
-					pendingPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
-				} else {
-					// Apply now. Late Present applies silently (no superior FYI).
-					directOps.push(upsertStmt.bind(target.id, d, e.period, e.status, e.reason));
+					informPayloads.push({ date: d, period: e.period, status: e.status, reason: e.reason });
 				}
 			}
 		}
@@ -411,68 +411,26 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		if (directOps.length > 0) await env.depot_db.batch(directOps);
 		if (deleteOps.length > 0) await env.depot_db.batch(deleteOps);
 
-		const approverTids = pendingPayloads.length ? await approverTidsFor(env, user) : [];
-
-		// Stage pending requests — supersede any previous pending for the same
-		// (user, date, period) so the superior only ever sees the latest one.
-		const pendingIds: number[] = [];
-		for (const p of pendingPayloads) {
-			const superseded = await env.depot_db
-				.prepare(
-					`UPDATE parade_change_requests SET status = 'cancelled'
-					 WHERE user_id = ? AND parade_state_date = ? AND period = ? AND status = 'pending'
-					 RETURNING id`,
-				)
-				.bind(user.id, p.date, p.period)
-				.all<{ id: number }>();
-			// Clear the now-superseded request's stale Approve/Reject buttons on every
-			// superior's copy — otherwise tapping the old message just yields an
-			// "Already cancelled." toast while the live buttons linger forever.
-			for (const old of superseded.results ?? []) {
-				await resolveApprovalDms(
-					env,
-					'parade_change_requests',
-					'approval_message_id',
-					old.id,
-					`⤴️ Superseded — ${user.full_name} submitted a newer ${p.period} change for ${p.date}.`,
-				);
-			}
-			const ins = await env.depot_db
-				.prepare(
-					`INSERT INTO parade_change_requests
-					   (user_id, parade_state_date, period, new_status, new_reason, status)
-					 VALUES (?, ?, ?, ?, ?, 'pending')
-					 RETURNING id`,
-				)
-				.bind(user.id, p.date, p.period, p.status, p.reason)
-				.first<{ id: number }>();
-			if (!ins) continue;
-			pendingIds.push(ins.id);
-
-			// Per-request DM with inline Approve/Reject to EACH superior; store all
-			// (chat,msg) pairs so a decision edits every copy.
-			const cutoff = p.period === 'AM' ? '07:00' : '13:00';
-			const msgPairs: MsgPair[] = [];
-			for (const tid of approverTids) {
-				const msg = await tgSendMessage(env.BOT_TOKEN, {
-					chat_id: tid,
-					text: `🟡 <b>Late ${p.period} parade-state change</b> (after ${cutoff})\n${user.full_name}: ${p.date} → ${p.status}${p.reason ? `\nReason: ${p.reason}` : ''}`,
-					parse_mode: 'HTML',
-					reply_markup: {
-						inline_keyboard: [
-							[
-								{ text: '✅ Approve', callback_data: `paradechg:approve:${ins.id}` },
-								{ text: '❌ Reject', callback_data: `paradechg:reject:${ins.id}` },
-							],
-						],
-					},
-				});
-				if (msg?.message_id) msgPairs.push([tid, String(msg.message_id)]);
-			}
-			if (msgPairs.length) {
-				await env.depot_db.prepare(`UPDATE parade_change_requests SET approval_message_id = ? WHERE id = ?`).bind(packApprovalMsgs(msgPairs), ins.id).run();
+		// INFORM-ONLY: the late non-Present changes were applied immediately above; just
+		// DM the unit's appointment-holders an FYI (no Approve/Reject). Plain text (no
+		// parse_mode) so names/reasons containing &/</> can't break the message.
+		if (informPayloads.length > 0) {
+			const approverTids = await approverTidsFor(env, user);
+			if (approverTids.length) {
+				const lines = informPayloads
+					.map((p) => {
+						const cutoff = p.period === 'AM' ? '07:00' : '13:00';
+						return `• ${p.date} ${p.period} → ${p.status}${p.reason ? ` (${p.reason})` : ''} (after ${cutoff})`;
+					})
+					.join('\n');
+				const text = `🔔 Late parade-state change — applied automatically (FYI, no action needed).\n${user.full_name}:\n${lines}`;
+				await Promise.allSettled(approverTids.map((tid) => tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
 			}
 		}
+
+		// MA (AM) + MC (PM) on the same date → remind the target to submit MC on
+		// OneNS + send it in chat, and inform their approvers. Deduped per date.
+		await informMaMcCombo(env, target.id, [...new Set(dates)]);
 
 		// Edit the most-recent parade nudge (if any) in place, so the user's own
 		// update is reflected without sending another notification. Only today /
@@ -510,8 +468,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		return json({
 			ok: true,
 			applied: directOps.length + deleteOps.length,
-			pending: pendingPayloads.length,
-			pending_ids: pendingIds,
+			informed: informPayloads.length,
 			skipped_weekends: skippedWeekends,
 			skipped_past: skippedPast,
 			// Set when an RSI/RSO half was stripped from a self-edit: the rest was

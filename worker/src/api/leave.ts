@@ -13,7 +13,7 @@ import { tgSendMessage } from '../tg';
 import { autoApprovesOwn, isLeaveStatus, periodsOverlap } from '../types';
 import { approverTidsFor, sameUnit } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
-import { packApprovalMsgs, resolveApprovalDms, type MsgPair } from '../approval-dms';
+import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
 function isValidDate(s: unknown): s is string {
 	return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -252,30 +252,40 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
-			.prepare(`SELECT id, user_id, leave_type, period, startdate, enddate, status FROM leave_requests WHERE id = ?`)
+			.prepare(
+				`SELECT l.id, l.user_id, l.leave_type, l.period, l.startdate, l.enddate, l.status,
+				        a.telegram_id AS approver_tid
+				 FROM leave_requests l LEFT JOIN users a ON a.id = l.approved_by WHERE l.id = ?`,
+			)
 			.bind(body.id)
-			.first<{ id: number; user_id: number; leave_type: string; period: LeavePeriod; startdate: string; enddate: string; status: string }>();
+			.first<{ id: number; user_id: number; leave_type: string; period: LeavePeriod; startdate: string; enddate: string; status: string; approver_tid: string | null }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
-		const isPending = row.status === 'pending';
-		const selfUndo = autoApprovesOwn(user) && row.status === 'approved';
-		if (!isPending && !selfUndo) return json({ error: 'not_cancellable', state: row.status }, { status: 409 });
+		// The requester may withdraw their OWN request in ANY state — pending,
+		// approved, or rejected (a private dismiss).
+		const cancellable = ['pending', 'approved', 'rejected'];
+		if (!cancellable.includes(row.status)) return json({ error: 'not_cancellable', state: row.status }, { status: 409 });
+		const fromState = row.status;
+		const wasRejected = fromState === 'rejected';
+		const wasApproved = fromState === 'approved';
 
-		await env.depot_db
-			.prepare(`UPDATE leave_requests SET status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ?`)
-			.bind(user.id, body.id)
+		const flip = await env.depot_db
+			.prepare(`UPDATE leave_requests SET status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND status = ?`)
+			.bind(user.id, body.id, fromState)
 			.run();
-		await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
+		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_cancellable' }, { status: 409 });
 
-		const approverTids = await approverTidsFor(env, user);
-		await Promise.allSettled(
-			approverTids.map((tid) =>
-				tgSendMessage(env.BOT_TOKEN, {
-					chat_id: tid,
-					text: `🚫 ${user.full_name} cancelled their ${row.leave_type}${leaveNoun(row.leave_type)} request (${rangeLabel(row.startdate, row.enddate)}).`,
-				}),
-			),
-		);
+		// A rejected request already had its parade blanked + approver DMs show
+		// "rejected"; cancelling it is a private dismiss with nothing to undo.
+		if (!wasRejected) {
+			await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
+			// Sync every approver's DM copy → clears live buttons (pending) / shows withdrawn (approved).
+			await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) — withdrawn by requester. No action needed.`);
+			// An edit doesn't push a notification; for an already-approved request ping the approver too.
+			if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
+				await tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `🚫 ${user.full_name} cancelled their ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) that you approved.` });
+			}
+		}
 		return json({ ok: true });
 	}
 
@@ -323,6 +333,8 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 			.bind(body.id)
 			.run();
 		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
+		// Re-arm the chat Approve/Reject buttons on every approver's DM.
+		await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `${leaveIcon(row.leave_type)} ${isMa(row.leave_type) ? 'MA' : 'Leave'} request (re-opened for approval): ${row.requester_name} — ${rangeLabel(row.startdate, row.enddate)}`, 'leave');
 		const msg = `↩ ${user.full_name} reverted your approved ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) — it's pending approval again.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {

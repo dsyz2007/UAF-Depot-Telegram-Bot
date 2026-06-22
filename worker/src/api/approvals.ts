@@ -13,7 +13,7 @@ import { canApprove, sameUnit, departmentsWithHolders } from '../superiors';
 import { approveLeave, setParadeForLeave } from './leave';
 import { setParadeForSick } from './sick';
 import { setParadeForOff } from './off';
-import { resolveApprovalDms } from '../approval-dms';
+import { resolveApprovalDms, restoreApprovalDms } from '../approval-dms';
 import { sgtToday } from '../holidays';
 
 // Credit-days for an off request: half-day (AM/PM) = 0.5 per day, full day = 1.
@@ -115,7 +115,11 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			.prepare(
 				`SELECT s.id, s.user_id, u.full_name, u.department, u.sub_department, s.case_type, s.reason, s.created_at
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id
-				 WHERE s.reportsick_status = 'pending_superior' ${sc.clause} ORDER BY s.created_at`,
+				 WHERE s.reportsick_status = 'pending_superior'
+				   -- Drop stale pending reports whose date has already passed (the daily
+				   -- runSickExpiry cron cancels them; this hides them immediately).
+				   AND (s.sick_date IS NULL OR date(s.sick_date) >= date('now','+8 hours'))
+				   ${sc.clause} ORDER BY s.created_at`,
 			)
 			.bind(...sc.binds)
 			.all<SickItem>();
@@ -528,7 +532,7 @@ async function applyAction(
 		]);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your ${row.case_type} request was approved by ${approver.full_name}.\n\nOnce seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.`,
+			text: `✅ Your ${row.case_type} request was approved by ${approver.full_name}.\n\nOnce seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.\n\n📎 Got an MC? Just send the photo/PDF here in this chat (no upload in the app) — it auto-forwards to your superior.`,
 			reply_markup: { inline_keyboard: [[{ text: '🤒 Open Sick page', web_app: { url: `${env.WEBAPP_URL}?tab=sick` } }]] },
 		});
 		return true;
@@ -670,11 +674,11 @@ async function unrejectItem(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT o.id, o.user_id, o.off_status, o.startdate, o.enddate, o.period,
-				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				        u.full_name AS requester_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM off_requests o JOIN users u ON u.id = o.user_id WHERE o.id = ?`,
 			)
 			.bind(id)
-			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string; requester_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
 		if (!row || row.off_status !== 'rejected') return { ok: false, error: 'not_rejected' };
 		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
 		const flip = await env.depot_db
@@ -686,6 +690,8 @@ async function unrejectItem(
 		const days = offCreditDays(row.startdate, row.enddate, row.period);
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, row.user_id).run();
 		const range = `${row.startdate} → ${row.enddate}`;
+		// Re-arm the chat Approve/Reject buttons on every approver's DM.
+		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', id, `🟡 Off request (re-opened for approval): ${row.requester_name} — ${range}`, 'off');
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `↩ Your previously-rejected off request (${range}) was reopened for approval by ${approver.full_name}.\n🪙 ${days} credit(s) re-reserved pending the decision.`,
@@ -697,11 +703,11 @@ async function unrejectItem(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
-				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				        u.full_name AS requester_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
 			.bind(id)
-			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; requester_tid: string; department: string | null; sub_department: string | null }>();
+			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; requester_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
 		if (!row || row.reportsick_status !== 'rejected') return { ok: false, error: 'not_rejected' };
 		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
 		const flip = await env.depot_db
@@ -711,6 +717,7 @@ async function unrejectItem(
 		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
 		// Re-show optimistically on the calendar (it was blanked on rejection).
 		if (row.sick_date) await setParadeForSick(env, row.user_id, row.department, row.sick_date, row.case_type);
+		await restoreApprovalDms(env, 'sick_cases', 'approval_message_id', id, `🟡 ${row.case_type} request (re-opened for approval): ${row.requester_name}`, 'sick');
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `↩ Your previously-rejected ${row.case_type} was reopened for approval by ${approver.full_name}.`,
@@ -722,11 +729,11 @@ async function unrejectItem(
 		const row = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.status,
-				        u.telegram_id AS requester_tid, u.department, u.sub_department
+				        u.full_name AS staff_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id WHERE g.id = ?`,
 			)
 			.bind(id)
-			.first<{ id: number; user_id: number; num_days: number; status: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+			.first<{ id: number; user_id: number; num_days: number; status: string; staff_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
 		if (!row || row.status !== 'rejected') return { ok: false, error: 'not_rejected' };
 		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
 		const flip = await env.depot_db
@@ -735,6 +742,7 @@ async function unrejectItem(
 			.run();
 		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
 		// Grants only add credits on approval, so there's nothing to restore here.
+		await restoreApprovalDms(env, 'off_credit_grants', 'approval_message_id', id, `🟡 Off-credit request (re-opened for approval): ${row.staff_name} (+${row.num_days} day(s))`, 'grant');
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `↩ Your previously-rejected off-credit request (+${row.num_days} day[s]) was reopened for approval by ${approver.full_name}.`,
@@ -746,11 +754,11 @@ async function unrejectItem(
 	const row = await env.depot_db
 		.prepare(
 			`SELECT l.id, l.user_id, l.leave_type, l.period, l.startdate, l.enddate, l.reason, l.status,
-			        u.telegram_id AS requester_tid, u.department, u.sub_department
+			        u.full_name AS requester_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 			 FROM leave_requests l JOIN users u ON u.id = l.user_id WHERE l.id = ?`,
 		)
 		.bind(id)
-		.first<{ id: number; user_id: number; leave_type: string; period: 'AM' | 'PM' | 'FD'; startdate: string; enddate: string; reason: string | null; status: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+		.first<{ id: number; user_id: number; leave_type: string; period: 'AM' | 'PM' | 'FD'; startdate: string; enddate: string; reason: string | null; status: string; requester_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
 	if (!row || row.status !== 'rejected') return { ok: false, error: 'not_rejected' };
 	if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
 	const flip = await env.depot_db
@@ -762,6 +770,7 @@ async function unrejectItem(
 	await setParadeForLeave(env, row.user_id, row.department, row.startdate, row.enddate, row.leave_type, row.reason, row.period);
 	const noun = row.leave_type === 'MA' ? '' : ' leave';
 	const range = row.startdate === row.enddate ? row.startdate : `${row.startdate} → ${row.enddate}`;
+	await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', id, `${row.leave_type === 'MA' ? '🩺 MA' : '🏖 Leave'} request (re-opened for approval): ${row.requester_name} — ${range}`, 'leave');
 	await tgSendMessage(env.BOT_TOKEN, {
 		chat_id: row.requester_tid,
 		text: `↩ Your previously-rejected ${row.leave_type}${noun} (${range}) was reopened for approval by ${approver.full_name}.`,

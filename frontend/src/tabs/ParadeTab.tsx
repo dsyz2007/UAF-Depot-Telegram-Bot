@@ -480,9 +480,14 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 
 	return (
 		<div>
-			{/* Key forces DayPicker to fully re-render when my own entries change. */}
+			{/* Key on the MONTH only. Including myMonthByDate.size here used to force a
+			    full remount every time the month data loaded — so switching months
+			    remounted the grid against stale/empty data and the AM/PM chips blanked
+			    out until the fetch landed (the legend below, hard-coded, stayed). The
+			    inline DayButton closure already re-reads the fresh map on each parent
+			    re-render, so chips update on edits without the remount flicker. */}
 			<DayPicker
-				key={`cal-${myMonthByDate.size}-${ymKey(month)}`}
+				key={`cal-${ymKey(month)}`}
 				mode="single"
 				month={month}
 				onMonthChange={setMonth}
@@ -900,7 +905,7 @@ function SubmitModal({
 			if (target) payload.user_id = target.id;
 			const res = await api.post<{
 				applied: number;
-				pending: number;
+				informed: number;
 				skipped_weekends: number;
 				skipped_past?: number;
 				blocked_off?: boolean;
@@ -941,8 +946,8 @@ function SubmitModal({
 					: entries.map((e) => `${e.period}: ${e.status}`).join(' · ');
 			const range = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
 			let msg = target ? `✅ Updated ${target.name}\n${parts}\nfor ${range}` : `✅ ${parts}\nfor ${range}`;
-			if (res.pending > 0) {
-				msg += `\n\n⏳ ${res.pending} late ${res.pending === 1 ? 'change' : 'changes'} pending superior approval (today AM after 07:00 / PM after 13:00, non-Present only).`;
+			if (res.informed > 0) {
+				msg += `\n\n🔔 ${res.informed} late ${res.informed === 1 ? 'change was' : 'changes were'} applied immediately and your superior was notified (today AM after 07:00 / PM after 13:00, non-Present).`;
 			}
 			if (res.skipped_weekends > 0) {
 				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
@@ -950,7 +955,7 @@ function SubmitModal({
 			if (res.skipped_past && res.skipped_past > 0) {
 				msg += `\n\n🔒 ${res.skipped_past} past day(s) skipped — only a superadmin can edit days that have ended.`;
 			}
-			if (res.applied === 0 && res.pending === 0) {
+			if (res.applied === 0 && res.informed === 0) {
 				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved — those days have already passed (locked).';
 				else msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
 			}

@@ -11,6 +11,7 @@
 import { tgSendMessage, sendThrottled } from './tg';
 import { getDayWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from './holidays';
 import { dayCountInclusive } from './types';
+import { resolveApprovalDms } from './approval-dms';
 
 // Inline keyboard with a single WebApp button that deep-links to a tab.
 // Optional `date` (YYYY-MM-DD) pre-selects that date on the Parade calendar —
@@ -67,6 +68,8 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
 			// Refund expired-pending offs BEFORE the retention prune runs, so an old
 			// pending off can't be deleted before its credits are returned.
 			await runOffExpiry(env);
+			// Expire stale still-pending RSI/RSO whose date has passed (mirrors off-expiry).
+			await runSickExpiry(env);
 			await Promise.allSettled([
 				runOrdReminders(env),
 				runParadePrune(env),
@@ -468,6 +471,43 @@ async function runOffExpiry(env: Env): Promise<void> {
 	}
 }
 
+// Expire still-pending RSI/RSO whose sick_date has already passed: cancel it,
+// blank the optimistic RSI/RSO parade cell, clear the buttons on the approvers'
+// DMs, and tell the user. Mirrors runOffExpiry. (No credits involved for sick.)
+async function runSickExpiry(env: Env): Promise<void> {
+	const today = sgtToday();
+	const { results } = await env.depot_db
+		.prepare(
+			`SELECT s.id, s.user_id, s.case_type, s.sick_date, u.full_name, u.telegram_id
+			 FROM sick_cases s JOIN users u ON u.id = s.user_id
+			 WHERE s.reportsick_status = 'pending_superior' AND s.sick_date IS NOT NULL AND s.sick_date < ?`,
+		)
+		.bind(today)
+		.all<{ id: number; user_id: number; case_type: string; sick_date: string; full_name: string; telegram_id: string }>();
+	for (const s of results ?? []) {
+		// Atomic flip so a cancel/approve racing this can't double-process.
+		const flip = await env.depot_db
+			.prepare(`UPDATE sick_cases SET reportsick_status = 'cancelled', cancelled_at = datetime('now') WHERE id = ? AND reportsick_status = 'pending_superior'`)
+			.bind(s.id)
+			.run();
+		if ((flip.meta.changes ?? 0) === 0) continue;
+		await env.depot_db
+			.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date = ? AND parade_status = ?`)
+			.bind(s.user_id, s.sick_date, s.case_type)
+			.run();
+		await env.depot_db
+			.prepare(`DELETE FROM reminders WHERE related_type = 'sick_case' AND related_id = ? AND sent_at IS NULL`)
+			.bind(s.id)
+			.run();
+		// Clear the live Approve/Reject buttons on every approver's DM copy.
+		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', s.id, `⌛ ${s.full_name}'s ${s.case_type} (${s.sick_date}) expired unactioned — no action needed.`);
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: s.telegram_id,
+			text: `⌛ Your ${s.case_type} for ${s.sick_date} expired — it was never approved and the date has passed. Report again if you still need it.`,
+		});
+	}
+}
+
 async function runParadePrune(env: Env): Promise<void> {
 	const today = sgtToday();
 	await env.depot_db.batch([
@@ -490,15 +530,20 @@ async function runParadePrune(env: Env): Promise<void> {
 // calendar window, in runParadePrune.)
 async function runRetentionPrune(env: Env): Promise<void> {
 	const cutoff = `date('now','+8 hours','-2 months')`;
+	// Off records (take-off + credit grants) are kept much longer — they're the
+	// off-credit ledger/history, surfaced lazily per-person. Storage stays trivial
+	// (indexed per-user reads), and rows for a user are deleted when that user is
+	// deleted (see admin /users/delete), so this can't grow unbounded.
+	const offCutoff = `date('now','+8 hours','-2 years')`;
 	await env.depot_db.batch([
-		// Off requests — by the off's end date.
-		env.depot_db.prepare(`DELETE FROM off_requests WHERE enddate < ${cutoff}`),
+		// Off requests — by the off's end date (2-year retention).
+		env.depot_db.prepare(`DELETE FROM off_requests WHERE enddate < ${offCutoff}`),
 		// Sick cases — by MC end date, falling back to created date when no MC.
 		env.depot_db.prepare(`DELETE FROM sick_cases WHERE COALESCE(mc_end_date, date(created_at)) < ${cutoff}`),
 		// Leave requests — by the leave's end date.
 		env.depot_db.prepare(`DELETE FROM leave_requests WHERE enddate < ${cutoff}`),
-		// Off-credit grants — by created date (they have no "end").
-		env.depot_db.prepare(`DELETE FROM off_credit_grants WHERE date(created_at) < ${cutoff}`),
+		// Off-credit grants — by created date (2-year retention, ledger history).
+		env.depot_db.prepare(`DELETE FROM off_credit_grants WHERE date(created_at) < ${offCutoff}`),
 		// Late parade-change requests — by the parade date they targeted.
 		env.depot_db.prepare(`DELETE FROM parade_change_requests WHERE parade_state_date < ${cutoff}`),
 		// Reminders — drained or stale ones past their due time.

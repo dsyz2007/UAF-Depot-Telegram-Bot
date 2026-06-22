@@ -123,6 +123,24 @@ function ApprovalsInbox({ me }: { me: Me }) {
 		}
 	}
 
+	// Requester withdraws their OWN still-pending request (Mine view only). Off,
+	// sick and leave/MA each have their own cancel endpoint.
+	async function cancelMine(kind: 'off' | 'sick' | 'leave', id: number) {
+		const ok = await confirmDialog('Cancel this request? It will be withdrawn and any parade status reverted.');
+		if (!ok) return;
+		setBusy(true);
+		try {
+			const path = kind === 'off' ? '/api/off/cancel' : kind === 'sick' ? '/api/sick/cancel' : '/api/leave/cancel';
+			await api.post(path, { id });
+			await refresh();
+			alertDialog('Cancelled.');
+		} catch (e) {
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			setBusy(false);
+		}
+	}
+
 	if (!data) return <div className="muted">Loading…</div>;
 	const total = data.offs.length + data.sick.length + data.grants.length + data.parade.length + data.leave.length;
 	const mineView = scope === 'mine';
@@ -196,6 +214,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: o.reason,
 								onApprove: () => act([{ type: 'off', id: o.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'off', id: o.id, action: 'reject' }], 'Reject'),
+								onCancel: mineView ? () => cancelMine('off', o.id) : undefined,
 							}))}
 						/>
 					)}
@@ -213,6 +232,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: s.reason ? `Reason: ${s.reason}` : s.created_at,
 								onApprove: () => act([{ type: 'sick', id: s.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'sick', id: s.id, action: 'reject' }], 'Reject'),
+								onCancel: mineView ? () => cancelMine('sick', s.id) : undefined,
 							}))}
 						/>
 					)}
@@ -264,6 +284,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: l.reason ?? '',
 								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
+								onCancel: mineView ? () => cancelMine('leave', l.id) : undefined,
 							}))}
 						/>
 					)}
@@ -281,6 +302,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: l.reason ?? '',
 								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
+								onCancel: mineView ? () => cancelMine('leave', l.id) : undefined,
 							}))}
 						/>
 					)}
@@ -303,7 +325,7 @@ function ApprovalGroup({
 	chip: string;
 	busy: boolean;
 	onApproveAll: () => void;
-	rows: { id: number; main: string; sub: string; canAct: boolean; onApprove: () => void; onReject: () => void }[];
+	rows: { id: number; main: string; sub: string; canAct: boolean; onApprove: () => void; onReject: () => void; onCancel?: () => void }[];
 }) {
 	const accent = type === 'grant' ? 'acc-grant' : `acc-${type}`;
 	const actionable = rows.filter((r) => r.canAct).length;
@@ -327,6 +349,8 @@ function ApprovalGroup({
 								<button className="pill-btn approve" disabled={busy} onClick={r.onApprove}>✅</button>
 								<button className="pill-btn reject" disabled={busy} onClick={r.onReject}>❌</button>
 							</div>
+						) : r.onCancel ? (
+							<button className="btn-link danger" style={{ flexShrink: 0 }} disabled={busy} onClick={r.onCancel}>🗑 Cancel</button>
 						) : (
 							<span className="muted" style={{ fontSize: 12, flexShrink: 0 }}>pending</span>
 						)}
@@ -433,19 +457,50 @@ function RecentApprovals({ me }: { me: Me }) {
 		}
 	}
 
+	// Requester withdraws/dismisses their OWN processed request (Mine view only).
+	async function cancelMine(kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string) {
+		const ok = await confirmDialog(
+			isRejected
+				? `Dismiss this rejected ${label}? It will be cleared from your list.`
+				: `Cancel this ${label}? It will be withdrawn and your parade status reverted.`,
+		);
+		if (!ok) return;
+		setBusy(true);
+		try {
+			const path = kind === 'sick' ? '/api/sick/cancel' : kind === 'leave' ? '/api/leave/cancel' : '/api/off/cancel';
+			await api.post(path, { id });
+			await refresh();
+			alertDialog(isRejected ? 'Dismissed.' : 'Cancelled.');
+		} catch (e) {
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			setBusy(false);
+		}
+	}
+
 	if (!data) return null;
 	const mineView = scope === 'mine';
 
-	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean) =>
-		can ? (
+	// Approver view → Undo/Reopen (gated by can_undo). Mine view → the requester's
+	// own Cancel/Dismiss (a rejected OFF can't be cancelled — its credits were
+	// already refunded on rejection; an off-credit grant has no requester-cancel).
+	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean) => {
+		if (mineView) {
+			if (kind === 'grant' || (kind === 'off' && isRejected)) return null;
+			return (
+				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
+					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
+				</button>
+			);
+		}
+		return can ? (
 			<button className="btn-link danger" disabled={busy} onClick={() => undo(kind, id, label)}>
 				{isRejected ? '↩ Reopen' : '↩ Undo'}
 			</button>
-		) : mineView ? null : (
-			// In the "Mine" view every row is your own request — there's nothing to
-			// undo, so the "view only" tag would just be noise.
+		) : (
 			<span className="muted" style={{ fontSize: 12 }}>view only</span>
 		);
+	};
 
 	// Type filter (Leave and MA shown separately — they are different types).
 	const leaveOnly = data.leave.filter((l) => l.leave_type !== 'MA');
@@ -509,7 +564,7 @@ function RecentApprovals({ me }: { me: Me }) {
 				{isRejected ? 'Rejections' : 'Approvals'} in the last 14 days{whoText}.
 				{' '}
 				{mineView
-					? 'These are your own requests — view only.'
+					? 'These are your own requests — use Cancel/Dismiss to withdraw or clear one.'
 					: isRejected
 						? 'Reopening sends the request back to Pending approvals (off credits are re-reserved).'
 						: 'Undoing sends the request back to Pending approvals (an off-credit grant’s credits are clawed back; off-day credits stay reserved).'}
