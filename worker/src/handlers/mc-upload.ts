@@ -23,14 +23,14 @@ export function registerMcUpload(bot: Bot, env: Env): void {
 		// Attach to the most recent case that's expecting an MC.
 		const sickCase = await env.depot_db
 			.prepare(
-				`SELECT sc.id, sc.case_type, sc.sick_date, su.telegram_id AS superior_tid
+				`SELECT sc.id, sc.case_type, sc.sick_date, su.telegram_id AS superior_tid, su.full_name AS superior_name
 				 FROM sick_cases sc
 				 LEFT JOIN users su ON su.id = sc.superior_user_id
 				 WHERE sc.user_id = ? AND sc.reportsick_status IN ('approved','flagged','updated')
 				 ORDER BY sc.id DESC LIMIT 1`,
 			)
 			.bind(user.id)
-			.first<{ id: number; case_type: string; sick_date: string | null; superior_tid: string | null }>();
+			.first<{ id: number; case_type: string; sick_date: string | null; superior_tid: string | null; superior_name: string | null }>();
 		if (!sickCase) {
 			await ctx.reply('No active RSI/RSO case to attach this to. Report sick in the depot app first.');
 			return;
@@ -53,14 +53,17 @@ export function registerMcUpload(bot: Bot, env: Env): void {
 			.bind(fileId, fileType, sickCase.id)
 			.run();
 
-		await ctx.reply(`📎 MC received and attached to your ${sickCase.case_type} case${sickCase.sick_date ? ` (for ${sickCase.sick_date})` : ''}.`);
-
 		// Auto-forward to the superior who approved the case, if distinct —
 		// copyMessage preserves the original photo/document and adds a caption.
 		const superiorTid = sickCase.superior_tid;
-		if (superiorTid && superiorTid !== uploaderTid) {
+		const willForward = !!superiorTid && superiorTid !== uploaderTid;
+		await ctx.reply(
+			`📎 MC received and attached to your ${sickCase.case_type} case${sickCase.sick_date ? ` (for ${sickCase.sick_date})` : ''}.` +
+				(willForward && sickCase.superior_name ? ` The bot helped you forward it to ${sickCase.superior_name}.` : ''),
+		);
+		if (willForward) {
 			try {
-				await ctx.api.copyMessage(superiorTid, ctx.chat.id, ctx.message.message_id, {
+				await ctx.api.copyMessage(superiorTid!, ctx.chat.id, ctx.message.message_id, {
 					caption: `📎 MC from ${user.full_name} (${sickCase.case_type}${sickCase.sick_date ? ` for ${sickCase.sick_date}` : ''}).`,
 				});
 			} catch (e) {

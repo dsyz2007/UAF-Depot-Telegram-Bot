@@ -59,6 +59,7 @@ interface GrantRow {
 	reason: string;
 	status: string;
 	granted_by_name: string | null;
+	approved_by_name: string | null;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -94,6 +95,10 @@ export function OffTab({
 	const [summary, setSummary] = useState<SummaryRow[]>([]);
 	const [detailUser, setDetailUser] = useState<SummaryRow | null>(null);
 	const [details, setDetails] = useState<DetailRow[]>([]);
+	// Per-person CREDIT history (off_credit_grants), loaded lazily alongside the
+	// take-off history when a person is opened, with its own show-older cap.
+	const [detailCredits, setDetailCredits] = useState<GrantRow[]>([]);
+	const [detailShowAllCredits, setDetailShowAllCredits] = useState(false);
 	const [mine, setMine] = useState<MyOffRow[]>([]);
 	const [grants, setGrants] = useState<GrantRow[]>([]);
 	const [credits, setCredits] = useState<number>(me.off_credits);
@@ -152,14 +157,20 @@ export function OffTab({
 	useEffect(() => {
 		if (!detailUser) return;
 		setDetailShowAll(false);
+		setDetailShowAllCredits(false);
 		api.get<DetailRow[]>(`/api/off/user?id=${detailUser.id}`).then(setDetails).catch(console.error);
+		api.get<GrantRow[]>(`/api/off/user-credits?id=${detailUser.id}`).then(setDetailCredits).catch(console.error);
 	}, [detailUser]);
 
 	async function refreshAll() {
 		await Promise.all([loadSummary(), loadMine(), loadGrants(), loadMyCredits()]);
 		if (detailUser) {
-			const fresh = await api.get<DetailRow[]>(`/api/off/user?id=${detailUser.id}`);
+			const [fresh, freshCredits] = await Promise.all([
+				api.get<DetailRow[]>(`/api/off/user?id=${detailUser.id}`),
+				api.get<GrantRow[]>(`/api/off/user-credits?id=${detailUser.id}`),
+			]);
 			setDetails(fresh);
+			setDetailCredits(freshCredits);
 		}
 	}
 
@@ -249,6 +260,39 @@ export function OffTab({
 					<button className="btn-link" onClick={() => setDetailShowAll(true)}>
 						Show older ({details.length - DETAIL_CAP} more)
 					</button>
+				)}
+
+				<h4 className="section-title" style={{ marginTop: 18 }}>Credit history</h4>
+				{detailCredits.length === 0 ? (
+					<p className="muted">No approved credit grants yet.</p>
+				) : (
+					<>
+						<table>
+							<thead>
+								<tr>
+									<th>Credits</th>
+									<th>Reason</th>
+									<th>Approved by</th>
+									<th>Approved date</th>
+								</tr>
+							</thead>
+							<tbody>
+								{(detailShowAllCredits ? detailCredits : detailCredits.slice(0, DETAIL_CAP)).map((g) => (
+									<tr key={g.id}>
+										<td>🪙 +{g.num_days}</td>
+										<td><span className="muted">{g.reason}</span></td>
+										<td>{g.approved_by_name ?? '—'}</td>
+										<td>{g.approved_at?.slice(0, 10) ?? '—'}</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+						{!detailShowAllCredits && detailCredits.length > DETAIL_CAP && (
+							<button className="btn-link" onClick={() => setDetailShowAllCredits(true)}>
+								Show older ({detailCredits.length - DETAIL_CAP} more)
+							</button>
+						)}
+					</>
 				)}
 			</div>
 		);

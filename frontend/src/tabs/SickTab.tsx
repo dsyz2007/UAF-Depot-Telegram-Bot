@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, alertDialog, confirmDialog, type Me } from '../lib/api';
+import { api, alertDialog, confirmDialog, sgtDateTime, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 interface OpenCase {
@@ -252,8 +252,8 @@ export function SickTab({
 				</div>
 				<div className="entry-meta">
 					{open.sick_date && <span>📅 for {open.sick_date}</span>}
-					<span>📝 {open.created_at}</span>
-					{open.approved_at && <span>✓ {open.approved_at}</span>}
+					<span>📝 Submitted {sgtDateTime(open.created_at)}</span>
+					{open.approved_at && <span>✓ Approved {sgtDateTime(open.approved_at)}</span>}
 				</div>
 				{open.reason && <div className="entry-reason">Reason: {open.reason}</div>}
 				{open.num_of_mc_days != null && open.num_of_mc_days >= 1 && (

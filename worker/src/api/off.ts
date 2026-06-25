@@ -149,6 +149,7 @@ interface GrantRow {
 	reason: string;
 	status: string;
 	granted_by_name: string | null;
+	approved_by_name: string | null;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -204,6 +205,27 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			)
 			.bind(id)
 			.all<DetailRow>();
+		return json(results ?? []);
+	}
+
+	// Approved off-CREDIT grants for one person (the credit side of their off
+	// ledger). Same 2-year retention as take-offs; surfaced lazily when a person
+	// is opened in the Off page. Indexed by (user_id) so it reads only their rows.
+	if (request.method === 'GET' && sub === '/user-credits') {
+		const id = Number(url.searchParams.get('id'));
+		if (!Number.isInteger(id)) return json({ error: 'bad_id' }, { status: 400 });
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status, g.created_at, g.approved_at,
+				        gr.full_name AS granted_by_name, ab.full_name AS approved_by_name
+				 FROM off_credit_grants g
+				 LEFT JOIN users gr ON gr.id = g.granted_by
+				 LEFT JOIN users ab ON ab.id = g.superior_user_id
+				 WHERE g.user_id = ? AND g.status = 'approved'
+				 ORDER BY g.id DESC`,
+			)
+			.bind(id)
+			.all<GrantRow>();
 		return json(results ?? []);
 	}
 

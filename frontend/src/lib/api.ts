@@ -84,6 +84,20 @@ export function deptLabel(department: string | null | undefined, _sub?: string |
 	return department ?? 'Unassigned';
 }
 
+// D1/SQLite stores timestamps (datetime('now') / CURRENT_TIMESTAMP) in UTC, with
+// no timezone marker — e.g. '2026-06-25 14:30:15'. Render them in SGT (UTC+8) so
+// "submitted/approved at" times match the wall clock the user actually sees.
+// Returns 'YYYY-MM-DD HH:MM SGT' (minute precision is enough here).
+export function sgtDateTime(utc: string | null | undefined): string {
+	if (!utc) return '';
+	let iso = utc.trim();
+	if (!iso.includes('T')) iso = iso.replace(' ', 'T');
+	if (!iso.endsWith('Z') && !/[+-]\d\d:?\d\d$/.test(iso)) iso += 'Z';
+	const ms = Date.parse(iso);
+	if (Number.isNaN(ms)) return utc; // unparseable — show raw rather than blank
+	return new Date(ms + 8 * 3_600_000).toISOString().replace('T', ' ').slice(0, 16) + ' SGT';
+}
+
 export interface Me {
 	id: number;
 	telegram_id: string;

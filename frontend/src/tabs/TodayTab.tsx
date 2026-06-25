@@ -1,5 +1,5 @@
 import { useEffect, useState, type CSSProperties } from 'react';
-import { api, alertDialog, confirmDialog, deptLabel, type Me } from '../lib/api';
+import { api, alertDialog, confirmDialog, deptLabel, sgtDateTime, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
 // Pill-style toggle used by the Pending page type filter.
@@ -229,7 +229,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								id: s.id,
 								canAct: s.can_action,
 								main: `${deptLabel(s.department, s.sub_department)} · ${s.full_name} · ${s.case_type}`,
-								sub: s.reason ? `Reason: ${s.reason}` : s.created_at,
+								sub: s.reason ? `Reason: ${s.reason}` : `Submitted ${sgtDateTime(s.created_at)}`,
 								onApprove: () => act([{ type: 'sick', id: s.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'sick', id: s.id, action: 'reject' }], 'Reject'),
 								onCancel: mineView ? () => cancelMine('sick', s.id) : undefined,
@@ -795,9 +795,10 @@ export function TodayTab({ me }: { me: Me }) {
 													</div>
 												)}
 												{s.location && <div className="muted">Location: {s.location}</div>}
-												{s.approx_time && <div className="muted">Time: {s.approx_time}</div>}
-												{s.approved_by_name && <div className="muted">Approved by {s.approved_by_name}{s.approved_at ? ` · ${s.approved_at}` : ''}</div>}
-												{!s.approved_by_name && s.approved_at && <div className="muted">Approved {s.approved_at}</div>}
+												{s.approx_time && <div className="muted">Appt time: {s.approx_time}</div>}
+												<div className="muted">Submitted: {sgtDateTime(s.created_at)}</div>
+												{s.approved_by_name && <div className="muted">Approved by {s.approved_by_name}{s.approved_at ? ` · ${sgtDateTime(s.approved_at)}` : ''}</div>}
+												{!s.approved_by_name && s.approved_at && <div className="muted">Approved {sgtDateTime(s.approved_at)}</div>}
 											</div>
 										))}
 									</div>

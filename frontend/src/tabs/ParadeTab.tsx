@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { DayPicker } from 'react-day-picker';
 import 'react-day-picker/style.css';
 import { api, alertDialog, deptLabel, DEPARTMENTS, type Me, type RouteAction } from '../lib/api';
@@ -394,7 +394,11 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 	const bounds = useMemo(() => calendarBounds(), []);
 	const initial = useMemo(() => initialDate(bounds.minIso, bounds.maxIso), [bounds]);
 	const [month, setMonth] = useState<Date>(initial);
-	const [myMonthByDate, setMyMonthByDate] = useState<Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>>(new Map());
+	// Store the month-data WITH the ym it belongs to, so a stale /my-month response
+	// (one that resolved out-of-order while the user switched months / refocused the
+	// app) can never be shown for the wrong month. See refreshMyMonth.
+	type MonthMap = Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>;
+	const [myMonth, setMyMonth] = useState<{ ym: string; byDate: MonthMap } | null>(null);
 	const [dayDetails, setDayDetails] = useState<Entry[]>([]);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [selectedDate, setSelectedDate] = useState<Date>(initial);
@@ -415,19 +419,31 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 	const [forecastTarget, setForecastTarget] = useState<{ id: number; name: string } | null>(null);
 	const canEditParade = (uid: number) => staffEdit.all || staffEdit.ids.has(uid);
 
+	// Always-current ym, so an in-flight fetch can tell at resolve time whether the
+	// user has since switched away from the month it was fetching.
+	const curYm = ymKey(month);
+	const curYmRef = useRef(curYm);
+	curYmRef.current = curYm;
+
 	// Fetch only the current user's entries for the visible month (~60 rows max).
 	function refreshMyMonth() {
 		setLoadError(null);
+		const requestedYm = ymKey(month);
 		return api
-			.get<MyMonthRow[]>(`/api/parade/my-month?ym=${ymKey(month)}`)
+			.get<MyMonthRow[]>(`/api/parade/my-month?ym=${requestedYm}`)
 			.then((rows) => {
+				// Drop a stale response: if the user navigated to another month (or a
+				// focus-refresh raced this) the displayed month no longer matches what we
+				// fetched, so applying it would blank the calendar with the wrong month's
+				// (non-matching) date keys. Whichever month is shown, only ITS response wins.
+				if (requestedYm !== curYmRef.current) return;
 				const m = new Map<string, { AM?: MyMonthRow; PM?: MyMonthRow }>();
 				for (const r of rows) {
 					const cur = m.get(r.parade_state_date) ?? {};
 					cur[r.period] = r;
 					m.set(r.parade_state_date, cur);
 				}
-				setMyMonthByDate(m);
+				setMyMonth({ ym: requestedYm, byDate: m });
 			})
 			.catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
 	}
@@ -460,6 +476,12 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 	}, [selectedDate, showEveryone]);
 	// Sync when the user returns to the app (e.g. a late-change was approved).
 	useFocusRefresh(refresh);
+
+	// Render guard: only expose the month map when it belongs to the displayed
+	// month. During a month switch (before the new fetch lands) this is an empty
+	// map → cells render blank (loading) rather than stale, and a late stale write
+	// can't leak through either.
+	const myMonthByDate: MonthMap = myMonth && myMonth.ym === curYm ? myMonth.byDate : new Map();
 
 	const myToday = myMonthByDate.get(ymdKey(selectedDate));
 
@@ -725,6 +747,11 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 					}}
 					onDone={refresh}
 					onRoute={onRoute}
+					onSaved={(d) => {
+						const dt = new Date(`${d}T00:00:00`);
+						setMonth(dt);
+						setSelectedDate(dt);
+					}}
 				/>
 			)}
 
@@ -754,6 +781,7 @@ function SubmitModal({
 	onClose,
 	onDone,
 	onRoute,
+	onSaved,
 }: {
 	initialDate: string;
 	minIso: string;
@@ -767,6 +795,9 @@ function SubmitModal({
 	onClose: () => void;
 	onDone: () => Promise<void>;
 	onRoute: (action: RouteAction) => void;
+	// After a clean SELF save, jump the calendar to the saved start date so the new
+	// colour is visible immediately (esp. when submitting for a different month).
+	onSaved?: (startdate: string) => void;
 }) {
 	const [startdate, setStartdate] = useState(initialDate);
 	const [enddate, setEnddate] = useState(initialDate);
@@ -881,6 +912,7 @@ function SubmitModal({
 				});
 				await onDone();
 				onClose();
+				if (!target) onSaved?.(startdate);
 				const lrange = startdate === enddate ? startdate : `${startdate} → ${enddate} (${dayCount} days)`;
 				const half = leaveSel.period === 'FD' ? 'full-day' : `${leaveSel.period} half-day`;
 				const otherNote =
@@ -940,6 +972,9 @@ function SubmitModal({
 				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar — report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
 				return;
 			}
+			// Clean self save — jump the calendar to the saved start date so the new
+			// colour is visible immediately (covers submitting for a different month).
+			if (!target) onSaved?.(startdate);
 			const parts =
 				mode === 'fd'
 					? `Full day: ${entries[0].status}`
