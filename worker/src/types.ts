@@ -6,6 +6,12 @@ declare global {
 	interface Env {
 		BOT_TOKEN: string;
 		WEBHOOK_SECRET: string;
+		// Private-bot invite gate. An unknown Telegram ID may only create an
+		// account by arriving through `t.me/<bot>?start=<INVITE_CODE>`. Stored as
+		// a Worker secret (NOT a committed var) so it can be rotated on leak
+		// without a code change. Must be in Telegram's start-payload charset
+		// ([A-Za-z0-9_-], ≤64 chars).
+		INVITE_CODE: string;
 	}
 }
 
