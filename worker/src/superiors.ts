@@ -17,6 +17,14 @@ export function sameUnit(
 	return u.department === dept && (u.sub_department ?? '') === (sub ?? '');
 }
 
+// DHQ (depot HQ) appointment-holders get a LIMITED cross-department oversight
+// role: they may reject/revert other units' requests and credit (incl. negative)
+// any unit — but NOT approve other units' requests, and they are NEVER added to
+// another unit's notification routing (see approverTidsFor, which is unchanged).
+export function isHqHolder(u: { appointment: string | null; department: string | null }): boolean {
+	return !!u.appointment && u.department === 'DHQ';
+}
+
 interface ApproverTarget {
 	id: number;
 	department: string | null;
@@ -74,6 +82,11 @@ export async function canApprove(
 		reqDepartment === approver.department &&
 		(approver.sub_department ?? '') === (reqSub ?? '');
 	if (appointed && inUnit) return true;
+	// DHQ appointment-holders may approve/reject/revert ANY unit (HQ oversight).
+	// This is an AUTHORITY check only — it does NOT add them to other units'
+	// notification routing (approverTidsFor is unchanged), so they get no DMs for
+	// other departments; the items only appear in their in-app inbox.
+	if (isHqHolder(approver)) return true;
 	if (isSuper) {
 		if (!reqDepartment) return true; // no-department orphan → all superadmins
 		// A unit with no OTHER active appointment-holder also falls back to all

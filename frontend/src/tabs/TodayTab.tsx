@@ -71,7 +71,9 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	const canSeeOthers = me.is_approver;
 	// Normal users → their own requests; superadmins → all depts (that's where
 	// the units they're the fallback approver for live); appointment-holders → dept.
-	const [scope, setScope] = useState<InboxScope>(!canSeeOthers ? 'mine' : me.user_role === 'superadmin' ? 'all' : 'dept');
+	// Default to MY DEPT when the viewer has a department (incl. DHQ holders &
+	// dept-ed superadmins); only a department-less superadmin defaults to All.
+	const [scope, setScope] = useState<InboxScope>(!canSeeOthers ? 'mine' : me.department ? 'dept' : 'all');
 	const [typeFilter, setTypeFilter] = useState<InboxTypeFilter>('all');
 	const [data, setData] = useState<ApprovalsPayload | null>(null);
 	const [busy, setBusy] = useState(false);

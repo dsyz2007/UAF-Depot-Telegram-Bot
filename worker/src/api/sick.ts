@@ -1,7 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { autoApprovesOwn } from '../types';
-import { approverTidsFor, sameUnit } from '../superiors';
+import { approverTidsFor, sameUnit, isHqHolder } from '../superiors';
 import { sgtToday, sgtDateAddDays, sgtPeriodNow, getDayWorkInfo, getRangeWorkInfo, slotWorking } from '../holidays';
 import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
@@ -421,7 +421,8 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const canRevert =
 			user.user_role === 'superadmin' ||
 			row.superior_user_id === user.id ||
-			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub));
+			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub)) ||
+			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
 		// Reopen as pending (back to the inbox) and clear the approval fields.

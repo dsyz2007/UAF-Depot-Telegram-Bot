@@ -9,7 +9,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive } from '../types';
-import { canApprove, sameUnit, departmentsWithHolders } from '../superiors';
+import { canApprove, sameUnit, departmentsWithHolders, isHqHolder } from '../superiors';
 import { approveLeave, setParadeForLeave } from './leave';
 import { setParadeForSick } from './sick';
 import { setParadeForOff } from './off';
@@ -152,8 +152,13 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const holderDepts = await departmentsWithHolders(env);
 		const isSuper = isSuperadmin(user.user_role);
 		const appointed = !!user.appointment;
+		const hqHolder = isHqHolder(user);
+		// can_action = may approve/reject. Own unit, superadmin fallback, OR a DHQ
+		// appointment-holder (HQ oversight over ANY unit). DHQ holders are NOT in any
+		// other unit's notification routing (approverTidsFor) — this only surfaces the
+		// items in their in-app inbox when they choose to look.
 		const canActOn = (dept: string | null, subDept: string | null): boolean =>
-			(appointed && sameUnit(user, dept, subDept)) || (isSuper && (dept == null || !holderDepts.has(dept)));
+			(appointed && sameUnit(user, dept, subDept)) || (isSuper && (dept == null || !holderDepts.has(dept))) || hqHolder;
 		const withAct = <T extends Dept>(rows: T[]): (T & { can_action: boolean })[] =>
 			rows.map((r) => ({ ...r, can_action: canActOn(r.department, r.sub_department) }));
 
@@ -208,10 +213,12 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			}
 			return { clause: '', binds: [] }; // 'all'
 		};
+		const hqHolder = isHqHolder(user);
 		const canUndo = (dept: string | null, subDept: string | null, actorId: number | null): boolean =>
 			(appointed && sameUnit(user, dept, subDept)) ||
 			(isSuper && (dept == null || !holderDepts.has(dept))) ||
-			(actorId != null && actorId === user.id);
+			(actorId != null && actorId === user.id) ||
+			hqHolder; // DHQ holders may undo/revert (and reopen) any unit's items.
 
 		// Per-status column config (status value + actor column + timestamp column).
 		const approved = status === 'approved';

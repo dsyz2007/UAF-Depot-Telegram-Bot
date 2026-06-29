@@ -1,7 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { dayCountInclusive, autoApprovesOwn, periodsOverlap } from '../types';
-import { approverTidsFor, sameUnit, departmentsWithHolders } from '../superiors';
+import { approverTidsFor, sameUnit, departmentsWithHolders, isHqHolder } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
 import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
@@ -383,7 +383,9 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const rawDays = Number(body.num_days);
 		const days = Number.isFinite(rawDays) ? Math.round(rawDays * 10) / 10 : NaN;
 		const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
-		if (!Number.isFinite(days) || days <= 0) {
+		// Negative credits are allowed (a deliberate deduction / correction by a
+		// unit appointment-holder or DHQ); only zero / non-numeric is rejected.
+		if (!Number.isFinite(days) || days === 0) {
 			return json({ error: 'invalid_num_days', got: body.num_days ?? null }, { status: 400 });
 		}
 		if (!reason) return json({ error: 'reason_required' }, { status: 400 });
@@ -404,21 +406,20 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			}>();
 		if (!staff) return json({ error: 'staff_not_found' }, { status: 404 });
 
-		// Immediate (no approval) ONLY when the GRANTER holds an appointment AND is
-		// self-managed AND the recipient is in the granter's own department (incl
-		// themselves). Everyone else's credit — including a superadmin/admin
-		// crediting another person — is a proposal routed for approval.
-		const granterAutoCredit = !!user.appointment && !!user.self_managed && sameUnit(user, staff.department, staff.sub_department);
+		// Immediate (no approval) when the granter is the recipient unit's authority:
+		// an appointment-holder of the recipient's OWN unit, or a DHQ appointment-
+		// holder (who may credit — incl. NEGATIVE — ANY unit). A superadmin/admin who
+		// is NOT that unit's holder still routes for approval; anyone may self-credit.
+		const isUnitHolder = !!user.appointment && sameUnit(user, staff.department, staff.sub_department);
+		const isHq = isHqHolder(user);
+		const autoCredit = isUnitHolder || isHq;
 
-		// Who may credit ANOTHER person: admins/superadmins (any department,
-		// subject to approval), or an appointment+self granter within their own
-		// department. Anyone may propose a self-credit.
-		if (!isSelf && !isAdminish(user.user_role) && !granterAutoCredit) {
+		if (!isSelf && !isAdminish(user.user_role) && !autoCredit) {
 			return json({ error: 'forbidden' }, { status: 403 });
 		}
 
-		if (granterAutoCredit) {
-			// The appointment+self granter self-approves their own-department credit.
+		if (autoCredit) {
+			// The unit's appointment-holder (or DHQ) self-approves the credit/deduction.
 			await env.depot_db.batch([
 				env.depot_db
 					.prepare(
@@ -435,7 +436,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			if (staff.telegram_id !== user.telegram_id) {
 				await tgSendMessage(env.BOT_TOKEN, {
 					chat_id: staff.telegram_id,
-					text: `🪙 ${user.full_name} credited you +${days} off day(s). Balance: ${bal?.off_credits ?? '?'}.`,
+					text: `🪙 Off-credit ${days >= 0 ? 'grant' : 'deduction'} by ${user.full_name}: ${days >= 0 ? '+' : ''}${days} day(s). Balance: ${bal?.off_credits ?? '?'}.`,
 				});
 			}
 			return json({ ok: true, auto_approved: true, balance: bal?.off_credits, recipient_name: staff.full_name });
@@ -585,7 +586,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const canRevert =
 			user.user_role === 'superadmin' ||
 			row.approved_by === user.id ||
-			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub));
+			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub)) ||
+			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
 		// Reopen as pending (back to the inbox). Credits were reserved at request
@@ -656,7 +658,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const canRevertGrant =
 			user.user_role === 'superadmin' ||
 			row.superior_user_id === user.id ||
-			(!!user.appointment && sameUnit(user, row.staff_dept, row.staff_sub));
+			(!!user.appointment && sameUnit(user, row.staff_dept, row.staff_sub)) ||
+			isHqHolder(user);
 		if (!canRevertGrant) return json({ error: 'not_your_approval' }, { status: 403 });
 		// Reopen as pending (back to the inbox) and claw the credits back — atomic
 		// flip so a double-revert can't claw twice.
@@ -678,9 +681,9 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 	}
 
 	if (request.method === 'GET' && sub === '/staff') {
-		// Admins & superadmins may credit anyone. Include role + personnel type so
-		// the client can sort by the same tiebreaks as the Parade panel.
-		if (user.user_role === 'admin' || user.user_role === 'superadmin') {
+		// Admins, superadmins, and DHQ appointment-holders may credit anyone. Include
+		// role + personnel type so the client can sort by the same tiebreaks.
+		if (user.user_role === 'admin' || user.user_role === 'superadmin' || isHqHolder(user)) {
 			const { results } = await env.depot_db
 				.prepare(
 					`SELECT id, full_name, off_credits, department, user_role, personnel_type
@@ -689,8 +692,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				.all<{ id: number; full_name: string; off_credits: number; department: string | null; user_role: string; personnel_type: string | null }>();
 			return json(results ?? []);
 		}
-		// An appointment+self granter may credit their OWN department's members.
-		if (user.appointment && user.self_managed) {
+		// Any appointment-holder may credit their OWN department's members.
+		if (user.appointment) {
 			const { results } = await env.depot_db
 				.prepare(
 					`SELECT id, full_name, off_credits, department, user_role, personnel_type

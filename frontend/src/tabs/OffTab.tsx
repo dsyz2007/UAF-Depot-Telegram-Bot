@@ -533,7 +533,9 @@ function RequestOffModal({
 function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; onDone: () => Promise<void> }) {
 	// Admins/superadmins can credit anyone (subject to approval); an
 	// appointment+self user can credit their own department (incl self).
-	const canCreditOthers = isAdminish(me.user_role) || (!!me.appointment && !!me.self_managed);
+	// Admins/superadmins, and any appointment-holder (DHQ → any dept, others → own
+	// dept, enforced server-side), may credit other people — incl. NEGATIVE amounts.
+	const canCreditOthers = isAdminish(me.user_role) || !!me.appointment;
 	const [staff, setStaff] = useState<StaffRow[]>([]);
 	// '' means self for normal users; admins pick a recipient from the list.
 	const [staffId, setStaffId] = useState<number | ''>('');
@@ -593,12 +595,15 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 		}
 	}
 
-	const ok = typeof numDays === 'number' && numDays > 0 && reason.trim().length > 0;
+	// Crediters may go negative (a deduction); a plain self-crediter cannot.
+	const ok = typeof numDays === 'number' && (canCreditOthers ? numDays !== 0 : numDays > 0) && reason.trim().length > 0;
 	// Immediate (no approval) only when the granter holds an appointment AND is
 	// self-managed AND the recipient is in their own department (incl self).
 	// Everyone else's credit (incl admin/superadmin → others) is a proposal.
 	const recipientDept = selfSelected ? me.department : selected?.department ?? null;
-	const immediate = !!me.appointment && !!me.self_managed && me.department === recipientDept;
+	// Applies immediately when the granter is the recipient unit's authority: an
+	// appointment-holder of that unit, or a DHQ appointment-holder (any unit).
+	const immediate = !!me.appointment && (me.department === recipientDept || me.department === 'DHQ');
 
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
@@ -674,14 +679,14 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 						)}
 					</>
 				)}
-				<label>Number of off days (half-days allowed, e.g. 3.5)
+				<label>Number of off days (half-days allowed, e.g. 3.5{canCreditOthers ? '; negative to deduct' : ''})
 					<input
 						type="number"
-						min={0.5}
+						min={canCreditOthers ? undefined : 0.5}
 						step={0.5}
 						value={numDays}
 						onChange={(e) => setNumDays(e.target.value === '' ? '' : Number(e.target.value))}
-						placeholder="e.g. 3 or 3.5"
+						placeholder={canCreditOthers ? 'e.g. 3, 3.5 or -2' : 'e.g. 3 or 3.5'}
 					/>
 				</label>
 				<label>Reason

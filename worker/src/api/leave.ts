@@ -11,7 +11,7 @@
 import { json, type AuthedContext } from './router';
 import { tgSendMessage } from '../tg';
 import { autoApprovesOwn, isLeaveStatus, periodsOverlap } from '../types';
-import { approverTidsFor, sameUnit } from '../superiors';
+import { approverTidsFor, sameUnit, isHqHolder } from '../superiors';
 import { getRangeWorkInfo, slotWorking } from '../holidays';
 import { packApprovalMsgs, resolveApprovalDms, restoreApprovalDms, type MsgPair } from '../approval-dms';
 
@@ -325,7 +325,8 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		const canRevert =
 			user.user_role === 'superadmin' ||
 			row.approved_by === user.id ||
-			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub));
+			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub)) ||
+			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
 		const flip = await env.depot_db
