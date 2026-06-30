@@ -506,6 +506,32 @@ async function runSickExpiry(env: Env): Promise<void> {
 			text: `⌛ Your ${s.case_type} for ${s.sick_date} expired — it was never approved and the date has passed. Report again if you still need it.`,
 		});
 	}
+
+	// Hygiene: archive resolved/stale cases. approved/updated/flagged cases never
+	// auto-close on their own, so they linger forever as "open" — cluttering the
+	// active-sick views (a "seen, no MC" updated case has no mc_end_date, so
+	// /api/today shows it indefinitely) and, before the per-day dedup fix, silently
+	// blocking new reports. Once a case's report date AND any MC end have both been
+	// >3 days in the past (so it can no longer be active anywhere), flip it to the
+	// existing terminal 'cancelled' state with cancelled_by left NULL = system-
+	// archived (same convention as the pending-expiry above). The MC parade cells
+	// are left untouched — the MC genuinely happened; we're only closing the case.
+	const staleResolved =
+		`reportsick_status IN ('approved','updated','flagged')
+		   AND sick_date IS NOT NULL
+		   AND date(sick_date) < date('now','+8 hours','-3 days')
+		   AND (mc_end_date IS NULL OR date(mc_end_date) < date('now','+8 hours','-3 days'))`;
+	await env.depot_db.batch([
+		// Drop any still-unsent update-reminders for cases we're about to archive.
+		env.depot_db.prepare(
+			`DELETE FROM reminders WHERE related_type = 'sick_case' AND sent_at IS NULL
+			   AND related_id IN (SELECT id FROM sick_cases WHERE ${staleResolved})`,
+		),
+		env.depot_db.prepare(
+			`UPDATE sick_cases SET reportsick_status = 'cancelled', cancelled_at = datetime('now')
+			 WHERE ${staleResolved}`,
+		),
+	]);
 }
 
 async function runParadePrune(env: Env): Promise<void> {

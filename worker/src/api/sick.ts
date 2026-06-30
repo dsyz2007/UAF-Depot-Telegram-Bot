@@ -152,12 +152,23 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const reason = body.reason?.trim() || null;
 		if (!reason) return json({ error: 'reason_required' }, { status: 400 });
 
+		// Block only a DUPLICATE report for the SAME day, and only while a prior
+		// case for that day is still in progress (pending / approved / flagged). We
+		// deliberately do NOT block on:
+		//   • other dates — a finished or pending case for another day must never
+		//     stop today's/tomorrow's report. (This was the "already_open" bug: the
+		//     old check was date-agnostic, so a resolved case from days ago
+		//     permanently occupied the single open slot and 409'd every new report.)
+		//   • an 'updated' case for the SAME day — once the outcome of one visit is
+		//     recorded, the user may legitimately report again for another doctor
+		//     visit that same day / half-day.
 		const open = await env.depot_db
 			.prepare(
 				`SELECT id FROM sick_cases
-				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','updated','flagged')`,
+				 WHERE user_id = ? AND sick_date = ?
+				   AND reportsick_status IN ('pending_superior','approved','flagged')`,
 			)
-			.bind(user.id)
+			.bind(user.id, sickDate)
 			.first<{ id: number }>();
 		if (open) return json({ error: 'already_open', id: open.id }, { status: 409 });
 
