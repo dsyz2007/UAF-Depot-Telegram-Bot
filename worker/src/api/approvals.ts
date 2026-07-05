@@ -476,7 +476,7 @@ async function applyAction(
 	if (type === 'sick') {
 		const row = await env.depot_db
 			.prepare(
-				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.approval_message_id, s.sick_date,
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.approval_message_id, s.sick_date, s.period,
 				        u.full_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
@@ -488,6 +488,7 @@ async function applyAction(
 				reportsick_status: string;
 				approval_message_id: string | null;
 				sick_date: string | null;
+				period: string | null;
 				full_name: string;
 				requester_tid: string;
 				department: string | null;
@@ -523,11 +524,13 @@ async function applyAction(
 		if ((flipSickA.meta.changes ?? 0) === 0) return false;
 		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', id, `✅ ${row.full_name}'s ${row.case_type} approved by ${approver.full_name}.`);
 		// Schedule the 3h/6h personnel + 8h superior-flag reminders. For a case dated
-		// LATER than today (i.e. reported for tomorrow), anchor the timers to 08:00
-		// SGT of the sick day instead of approval time — so an evening approval
-		// doesn't fire (and flag) the user the night before. 08:00 SGT = 00:00 UTC,
-		// so the base is '<sick_date> 00:00:00'; a same-day case counts from 'now'.
-		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} 00:00:00` : 'now';
+		// LATER than today (i.e. reported for tomorrow), anchor the timers to the START
+		// of the reported half-day instead of approval time — so an evening approval
+		// doesn't fire (and flag) the user the night before. AM/FD → 08:00 SGT (= 00:00
+		// UTC); a PM report → 12:00 SGT (= 04:00 UTC) so it doesn't start counting from
+		// the morning. A same-day case counts from 'now'.
+		const anchorTime = row.period === 'PM' ? '04:00:00' : '00:00:00';
+		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} ${anchorTime}` : 'now';
 		const stmt = env.depot_db.prepare(
 			`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
 			 VALUES (?, 'sick_case', ?, datetime(?, ?), ?)`,
@@ -709,12 +712,12 @@ async function unrejectItem(
 	if (type === 'sick') {
 		const row = await env.depot_db
 			.prepare(
-				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date, s.period, s.reason,
 				        u.full_name AS requester_name, u.telegram_id AS requester_tid, u.department, u.sub_department
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
 			)
 			.bind(id)
-			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; requester_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
+			.first<{ id: number; user_id: number; case_type: string; reportsick_status: string; sick_date: string | null; period: string | null; reason: string | null; requester_name: string; requester_tid: string; department: string | null; sub_department: string | null }>();
 		if (!row || row.reportsick_status !== 'rejected') return { ok: false, error: 'not_rejected' };
 		if (!(await canApprove(env, approver, row.department, row.sub_department, row.user_id))) return { ok: false, error: 'forbidden', status: 403 };
 		const flip = await env.depot_db
@@ -723,7 +726,7 @@ async function unrejectItem(
 			.run();
 		if ((flip.meta.changes ?? 0) === 0) return { ok: false, error: 'not_rejected' };
 		// Re-show optimistically on the calendar (it was blanked on rejection).
-		if (row.sick_date) await setParadeForSick(env, row.user_id, row.department, row.sick_date, row.case_type);
+		if (row.sick_date) await setParadeForSick(env, row.user_id, row.department, row.sick_date, row.case_type, row.period as 'AM' | 'PM' | 'FD' | null, row.reason);
 		await restoreApprovalDms(env, 'sick_cases', 'approval_message_id', id, `🟡 ${row.case_type} request (re-opened for approval): ${row.requester_name}`, 'sick');
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,

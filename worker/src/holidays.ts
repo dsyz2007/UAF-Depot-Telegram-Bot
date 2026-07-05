@@ -60,9 +60,11 @@ export interface OverrideRow {
 	period: OverridePeriod;
 	departments: string[] | null; // null = all departments
 	is_working_day: number;
+	reason: string | null;
 }
 export interface DayWorkInfo {
 	baseNonWorking: boolean; // weekend or confirmed public holiday
+	holidayName: string | null; // name of the confirmed public holiday on this date, if any
 	overrides: OverrideRow[];
 }
 
@@ -95,24 +97,52 @@ export function slotWorking(info: DayWorkInfo, department: string | null, period
 	return !info.baseNonWorking;
 }
 
+// Why is a (department, period) slot non-working? Returns null if it IS working;
+// otherwise a human-readable reason: the forced-non-working override's reason, or
+// the public-holiday name, or a weekend label. Used to alert a user who tries to
+// set parade state on a non-working slot instead of silently dropping it.
+export function slotNonWorkingReason(
+	info: DayWorkInfo,
+	department: string | null,
+	period: Period,
+	date: string,
+): string | null {
+	if (slotWorking(info, department, period)) return null;
+	const matches = info.overrides.filter(
+		(o) =>
+			(o.period === period || o.period === 'FD') &&
+			(o.departments === null || (department !== null && o.departments.includes(department))),
+	);
+	if (matches.length) {
+		matches.sort((a, b) => overrideScore(b, period, department) - overrideScore(a, period, department));
+		if (matches[0].is_working_day === 0) return matches[0].reason?.trim() || 'Forced non-working day';
+	}
+	if (info.holidayName) return `Public holiday: ${info.holidayName}`;
+	const dow = dayOfWeekSgt(date);
+	if (dow === 6) return 'Weekend (Saturday)';
+	if (dow === 0) return 'Weekend (Sunday)';
+	return 'Non-working day';
+}
+
 export async function getDayWorkInfo(env: Env, sgtDate: string): Promise<DayWorkInfo> {
 	const { results: ovs } = await env.depot_db
-		.prepare('SELECT period, departments, is_working_day FROM working_day_overrides WHERE override_date = ?')
+		.prepare('SELECT period, departments, is_working_day, reason FROM working_day_overrides WHERE override_date = ?')
 		.bind(sgtDate)
-		.all<{ period: OverridePeriod; departments: string | null; is_working_day: number }>();
+		.all<{ period: OverridePeriod; departments: string | null; is_working_day: number; reason: string | null }>();
 	const overrides: OverrideRow[] = (ovs ?? []).map((r) => ({
 		period: r.period,
 		departments: parseDepartments(r.departments),
 		is_working_day: r.is_working_day,
+		reason: r.reason,
 	}));
 
 	const ph = await env.depot_db
-		.prepare('SELECT 1 AS one FROM public_holidays WHERE holiday_date = ? AND confirmed = 1')
+		.prepare('SELECT name FROM public_holidays WHERE holiday_date = ? AND confirmed = 1')
 		.bind(sgtDate)
-		.first<{ one: number }>();
+		.first<{ name: string }>();
 	const dow = dayOfWeekSgt(sgtDate);
 	const baseNonWorking = !!ph || dow === 0 || dow === 6;
-	return { baseNonWorking, overrides };
+	return { baseNonWorking, holidayName: ph?.name ?? null, overrides };
 }
 
 // Batch variant — two queries total regardless of range size (used by the
@@ -123,26 +153,27 @@ export async function getRangeWorkInfo(env: Env, dates: string[]): Promise<Map<s
 	const ph = dates.map(() => '?').join(',');
 
 	const { results: ovs } = await env.depot_db
-		.prepare(`SELECT override_date, period, departments, is_working_day FROM working_day_overrides WHERE override_date IN (${ph})`)
+		.prepare(`SELECT override_date, period, departments, is_working_day, reason FROM working_day_overrides WHERE override_date IN (${ph})`)
 		.bind(...dates)
-		.all<{ override_date: string; period: OverridePeriod; departments: string | null; is_working_day: number }>();
+		.all<{ override_date: string; period: OverridePeriod; departments: string | null; is_working_day: number; reason: string | null }>();
 	const ovByDate = new Map<string, OverrideRow[]>();
 	for (const r of ovs ?? []) {
 		const arr = ovByDate.get(r.override_date) ?? [];
-		arr.push({ period: r.period, departments: parseDepartments(r.departments), is_working_day: r.is_working_day });
+		arr.push({ period: r.period, departments: parseDepartments(r.departments), is_working_day: r.is_working_day, reason: r.reason });
 		ovByDate.set(r.override_date, arr);
 	}
 
 	const { results: hols } = await env.depot_db
-		.prepare(`SELECT holiday_date FROM public_holidays WHERE confirmed = 1 AND holiday_date IN (${ph})`)
+		.prepare(`SELECT holiday_date, name FROM public_holidays WHERE confirmed = 1 AND holiday_date IN (${ph})`)
 		.bind(...dates)
-		.all<{ holiday_date: string }>();
-	const holidaySet = new Set((hols ?? []).map((h) => h.holiday_date));
+		.all<{ holiday_date: string; name: string }>();
+	const holidayNames = new Map((hols ?? []).map((h) => [h.holiday_date, h.name]));
 
 	for (const d of dates) {
 		const dow = dayOfWeekSgt(d);
 		out.set(d, {
-			baseNonWorking: holidaySet.has(d) || dow === 0 || dow === 6,
+			baseNonWorking: holidayNames.has(d) || dow === 0 || dow === 6,
+			holidayName: holidayNames.get(d) ?? null,
 			overrides: ovByDate.get(d) ?? [],
 		});
 	}

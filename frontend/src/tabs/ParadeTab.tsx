@@ -939,6 +939,7 @@ function SubmitModal({
 				applied: number;
 				informed: number;
 				skipped_weekends: number;
+				skipped_slots?: { date: string; period: 'AM' | 'PM'; reason: string }[];
 				skipped_past?: number;
 				blocked_off?: boolean;
 				blocked_sick?: 'RSI' | 'RSO' | null;
@@ -984,7 +985,23 @@ function SubmitModal({
 			if (res.informed > 0) {
 				msg += `\n\n🔔 ${res.informed} late ${res.informed === 1 ? 'change was' : 'changes were'} applied immediately and your superior was notified (today AM after 07:00 / PM after 13:00, non-Present).`;
 			}
-			if (res.skipped_weekends > 0) {
+			if (res.skipped_slots && res.skipped_slots.length > 0) {
+				// Detailed per-day reasons (forced non-working overrides, holidays,
+				// weekends) so the user knows WHY a slot wasn't saved. Collapse AM+PM
+				// with the same reason into one "full day" line.
+				const byKey = new Map<string, { date: string; reason: string; periods: Set<string> }>();
+				for (const s of res.skipped_slots) {
+					const key = `${s.date}|${s.reason}`;
+					const g = byKey.get(key) ?? { date: s.date, reason: s.reason, periods: new Set<string>() };
+					g.periods.add(s.period);
+					byKey.set(key, g);
+				}
+				const lines = [...byKey.values()].map((g) => {
+					const half = g.periods.size >= 2 ? 'full day' : [...g.periods][0];
+					return `• ${g.date} (${half}): ${g.reason}`;
+				});
+				msg += `\n\n🟦 Not saved — non-working slot(s):\n${lines.join('\n')}`;
+			} else if (res.skipped_weekends > 0) {
 				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
 			}
 			if (res.skipped_past && res.skipped_past > 0) {

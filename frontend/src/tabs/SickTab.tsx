@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, alertDialog, confirmDialog, sgtDateTime, type Me } from '../lib/api';
 import { useFocusRefresh } from '../lib/useFocusRefresh';
 
@@ -17,7 +17,16 @@ interface OpenCase {
 	location: string | null;
 	approx_time: string | null;
 	mc_file_id: string | null;
+	period: string | null;
 	created_at: string;
+}
+
+interface UserSickStat {
+	id: number;
+	full_name: string;
+	department: string | null;
+	sick_count: number;
+	mc_days: number;
 }
 
 // SGT (UTC+8) date string, optionally offset by N days.
@@ -44,62 +53,96 @@ export function SickTab({
 	initialReason?: string;
 	onConsumed?: () => void;
 }) {
-	const selfManaged = !!me.self_managed;
-	const [open, setOpen] = useState<OpenCase | null | undefined>(undefined);
-	// Which day a new RSI/RSO is for — defaults to tomorrow once it's past 17:30.
-	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(sgtPastSickCutoff() ? 'tomorrow' : 'today');
+	// ALL currently-active cases (RSI/RSO can be reported concurrently), newest first.
+	const [cases, setCases] = useState<OpenCase[] | undefined>(undefined);
 	const [loadError, setLoadError] = useState<string | null>(null);
-	const [busy, setBusy] = useState(false);
-	const [mcDays, setMcDays] = useState<number | ''>('');
-	const [startDate, setStartDate] = useState('');
-	const [endDate, setEndDate] = useState('');
-	const [location, setLocation] = useState('');
-	const [approxTime, setApproxTime] = useState('');
-	// Reason / symptoms captured at report time, shown to the approver. Pre-filled
-	// from the Parade-calendar reason when routed here.
-	const [reportReason, setReportReason] = useState(initialReason ?? '');
 
 	function refresh() {
 		setLoadError(null);
 		return api
-			.get<OpenCase | null>('/api/sick/my-open')
-			.then(setOpen)
+			.get<OpenCase[]>('/api/sick/my-open')
+			.then((rows) => setCases(rows ?? []))
 			.catch((e: unknown) => {
 				const msg = e instanceof Error ? e.message : String(e);
 				setLoadError(msg);
-				setOpen(null);
+				setCases([]);
 			});
 	}
 	useEffect(() => {
 		refresh();
 	}, []);
-	// Sync the case (e.g. superior approved it) when the user returns to the app.
+	// Sync (e.g. superior approved it) when the user returns to the app.
 	useFocusRefresh(refresh);
 
-	// When routed here from the Parade tab, just land on the report UI (below);
-	// the user picks the day + RSI/RSO. Consume the route so it doesn't re-fire.
+	// When routed here from the Parade tab, just land on the report UI; consume the
+	// route so it doesn't re-fire.
 	const routeHandled = useRef(false);
 	useEffect(() => {
 		if (initialSick && !routeHandled.current) {
 			routeHandled.current = true;
-			// Carry the calendar reason over (covers the case where this tab was
-			// already mounted when the route fired).
-			if (initialReason) setReportReason(initialReason);
 			onConsumed?.();
 		}
 		if (!initialSick) routeHandled.current = false;
-	}, [initialSick, initialReason, onConsumed]);
+	}, [initialSick, onConsumed]);
+
+	if (loadError) {
+		return (
+			<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
+				<h3>⚠ Couldn't load sick page</h3>
+				<p className="muted">{loadError}</p>
+				<p className="muted">This usually means a migration wasn't fully applied yet. Run the latest migrations, then:</p>
+				<button className="btn" onClick={() => refresh()}>Retry</button>
+			</div>
+		);
+	}
+
+	if (cases === undefined) return <div className="muted">Loading…</div>;
+
+	return (
+		<div>
+			{/* Report buttons are ALWAYS available — even with active cases (concurrent
+			    reporting: multiple visits or consecutive sick days). */}
+			<ReportForm initialReason={initialReason} onReported={refresh} />
+
+			{cases.length > 0 && <h4 className="section-title" style={{ marginTop: 20 }}>Your active RSI/RSO ({cases.length})</h4>}
+			{cases.map((c) => (
+				<CaseCard key={c.id} me={me} c={c} onChanged={refresh} />
+			))}
+
+			{me.user_role === 'superadmin' && <SickStats />}
+		</div>
+	);
+}
+
+// ── The report form (day + half-day + reason + RSI/RSO buttons) ──────────────
+function ReportForm({ initialReason, onReported }: { initialReason?: string; onReported: () => Promise<void> }) {
+	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(sgtPastSickCutoff() ? 'tomorrow' : 'today');
+	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>('FD');
+	const [reportReason, setReportReason] = useState(initialReason ?? '');
+	const [busy, setBusy] = useState(false);
+
+	// Carry the calendar reason over if it arrives after mount.
+	useEffect(() => {
+		if (initialReason) setReportReason(initialReason);
+	}, [initialReason]);
 
 	async function report(case_type: 'RSI' | 'RSO') {
 		setBusy(true);
 		try {
 			const sickDate = sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1);
-			await api.post('/api/sick/report', { case_type, sick_date: sickDate, reason: reportReason.trim() || null });
-			await refresh();
+			const res = await api.post<{ auto_approved?: boolean }>('/api/sick/report', {
+				case_type,
+				sick_date: sickDate,
+				reason: reportReason.trim() || null,
+				period,
+			});
+			setReportReason('');
+			await onReported();
+			const half = period === 'FD' ? 'day' : `${period} half-day`;
 			alertDialog(
-				selfManaged
-					? `${case_type} logged for ${sickDate} (no approval needed). Update your status below.`
-					: `${case_type} submitted for ${sickDate} — awaiting approval. Your parade state for that day now shows ${case_type}.`,
+				res.auto_approved
+					? `${case_type} logged for ${sickDate} (${period}) — no approval needed. Update your status in the card below.`
+					: `${case_type} submitted for ${sickDate} (${period}) — awaiting approval. Your parade state for that ${half} now shows ${case_type}.`,
 			);
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -108,27 +151,93 @@ export function SickTab({
 		}
 	}
 
-	async function cancelPending() {
-		if (!open) return;
-		const isPending = open.reportsick_status === 'pending_superior';
+	const pastCutoff = sgtPastSickCutoff();
+	return (
+		<div>
+			<h3>Report Sick</h3>
+			<p className="muted" style={{ marginBottom: 8 }}>
+				You can report RSI/RSO anytime — even if you already have an active case (e.g. multiple doctor visits or several days sick).
+			</p>
+			<p className="muted" style={{ marginBottom: 6 }}>Which day is this RSI/RSO for?</p>
+			<div className="seg" style={{ marginBottom: 8 }}>
+				<button className={sickDay === 'today' ? 'active' : ''} onClick={() => setSickDay('today')}>
+					Today · {sgtDateStr(0)}
+				</button>
+				<button className={sickDay === 'tomorrow' ? 'active' : ''} onClick={() => setSickDay('tomorrow')}>
+					Tomorrow · {sgtDateStr(1)}
+				</button>
+			</div>
+			<p className="muted" style={{ marginBottom: 6 }}>Which half-day?</p>
+			<div className="seg" style={{ marginBottom: 8 }}>
+				<button className={period === 'FD' ? 'active' : ''} onClick={() => setPeriod('FD')}>Full day</button>
+				<button className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>AM only</button>
+				<button className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM only</button>
+			</div>
+			{sickDay === 'tomorrow' && period === 'PM' && (
+				<p className="muted" style={{ marginBottom: 6, fontSize: 12 }}>
+					⏱ A next-day PM report starts its update/flag timer from 12:00 (not 08:00).
+				</p>
+			)}
+			{pastCutoff && (
+				<div
+					style={{
+						margin: '0 0 10px',
+						padding: '10px 12px',
+						borderRadius: 12,
+						background: sickDay === 'today' ? 'var(--depot-danger)' : 'var(--depot-warning)',
+						color: '#fff',
+						fontWeight: 600,
+						lineHeight: 1.4,
+					}}
+				>
+					⚠ It's past 3pm — afternoon/evening reports are usually for <b>TOMORROW</b>. You've selected{' '}
+					<b>{sickDay === 'today' ? 'TODAY' : 'TOMORROW'}</b> ({sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}). Double-check before submitting.
+				</div>
+			)}
+			<label>
+				Reason / symptoms <span className="danger">*required</span> <span className="muted">(shown to your approver)</span>
+				<textarea value={reportReason} onChange={(e) => setReportReason(e.target.value)} placeholder="e.g. Fever and sore throat" />
+			</label>
+			<p className="muted" style={{ marginBottom: 6 }}>
+				Report for <b>{sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}</b> ({period === 'FD' ? 'full day' : `${period} half-day`}):
+			</p>
+			{!reportReason.trim() && <p className="muted danger" style={{ marginBottom: 6 }}>Enter a reason / symptoms to report.</p>}
+			<div className="actions">
+				<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSI')}>🏥 RSI (In-Camp)</button>
+				<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSO')}>🩺 RSO (Outside)</button>
+			</div>
+		</div>
+	);
+}
+
+// ── One active case: status card + (when approved/flagged) the MC update form ─
+function CaseCard({ me, c, onChanged }: { me: Me; c: OpenCase; onChanged: () => Promise<void> }) {
+	const selfManaged = !!me.self_managed;
+	const [busy, setBusy] = useState(false);
+	const [mcDays, setMcDays] = useState<number | ''>('');
+	const [startDate, setStartDate] = useState('');
+	const [endDate, setEndDate] = useState('');
+	const [location, setLocation] = useState('');
+	const [approxTime, setApproxTime] = useState('');
+
+	async function cancelCase() {
+		const isPending = c.reportsick_status === 'pending_superior';
 		const ok = await confirmDialog(
 			isPending ? 'Cancel this sick report?' : 'Cancel this RSI/RSO? It will be withdrawn and your parade status for those days reverted.',
 		);
 		if (!ok) return;
 		setBusy(true);
 		try {
-			await api.post('/api/sick/cancel', { id: open.id });
-			await refresh();
+			await api.post('/api/sick/cancel', { id: c.id });
+			await onChanged();
 			alertDialog('Cancelled.');
 		} catch (e) {
-			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
-		} finally {
 			setBusy(false);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
 	async function submitUpdate() {
-		if (!open) return;
 		if (mcDays === '' || mcDays < 0) {
 			alertDialog('Please enter number of MC days (0 if none).');
 			return;
@@ -144,19 +253,14 @@ export function SickTab({
 		setBusy(true);
 		try {
 			const res = await api.post<{ ok: boolean; mc_dates?: string[] }>('/api/sick/update', {
-				id: open.id,
+				id: c.id,
 				num_of_mc_days: Number(mcDays),
 				mc_start_date: mcDays >= 1 ? startDate : null,
 				mc_end_date: mcDays >= 1 ? endDate : null,
 				location: location.trim() || null,
 				approx_time: approxTime.trim() || null,
 			});
-			setMcDays('');
-			setStartDate('');
-			setEndDate('');
-			setLocation('');
-			setApproxTime('');
-			await refresh();
+			await onChanged();
 			const mc = res.mc_dates ?? [];
 			if (mc.length > 0) {
 				const range = mc.length === 1 ? mc[0] : `${mc[0]} → ${mc[mc.length - 1]}`;
@@ -167,108 +271,46 @@ export function SickTab({
 				alertDialog('Update sent.');
 			}
 		} catch (e) {
-			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
-		} finally {
 			setBusy(false);
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
-	if (loadError) {
-		return (
-			<div className="card" style={{ borderLeft: '4px solid var(--depot-danger)' }}>
-				<h3>⚠ Couldn't load sick page</h3>
-				<p className="muted">{loadError}</p>
-				<p className="muted">
-					This usually means migration 002 wasn't fully applied yet. Run:
-				</p>
-				<pre style={{ background: 'var(--tg-theme-secondary-bg-color, #eee)', padding: 10, borderRadius: 8, fontSize: 12, overflow: 'auto' }}>
-{`npx wrangler d1 execute depot_db --remote \\
-  --file worker/src/db/migrations/002_round2.sql`}
-				</pre>
-				<button className="btn" onClick={() => refresh()}>Retry</button>
-			</div>
-		);
-	}
-
-	if (open === undefined) return <div className="muted">Loading…</div>;
-
-	if (!open) {
-		const pastCutoff = sgtPastSickCutoff();
-		return (
-			<div>
-				<h3>Report Sick</h3>
-				<p className="muted" style={{ marginBottom: 6 }}>Which day is this RSI/RSO for?</p>
-				<div className="seg" style={{ marginBottom: 8 }}>
-					<button className={sickDay === 'today' ? 'active' : ''} onClick={() => setSickDay('today')}>
-						Today · {sgtDateStr(0)}
-					</button>
-					<button className={sickDay === 'tomorrow' ? 'active' : ''} onClick={() => setSickDay('tomorrow')}>
-						Tomorrow · {sgtDateStr(1)}
-					</button>
-				</div>
-				{pastCutoff && (
-					<div
-						style={{
-							margin: '0 0 10px',
-							padding: '10px 12px',
-							borderRadius: 12,
-							background: sickDay === 'today' ? 'var(--depot-danger)' : 'var(--depot-warning)',
-							color: '#fff',
-							fontWeight: 600,
-							lineHeight: 1.4,
-						}}
-					>
-						⚠ It's past 3pm — afternoon/evening reports are usually for <b>TOMORROW</b>. You've selected <b>{sickDay === 'today' ? 'TODAY' : 'TOMORROW'}</b> ({sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}). Double-check before submitting.
-					</div>
-				)}
-				<label>Reason / symptoms <span className="danger">*required</span> <span className="muted">(shown to your approver)</span>
-					<textarea value={reportReason} onChange={(e) => setReportReason(e.target.value)} placeholder="e.g. Fever and sore throat" />
-				</label>
-				<p className="muted" style={{ marginBottom: 6 }}>Report for <b>{sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}</b>:</p>
-				{!reportReason.trim() && <p className="muted danger" style={{ marginBottom: 6 }}>Enter a reason / symptoms to report.</p>}
-				<div className="actions">
-					<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSI')}>🏥 RSI (In-Camp)</button>
-					<button className="btn" disabled={busy || !reportReason.trim()} onClick={() => report('RSO')}>🩺 RSO (Outside)</button>
-				</div>
-			</div>
-		);
-	}
-
-	const showUpdateForm = open.reportsick_status === 'approved' || open.reportsick_status === 'flagged';
-	const sickIcon = open.case_type === 'RSI' ? '🏥' : '🩺';
+	const showUpdateForm = c.reportsick_status === 'approved' || c.reportsick_status === 'flagged';
+	const sickIcon = c.case_type === 'RSI' ? '🏥' : '🩺';
 	const sickAcc =
-		open.reportsick_status === 'approved' || open.reportsick_status === 'updated'
+		c.reportsick_status === 'approved' || c.reportsick_status === 'updated'
 			? 'acc-approved'
-			: open.reportsick_status === 'flagged'
+			: c.reportsick_status === 'flagged'
 				? 'acc-rejected'
 				: 'acc-pending';
 
 	return (
-		<div>
+		<div style={{ marginBottom: 14 }}>
 			<div className={`entry-card ${sickAcc}`}>
 				<div className="entry-head">
-					<span className="entry-title">{sickIcon} {open.case_type}</span>
-					<span className={`badge status-${open.reportsick_status}`}>{open.reportsick_status.replace(/_/g, ' ')}</span>
+					<span className="entry-title">
+						{sickIcon} {c.case_type}
+						{c.period && c.period !== 'FD' ? ` · ${c.period}` : ''}
+					</span>
+					<span className={`badge status-${c.reportsick_status}`}>{c.reportsick_status.replace(/_/g, ' ')}</span>
 				</div>
 				<div className="entry-meta">
-					{open.sick_date && <span>📅 for {open.sick_date}</span>}
-					<span>📝 Submitted {sgtDateTime(open.created_at)}</span>
-					{open.approved_at && <span>✓ Approved {sgtDateTime(open.approved_at)}</span>}
+					{c.sick_date && <span>📅 for {c.sick_date}</span>}
+					<span>📝 Submitted {sgtDateTime(c.created_at)}</span>
+					{c.approved_at && <span>✓ Approved {sgtDateTime(c.approved_at)}</span>}
 				</div>
-				{open.reason && <div className="entry-reason">Reason: {open.reason}</div>}
-				{open.num_of_mc_days != null && open.num_of_mc_days >= 1 && (
+				{c.reason && <div className="entry-reason">Reason: {c.reason}</div>}
+				{c.num_of_mc_days != null && c.num_of_mc_days >= 1 && (
 					<div className="entry-reason">
-						{open.num_of_mc_days} day(s) MC · {open.mc_start_date} → {open.mc_end_date}
+						{c.num_of_mc_days} day(s) MC · {c.mc_start_date} → {c.mc_end_date}
 					</div>
 				)}
-				{(open.reportsick_status === 'pending_superior' ||
-					['approved', 'updated', 'flagged'].includes(open.reportsick_status)) && (
-					<div className="entry-actions">
-						<button className="btn-link danger" disabled={busy} onClick={cancelPending}>
-							{open.reportsick_status === 'pending_superior' ? '🗑 Cancel request' : '🗑 Cancel RSI/RSO'}
-						</button>
-					</div>
-				)}
+				<div className="entry-actions">
+					<button className="btn-link danger" disabled={busy} onClick={cancelCase}>
+						{c.reportsick_status === 'pending_superior' ? '🗑 Cancel request' : '🗑 Cancel RSI/RSO'}
+					</button>
+				</div>
 			</div>
 
 			{showUpdateForm && (
@@ -283,7 +325,9 @@ export function SickTab({
 							lineHeight: 1.45,
 						}}
 					>
-						📄 <b>Got an MC?</b> There is <u>no upload in this app</u>. Open your Telegram chat with this bot and <b>send the MC photo or PDF as a message</b> — {selfManaged ? 'the bot saves it to your latest RSI/RSO case.' : 'it auto-forwards to your superior and is saved to your latest RSI/RSO case.'} Fill the dates below too. <span className="muted">(No MC? Just enter 0 below.)</span>
+						📄 <b>Got an MC?</b> There is <u>no upload in this app</u>. Open your Telegram chat with this bot and <b>send the MC photo or PDF as a message</b> —{' '}
+						{selfManaged ? 'the bot saves it to your latest RSI/RSO case.' : 'it auto-forwards to your superior and is saved to your latest RSI/RSO case.'} Fill the dates below too.{' '}
+						<span className="muted">(No MC? Just enter 0 below.)</span>
 					</div>
 					<label>
 						Number of MC days *
@@ -311,31 +355,88 @@ export function SickTab({
 								}}
 							>
 								📎 SEND YOUR MC NOW — not here. ⚠️ This app has <u>no upload</u>.<br />
-								Go to your <b>Telegram chat with this bot</b> and send the MC <b>photo or PDF as a normal message</b>. The bot replies “MC received”{selfManaged ? ' and attaches it to your case.' : ' and auto-forwards it to your superior.'}
+								Go to your <b>Telegram chat with this bot</b> and send the MC <b>photo or PDF as a normal message</b>. The bot replies “MC received”
+								{selfManaged ? ' and attaches it to your case.' : ' and auto-forwards it to your superior.'}
 							</div>
 						</>
 					)}
 					<label>
 						Location *
-						<input
-							value={location}
-							onChange={(e) => setLocation(e.target.value)}
-							placeholder="e.g. Khatib Medical Centre"
-						/>
+						<input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="e.g. Khatib Medical Centre" />
 					</label>
 					<label>
 						Approximate Time *
-						<input
-							value={approxTime}
-							onChange={(e) => setApproxTime(e.target.value)}
-							placeholder="e.g. 0930"
-						/>
+						<input value={approxTime} onChange={(e) => setApproxTime(e.target.value)} placeholder="e.g. 0930" />
 					</label>
 					<button className="btn" disabled={busy || mcDays === '' || !location.trim() || !approxTime.trim()} onClick={submitUpdate}>
 						{busy ? 'Saving…' : 'Submit update'}
 					</button>
 				</>
 			)}
+		</div>
+	);
+}
+
+// ── Superadmin-only: per-user RSI/RSO frequency + total MC days (this month),
+//    hidden behind a button and lazy-loaded on first open. ───────────────────
+function SickStats() {
+	const [open, setOpen] = useState(false);
+	const [stats, setStats] = useState<UserSickStat[] | undefined>(undefined);
+
+	function toggle() {
+		const next = !open;
+		setOpen(next);
+		if (next && stats === undefined) {
+			api
+				.get<UserSickStat[]>('/api/sick/stats')
+				.then((r) => setStats(r ?? []))
+				.catch(() => setStats([]));
+		}
+	}
+
+	const cell: CSSProperties = { padding: '6px 10px', textAlign: 'left', borderBottom: '1px solid var(--tg-theme-hint-color, #ccc)' };
+	const num: CSSProperties = { ...cell, textAlign: 'right' };
+
+	return (
+		<div style={{ marginTop: 28 }}>
+			<button className="btn" onClick={toggle}>
+				{open ? '▲ Hide sick stats' : '📊 Sick stats — this month (superadmin)'}
+			</button>
+			{open &&
+				(stats === undefined ? (
+					<p className="muted" style={{ marginTop: 10 }}>Loading…</p>
+				) : (
+					<div style={{ overflowX: 'auto', marginTop: 10 }}>
+						<table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 14 }}>
+							<thead>
+								<tr>
+									<th style={cell}>Name</th>
+									<th style={num}>Sick Frequency</th>
+									<th style={num}>Total MC Days</th>
+								</tr>
+							</thead>
+							<tbody>
+								{stats.map((r) => (
+									<tr key={r.id}>
+										<td style={cell}>
+											{r.full_name}
+											{r.department && <span className="muted"> · {r.department}</span>}
+										</td>
+										<td style={num}>{r.sick_count}</td>
+										<td style={num}>{r.mc_days}</td>
+									</tr>
+								))}
+								{stats.length > 0 && (
+									<tr>
+										<td style={cell}><b>Total ({stats.length})</b></td>
+										<td style={num}><b>{stats.reduce((s, r) => s + r.sick_count, 0)}</b></td>
+										<td style={num}><b>{stats.reduce((s, r) => s + r.mc_days, 0)}</b></td>
+									</tr>
+								)}
+							</tbody>
+						</table>
+					</div>
+				))}
 		</div>
 	);
 }

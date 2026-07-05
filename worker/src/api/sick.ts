@@ -65,19 +65,43 @@ async function setParadeForMc(env: Env, userId: number, dept: string | null, mcS
 //     otherwise PM) — you don't retroactively mark a half-day that's over.
 //   • for a LATER day (report() only ever passes tomorrow) → only that day's AM.
 // report() clamps sick_date to today/tomorrow, so these two cases are exhaustive.
-export async function setParadeForSick(env: Env, userId: number, dept: string | null, date: string, status: string): Promise<void> {
+export async function setParadeForSick(
+	env: Env,
+	userId: number,
+	dept: string | null,
+	date: string,
+	status: string,
+	sickPeriod: 'AM' | 'PM' | 'FD' | null,
+	reason: string | null,
+): Promise<void> {
 	const info = await getDayWorkInfo(env, date);
-	const periods: ('AM' | 'PM')[] = date === sgtToday() ? [sgtPeriodNow()] : ['AM'];
+	// Which half-day(s) the RSI/RSO covers:
+	//   • explicit AM/PM → just that half; FD → both halves.
+	//   • legacy NULL (rows that predate the period column) → today: the half
+	//     currently in progress; a later day: AM (the old behaviour).
+	const periods: ('AM' | 'PM')[] =
+		sickPeriod === 'AM'
+			? ['AM']
+			: sickPeriod === 'PM'
+				? ['PM']
+				: sickPeriod === 'FD'
+					? ['AM', 'PM']
+					: date === sgtToday()
+						? [sgtPeriodNow()]
+						: ['AM'];
+	// The original RSI/RSO reason is written onto the cell so it shows in "Show
+	// Everyone". The MC-range painter skips RSI/RSO cells, so this survives a later
+	// MC update.
 	const stmt = env.depot_db.prepare(
 		`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
-		 VALUES (?, ?, ?, ?, NULL)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(user_id, parade_state_date, period)
 		 DO UPDATE SET parade_status = excluded.parade_status, reason = excluded.reason`,
 	);
 	const ops: ReturnType<typeof env.depot_db.prepare>[] = [];
 	for (const period of periods) {
 		if (!slotWorking(info, dept, period)) continue;
-		ops.push(stmt.bind(userId, date, period, status));
+		ops.push(stmt.bind(userId, date, period, status, reason));
 	}
 	if (ops.length) await env.depot_db.batch(ops);
 }
@@ -106,6 +130,7 @@ interface OpenCase {
 	location: string | null;
 	approx_time: string | null;
 	mc_file_id: string | null;
+	period: string | null;
 	created_at: string;
 }
 
@@ -113,34 +138,78 @@ function isValidDate(s: unknown): s is string {
 	return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
+// Shared predicate: is a sick case still "active today"? Used by BOTH /my-open
+// (the user's own Sick page) and /api/today (the approvers' Active Today list) so
+// the two can never diverge again. `s` must be the sick_cases alias in the
+// surrounding query. `date('now','+8 hours')` is today in SGT.
+//   • pending          → visible until its day passes;
+//   • MC recorded      → visible while the MC still covers today or a future day;
+//   • no MC recorded   → visible only on/after the sick day (drops once it ends) —
+//                        this is the fix for "no-MC / never-updated case lingers";
+//   • flagged + unknown MC → kept past its day ONLY if the user has actually
+//                        painted MC for today on their parade state (so someone
+//                        genuinely still on MC stays surfaced, as Flagged).
+export const SICK_ACTIVE_VISIBLE_SQL = `(
+	(s.reportsick_status = 'pending_superior' AND (s.sick_date IS NULL OR date(s.sick_date) >= date('now','+8 hours')))
+	OR (s.mc_end_date IS NOT NULL AND date(s.mc_end_date) >= date('now','+8 hours'))
+	OR (s.mc_end_date IS NULL AND s.sick_date IS NOT NULL AND date(s.sick_date) >= date('now','+8 hours'))
+	OR (s.reportsick_status = 'flagged' AND s.num_of_mc_days IS NULL
+	    AND EXISTS (SELECT 1 FROM parade_state_entries pe
+	                WHERE pe.user_id = s.user_id AND pe.parade_state_date = date('now','+8 hours')
+	                  AND pe.parade_status = 'MC'))
+)`;
+
 export async function handleSick(actx: AuthedContext): Promise<Response> {
 	const { url, request, env, user } = actx;
 	const sub = url.pathname.slice('/api/sick'.length);
 
 	if (request.method === 'GET' && sub === '/my-open') {
-		const row = await env.depot_db
+		// Returns ALL of the user's currently-active cases (RSI/RSO can now be
+		// reported concurrently), newest first. Visibility is the shared
+		// SICK_ACTIVE_VISIBLE_SQL predicate so it matches the approvers' Active Today
+		// exactly — a case disappears once its day ends (no MC) or its MC end passes.
+		const { results } = await env.depot_db
 			.prepare(
-				`SELECT id, case_type, reportsick_status, sick_date, reason, approved_at, updated_status, updated_at,
-				        num_of_mc_days, mc_start_date, mc_end_date, location, approx_time, mc_file_id, created_at
-				 FROM sick_cases
-				 WHERE user_id = ? AND reportsick_status IN ('pending_superior','approved','updated','flagged')
-				   -- A still-pending report whose date has already passed is stale: hide it
-				   -- from the Sick page immediately (the daily runSickExpiry cron then cancels
-				   -- it + blanks the optimistic parade cell).
-				   AND NOT (reportsick_status = 'pending_superior' AND sick_date IS NOT NULL AND date(sick_date) < date('now','+8 hours'))
-				   -- An approved/updated/flagged case also stops showing once its date is
-				   -- well past (3-day grace so a late MC can still be recorded the next day
-				   -- or two); otherwise an old never-updated case would linger forever.
-				   AND NOT (reportsick_status IN ('approved','updated','flagged') AND sick_date IS NOT NULL AND date(sick_date) < date('now','+8 hours','-3 days'))
-				 ORDER BY id DESC LIMIT 1`,
+				`SELECT s.id, s.case_type, s.reportsick_status, s.sick_date, s.reason, s.approved_at, s.updated_status, s.updated_at,
+				        s.num_of_mc_days, s.mc_start_date, s.mc_end_date, s.location, s.approx_time, s.mc_file_id, s.period, s.created_at
+				 FROM sick_cases s
+				 WHERE s.user_id = ? AND s.reportsick_status IN ('pending_superior','approved','updated','flagged')
+				   AND ${SICK_ACTIVE_VISIBLE_SQL}
+				 ORDER BY s.id DESC`,
 			)
 			.bind(user.id)
-			.first<OpenCase>();
-		return json(row ?? null);
+			.all<OpenCase>();
+		return json(results ?? []);
+	}
+
+	// Superadmin-only: per-USER RSI/RSO frequency + total MC days for the current SGT
+	// month so far. EVERY non-pending user is listed via a LEFT JOIN — the sick
+	// filters live in the ON clause so users with no sick this month still appear
+	// (with zeros). MC days come only from sick_cases; confirmed cases only
+	// (approved/updated/flagged). Lazy-loaded behind a button on the Sick page.
+	if (request.method === 'GET' && sub === '/stats') {
+		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
+		const { results } = await env.depot_db
+			.prepare(
+				`SELECT u.id, u.full_name, u.department,
+				        COUNT(s.id) AS sick_count,
+				        COALESCE(SUM(CASE WHEN s.num_of_mc_days > 0 THEN s.num_of_mc_days ELSE 0 END), 0) AS mc_days
+				 FROM users u
+				 LEFT JOIN sick_cases s ON s.user_id = u.id
+				   AND s.case_type IN ('RSI','RSO')
+				   AND s.reportsick_status IN ('approved','updated','flagged')
+				   AND date(COALESCE(s.sick_date, s.created_at)) >= date('now','+8 hours','start of month')
+				   AND date(COALESCE(s.sick_date, s.created_at)) <= date('now','+8 hours')
+				 WHERE u.full_name NOT LIKE 'PENDING:%'
+				 GROUP BY u.id, u.full_name, u.department
+				 ORDER BY sick_count DESC, mc_days DESC, u.full_name`,
+			)
+			.all<{ id: number; full_name: string; department: string | null; sick_count: number; mc_days: number }>();
+		return json(results ?? []);
 	}
 
 	if (request.method === 'POST' && sub === '/report') {
-		const body = (await request.json()) as { case_type?: string; sick_date?: string; reason?: string };
+		const body = (await request.json()) as { case_type?: string; sick_date?: string; reason?: string; period?: string };
 		if (body.case_type !== 'RSI' && body.case_type !== 'RSO') {
 			return json({ error: 'bad_case_type' }, { status: 400 });
 		}
@@ -148,58 +217,46 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const today = sgtToday();
 		const tomorrow = sgtDateAddDays(today, 1);
 		const sickDate = isValidDate(body.sick_date) && (body.sick_date === today || body.sick_date === tomorrow) ? body.sick_date : today;
+		// Which half-day the RSI/RSO is for. Drives the flag-timer anchor (PM → 12:00
+		// SGT, AM/FD → 08:00) and which parade half-day(s) get painted. Default FD.
+		const period: 'AM' | 'PM' | 'FD' = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
 		// Reason / symptoms — compulsory; shown to the approver in the inbox + recent.
 		const reason = body.reason?.trim() || null;
 		if (!reason) return json({ error: 'reason_required' }, { status: 400 });
 
-		// Block only a DUPLICATE report for the SAME day, and only while a prior
-		// case for that day is still in progress (pending / approved / flagged). We
-		// deliberately do NOT block on:
-		//   • other dates — a finished or pending case for another day must never
-		//     stop today's/tomorrow's report. (This was the "already_open" bug: the
-		//     old check was date-agnostic, so a resolved case from days ago
-		//     permanently occupied the single open slot and 409'd every new report.)
-		//   • an 'updated' case for the SAME day — once the outcome of one visit is
-		//     recorded, the user may legitimately report again for another doctor
-		//     visit that same day / half-day.
-		const open = await env.depot_db
-			.prepare(
-				`SELECT id FROM sick_cases
-				 WHERE user_id = ? AND sick_date = ?
-				   AND reportsick_status IN ('pending_superior','approved','flagged')`,
-			)
-			.bind(user.id, sickDate)
-			.first<{ id: number }>();
-		if (open) return json({ error: 'already_open', id: open.id }, { status: 409 });
+		// NOTE: RSI/RSO may be reported CONCURRENTLY — the buttons stay available even
+		// when a case is already open (multiple doctor visits / consecutive sick days).
+		// There is intentionally no "already open" dedup here; the UI disables the
+		// button mid-submit to stop accidental double-taps.
 
 		// Self-managed users and appointment-holders skip the approval step: the
 		// case is logged as approved immediately, no DM, no reminders.
 		if (autoApprovesOwn(user)) {
 			const ins = await env.depot_db
 				.prepare(
-					`INSERT INTO sick_cases (user_id, case_type, reportsick_status, superior_user_id, approved_at, sick_date, reason)
-					 VALUES (?, ?, 'approved', ?, datetime('now'), ?, ?)
+					`INSERT INTO sick_cases (user_id, case_type, reportsick_status, superior_user_id, approved_at, sick_date, reason, period)
+					 VALUES (?, ?, 'approved', ?, datetime('now'), ?, ?, ?)
 					 RETURNING id`,
 				)
-				.bind(user.id, body.case_type, user.id, sickDate, reason)
+				.bind(user.id, body.case_type, user.id, sickDate, reason, period)
 				.first<{ id: number }>();
 			if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
-			await setParadeForSick(env, user.id, user.department, sickDate, body.case_type);
+			await setParadeForSick(env, user.id, user.department, sickDate, body.case_type, period, reason);
 			return json({ ok: true, id: ins.id, auto_approved: true, sick_date: sickDate });
 		}
 
 		const ins = await env.depot_db
 			.prepare(
-				`INSERT INTO sick_cases (user_id, case_type, reportsick_status, sick_date, reason)
-				 VALUES (?, ?, 'pending_superior', ?, ?)
+				`INSERT INTO sick_cases (user_id, case_type, reportsick_status, sick_date, reason, period)
+				 VALUES (?, ?, 'pending_superior', ?, ?, ?)
 				 RETURNING id`,
 			)
-			.bind(user.id, body.case_type, sickDate, reason)
+			.bind(user.id, body.case_type, sickDate, reason, period)
 			.first<{ id: number }>();
 		if (!ins) return json({ error: 'insert_failed' }, { status: 500 });
 
 		// Optimistically reflect it on the parade calendar right away (pending).
-		await setParadeForSick(env, user.id, user.department, sickDate, body.case_type);
+		await setParadeForSick(env, user.id, user.department, sickDate, body.case_type, period, reason);
 
 		// Per-request DM with inline Approve/Reject to EACH superior; store all
 		// (chat,msg) pairs so a decision edits every copy.

@@ -2,6 +2,7 @@
 
 import { json, type AuthedContext } from './router';
 import { sgtToday } from '../holidays';
+import { SICK_ACTIVE_VISIBLE_SQL } from './sick';
 
 interface OffRow {
 	id: number;
@@ -71,10 +72,9 @@ export async function handleToday(actx: AuthedContext): Promise<Response> {
 			 JOIN users u ON u.id = s.user_id
 			 LEFT JOIN users ab ON ab.id = s.superior_user_id
 			 WHERE s.reportsick_status IN ('approved','updated','flagged')
-			   AND (s.mc_end_date IS NULL OR s.mc_end_date >= ?)
+			   AND ${SICK_ACTIVE_VISIBLE_SQL}
 			 ORDER BY s.created_at DESC`,
 		)
-		.bind(today)
 		.all<SickRow>();
 
 	const sickPending = await env.depot_db

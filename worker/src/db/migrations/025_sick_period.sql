@@ -1,0 +1,13 @@
+-- RSI/RSO half-day period.
+--
+-- Until now a sick report captured no AM/PM notion, so the escalation timer for a
+-- next-day case always anchored to 08:00 SGT and the optimistic parade cell was
+-- always painted on the AM half. This column lets a report say which half-day the
+-- RSI/RSO is for so that:
+--   • a next-day PM report anchors its flag timer at 12:00 SGT (not 08:00), and
+--   • the parade calendar paints the correct half-day (AM / PM / both for FD).
+--
+-- NULL = legacy / unspecified: treated as full-day (FD) — 08:00 anchor, and the
+-- pre-existing paint behaviour (today → current half, next-day → AM) is preserved
+-- for rows that predate this column.
+ALTER TABLE sick_cases ADD COLUMN period TEXT;   -- 'AM' | 'PM' | 'FD' | NULL

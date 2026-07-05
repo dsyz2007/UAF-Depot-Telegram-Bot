@@ -219,6 +219,9 @@ function EditUserModal({
 	const [appointment, setAppointment] = useState<string>(user.appointment ?? '');
 	const [selfManaged, setSelfManaged] = useState<boolean>(!!user.self_managed);
 	const [busy, setBusy] = useState(false);
+	// Once this user is deleted, hide the destructive button so it can't linger or be
+	// clicked a second time (the modal also closes via onDeleted).
+	const [deleted, setDeleted] = useState(false);
 
 	const canGrantSuperadmin = me.user_role === 'superadmin';
 	// Only a superadmin may edit another superadmin (so admins can't demote one).
@@ -252,6 +255,7 @@ function EditUserModal({
 		setBusy(true);
 		try {
 			await api.post('/api/admin/users/delete', { id: user.id });
+			setDeleted(true);
 			onDeleted(user.id);
 			alertDialog('Deleted.');
 		} catch (e) {
@@ -304,10 +308,10 @@ function EditUserModal({
 				<label>Expiry date (optional)
 					<input type="date" value={ordDate} onChange={(e) => setOrdDate(e.target.value)} />
 				</label>
-				<button className="btn" disabled={busy || !name.trim() || lockedSuperadmin} onClick={save}>
+				<button className="btn" disabled={busy || deleted || !name.trim() || lockedSuperadmin} onClick={save}>
 					{busy ? 'Saving…' : 'Save'}
 				</button>
-				{me.user_role === 'superadmin' && user.id !== me.id && (
+				{me.user_role === 'superadmin' && user.id !== me.id && !deleted && (
 					<button className="btn btn-danger" style={{ marginTop: 8 }} disabled={busy} onClick={del}>
 						🗑 Delete user
 					</button>

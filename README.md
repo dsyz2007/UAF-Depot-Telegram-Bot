@@ -439,9 +439,9 @@ npx wrangler secret put WEBHOOK_SECRET     # paste a (separate) random 32+ char 
 
 ### 9. Apply database migrations (in order)
 
-There are **22** migration files, `001_…` through `022_…`, and they **must be applied in numeric order** (later ones depend on tables/columns earlier ones create). The filenames are zero-padded, so a shell `*.sql` glob already sorts them `001 → 022` correctly.
+There are **25** migration files, `001_…` through `025_…`, and they **must be applied in numeric order** (later ones depend on tables/columns earlier ones create). The filenames are zero-padded, so a shell `*.sql` glob already sorts them `001 → 025` correctly.
 
-**Fresh database (first-time setup) — apply ALL 22, in order.** Paste these into the VS Code terminal (Terminal → New Terminal), run from the repo root. The `|| break` stops the loop on the first error so a bad migration doesn't get skipped:
+**Fresh database (first-time setup) — apply ALL 25, in order.** Paste these into the VS Code terminal (Terminal → New Terminal), run from the repo root. The `|| break` stops the loop on the first error so a bad migration doesn't get skipped:
 
 ```bash
 # Local D1 first (so `wrangler dev` works), then production.
@@ -469,6 +469,7 @@ npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/021_le
 npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/022_sick_reason.sql
 npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/023_off_period.sql
 npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/024_reject_audit.sql
+npx wrangler d1 execute depot_db --remote --file worker/src/db/migrations/025_sick_period.sql
 ```
 
 Notes:
@@ -612,6 +613,7 @@ Always apply in numeric order on both local and remote.
 | `022_sick_reason.sql` | Adds `sick_cases.reason` — an optional reason/symptoms captured on an RSI/RSO report, shown to the approver in the Pending inbox + Recent approvals. Additive column. |
 | `023_off_period.sql` | Adds `off_requests.period` (`FD`/`AM`/`PM`) so an off request can be a **half day** (0.5 credits/day) not just full-day. Additive column. |
 | `024_reject_audit.sql` | Adds `rejected_by` + `rejected_at` to `off_requests`, `sick_cases`, `leave_requests`, `off_credit_grants` — records who rejected a request and when, powering the Pending page's **Past Rejections** list + un-reject. Additive columns. |
+| `025_sick_period.sql` | Adds `sick_cases.period` (`AM`/`PM`/`FD`, `NULL` = legacy/full-day) — which half-day an RSI/RSO is for. Anchors a next-day **PM** report's update/flag escalation timer at 12:00 SGT (not 08:00) and paints the correct parade half-day(s). Additive column. |
 
 When you write a migration:
 - Use `PRAGMA foreign_keys = OFF;` at the top if you're rebuilding any table that has FK references pointing in.

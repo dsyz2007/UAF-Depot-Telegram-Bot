@@ -464,6 +464,17 @@ async function runOffExpiry(env: Env): Promise<void> {
 		if ((flip.meta.changes ?? 0) === 0) continue;
 		const days = offCreditDays(o.startdate, o.enddate, o.period);
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, o.user_id).run();
+		// Blank the optimistically-painted OFF cells (pending offs now paint on
+		// submit) — period-scoped, mirroring a user cancel.
+		const halfDay = o.period === 'AM' || o.period === 'PM';
+		await env.depot_db
+			.prepare(
+				halfDay
+					? `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF' AND period = ?`
+					: `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF'`,
+			)
+			.bind(...(halfDay ? [o.user_id, o.startdate, o.enddate, o.period] : [o.user_id, o.startdate, o.enddate]))
+			.run();
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: o.telegram_id,
 			text: `⌛ Your pending off (${o.startdate} → ${o.enddate}) expired — it was never approved and the dates have passed. 🪙 ${days} credit(s) refunded.`,

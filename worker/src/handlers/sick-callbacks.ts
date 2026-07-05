@@ -14,6 +14,7 @@ interface SickRow {
 	case_type: 'RSI' | 'RSO';
 	reportsick_status: string;
 	sick_date: string | null;
+	period: string | null;
 	personnel_name: string;
 	personnel_tid: string;
 	dept: string | null;
@@ -37,7 +38,7 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 
 		const row = await env.depot_db
 			.prepare(
-				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date,
+				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.sick_date, s.period,
 				        u.full_name AS personnel_name, u.telegram_id AS personnel_tid,
 				        u.department AS dept, u.sub_department AS sub
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
@@ -97,10 +98,12 @@ export function registerSickCallbacks(bot: Bot, env: Env): void {
 		}
 
 		// D1 supports batched prepared statements — one round-trip. For a case dated
-		// later than today (reported for tomorrow), anchor the timers to 08:00 SGT of
-		// the sick day (= 00:00 UTC) so an evening approval doesn't flag the user the
-		// night before; a same-day case counts from approval ('now').
-		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} 00:00:00` : 'now';
+		// later than today (reported for tomorrow), anchor the timers to the START of
+		// the reported half-day so an evening approval doesn't flag the user the night
+		// before: AM/FD → 08:00 SGT (= 00:00 UTC), PM → 12:00 SGT (= 04:00 UTC). A
+		// same-day case counts from approval ('now').
+		const anchorTime = row.period === 'PM' ? '04:00:00' : '00:00:00';
+		const anchor = row.sick_date && row.sick_date > sgtToday() ? `${row.sick_date} ${anchorTime}` : 'now';
 		const stmt = env.depot_db.prepare(
 			`INSERT INTO reminders (user_id, related_type, related_id, due_at, reminder_type)
 			 VALUES (?, 'sick_case', ?, datetime(?, ?), ?)`,

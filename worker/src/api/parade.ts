@@ -1,7 +1,7 @@
 import { json, type AuthedContext } from './router';
 import { PARADE_STATUSES, REASON_REQUIRED_STATUSES, DEPARTMENTS, autoApprovesOwn, type ParadeStatus } from '../types';
 import { tgSendDocument, tgSendMessage, tgEditMessageText } from '../tg';
-import { getRangeWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from '../holidays';
+import { getRangeWorkInfo, slotWorking, slotNonWorkingReason, sgtToday, sgtDateAddDays } from '../holidays';
 import { approverTidsFor } from '../superiors';
 import { buildXlsx } from '../xlsx';
 import { informMaMcCombo } from '../ma-mc';
@@ -308,6 +308,23 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const dates = notPast.filter((d) => clean.some((e) => slotWorking(workInfo.get(d)!, targetDept, e.period)));
 		const skippedWeekends = notPast.length - dates.length;
 
+		// Collect the (date, period) slots the user actually submitted that land on a
+		// non-working slot, WITH the reason (a forced-non-working override's reason, or
+		// a holiday/weekend label) — so the frontend can tell the user WHY they were
+		// dropped instead of silently skipping them. Computed now, before `clean` is
+		// mutated by the OFF-backing strip below. Clearing a slot ('Blank') is allowed
+		// on any day and is not reported.
+		const skippedSlots: { date: string; period: 'AM' | 'PM'; reason: string }[] = [];
+		for (const d of notPast) {
+			const di = workInfo.get(d);
+			if (!di) continue;
+			for (const e of clean) {
+				if (e.status === CLEAR_STATUS || (e.period !== 'AM' && e.period !== 'PM')) continue;
+				const reason = slotNonWorkingReason(di, targetDept, e.period, d);
+				if (reason) skippedSlots.push({ date: d, period: e.period, reason });
+			}
+		}
+
 		// Compulsory backing for OFF (self-edits only): OFF needs an off request
 		// covering every OFF date. If some OFF date is unbacked we DON'T drop the
 		// whole submit — we strip the OFF entries (so any other half, e.g. Present,
@@ -470,6 +487,9 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			applied: directOps.length + deleteOps.length,
 			informed: informPayloads.length,
 			skipped_weekends: skippedWeekends,
+			// Per-slot non-working reasons (forced overrides, holidays, weekends) so the
+			// frontend can alert the user which slots were dropped and why.
+			skipped_slots: skippedSlots.length ? skippedSlots : undefined,
 			skipped_past: skippedPast,
 			// Set when an RSI/RSO half was stripped from a self-edit: the rest was
 			// saved (see `applied`), and the frontend routes the user to the Sick page

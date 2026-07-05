@@ -340,6 +340,11 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// Refunded if the request is rejected or cancelled.
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, user.id).run();
 
+		// Optimistically paint OFF on the parade calendar right away (pending), like
+		// sick/leave already do. setParadeForOff skips RSI/RSO/MC cells; reject, cancel
+		// and the daily expiry all blank these OFF cells again.
+		await setParadeForOff(env, user.id, user.department, body.startdate, body.enddate, period);
+
 		// Per-request DM with inline Approve/Reject to EACH superior (either may
 		// action). We store ALL their (chat,msg) pairs so that when one decides, the
 		// callback / in-app action edits EVERY copy (see resolveApprovalDms).
@@ -505,10 +510,26 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.first<{ id: number; user_id: number; off_status: string; startdate: string; enddate: string; period: string; approved_by: number | null; approver_tid: string | null; approver_name: string | null }>();
 		if (!row) return json({ error: 'not_found' }, { status: 404 });
 		if (row.user_id !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
-		if (row.off_status !== 'pending' && row.off_status !== 'approved') {
+		// The requester may cancel their own off in ANY settled state — pending,
+		// approved, or rejected (a rejected off is a private "dismiss", parallel to
+		// how sick/leave already allow it).
+		if (!['pending', 'approved', 'rejected'].includes(row.off_status)) {
 			return json({ error: 'not_cancellable', state: row.off_status }, { status: 409 });
 		}
 		const wasApproved = row.off_status === 'approved';
+		const wasActive = row.off_status === 'pending' || row.off_status === 'approved';
+
+		// A rejected off was already refunded and its parade cells blanked at reject
+		// time, so "cancelling" it is just a private dismiss from the requester's
+		// Recent list — flip to cancelled with NO further refund, parade change or DM.
+		if (!wasActive) {
+			const flipD = await env.depot_db
+				.prepare(`UPDATE off_requests SET off_status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND off_status = 'rejected'`)
+				.bind(user.id, body.id)
+				.run();
+			if ((flipD.meta.changes ?? 0) === 0) return json({ error: 'not_cancellable' }, { status: 409 });
+			return json({ ok: true, dismissed: true, refunded: 0 });
+		}
 
 		// Refund the credits (reserved at request time; still reserved while approved).
 		const refundDays = offDays(row.startdate, row.enddate, row.period);

@@ -488,7 +488,7 @@ function RecentApprovals({ me }: { me: Me }) {
 	// already refunded on rejection; an off-credit grant has no requester-cancel).
 	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean) => {
 		if (mineView) {
-			if (kind === 'grant' || (kind === 'off' && isRejected)) return null;
+			if (kind === 'grant') return null; // rejected off/sick/leave are dismissible by the requester
 			return (
 				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
 					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
