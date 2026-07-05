@@ -398,7 +398,7 @@ function SickStats() {
 	const num: CSSProperties = { ...cell, textAlign: 'right' };
 
 	return (
-		<div style={{ marginTop: 28 }}>
+		<div style={{ marginTop: 40, paddingTop: 20, borderTop: '1px solid var(--tg-theme-hint-color, #ccc)' }}>
 			<button className="btn" onClick={toggle}>
 				{open ? '▲ Hide sick stats' : '📊 Sick stats — this month (superadmin)'}
 			</button>

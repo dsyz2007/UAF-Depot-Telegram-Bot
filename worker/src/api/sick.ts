@@ -201,8 +201,8 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				   AND date(COALESCE(s.sick_date, s.created_at)) >= date('now','+8 hours','start of month')
 				   AND date(COALESCE(s.sick_date, s.created_at)) <= date('now','+8 hours')
 				 WHERE u.full_name NOT LIKE 'PENDING:%'
-				 GROUP BY u.id, u.full_name, u.department
-				 ORDER BY sick_count DESC, mc_days DESC, u.full_name`,
+				 GROUP BY u.id, u.full_name, u.department, u.sub_department
+				 ORDER BY u.department, u.sub_department, u.full_name`,
 			)
 			.all<{ id: number; full_name: string; department: string | null; sick_count: number; mc_days: number }>();
 		return json(results ?? []);
