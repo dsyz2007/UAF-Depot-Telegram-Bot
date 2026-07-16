@@ -87,10 +87,13 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		// appointment-holders are the proper approvers, or a normal user's own row).
 		const canSeeOthers = user.user_role === 'admin' || user.user_role === 'superadmin' || !!user.appointment;
 		const scopeParam = url.searchParams.get('scope');
-		const defaultScope: 'mine' | 'dept' | 'all' = user.user_role === 'superadmin' ? 'all' : canSeeOthers ? 'dept' : 'mine';
-		let scope: 'mine' | 'dept' | 'all' =
+		// Default = My dept for anyone with a department (approvers AND normal users);
+		// dept-less users fall back to all (approvers) / mine (normal). EVERY user may
+		// now view any scope — a non-approver sees other people's items read-only
+		// (can_action = false below), they simply can't approve/reject.
+		const defaultScope: 'mine' | 'dept' | 'all' = user.department ? 'dept' : canSeeOthers ? 'all' : 'mine';
+		const scope: 'mine' | 'dept' | 'all' =
 			scopeParam === 'mine' || scopeParam === 'dept' || scopeParam === 'all' ? scopeParam : defaultScope;
-		if (!canSeeOthers) scope = 'mine'; // normal users only ever see their own
 
 		const sc = ((): { clause: string; binds: (string | number)[] } => {
 			if (scope === 'mine') return { clause: 'AND u.id = ?', binds: [user.id] };
@@ -190,12 +193,14 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const status: 'approved' | 'rejected' = url.searchParams.get('status') === 'rejected' ? 'rejected' : 'approved';
 		const canSeeOthers = user.user_role === 'admin' || user.user_role === 'superadmin' || !!user.appointment;
 		const scopeParam = url.searchParams.get('scope');
-		const defaultScope: 'mine' | 'self' | 'dept' | 'all' = user.user_role === 'superadmin' ? 'all' : canSeeOthers ? 'dept' : 'mine';
-		let scope: 'mine' | 'self' | 'dept' | 'all' =
+		// Default = My dept for anyone with a department; dept-less fall back to all
+		// (approvers) / mine (normal). Every user may view any scope now (view-only for
+		// items they can't action).
+		const defaultScope: 'mine' | 'self' | 'dept' | 'all' = user.department ? 'dept' : canSeeOthers ? 'all' : 'mine';
+		const scope: 'mine' | 'self' | 'dept' | 'all' =
 			scopeParam === 'mine' || scopeParam === 'self' || scopeParam === 'all' || scopeParam === 'dept'
 				? scopeParam
 				: defaultScope;
-		if (!canSeeOthers) scope = 'mine'; // normal users only ever see their own submissions
 		const isSuper = isSuperadmin(user.user_role);
 		const appointed = !!user.appointment;
 		const holderDepts = await departmentsWithHolders(env);

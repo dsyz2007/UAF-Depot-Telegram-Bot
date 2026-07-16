@@ -183,21 +183,44 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	}
 
 	// Superadmin-only: per-USER RSI/RSO frequency + total MC days for the current SGT
-	// month so far. EVERY non-pending user is listed via a LEFT JOIN — the sick
-	// filters live in the ON clause so users with no sick this month still appear
-	// (with zeros). MC days come only from sick_cases; confirmed cases only
-	// (approved/updated/flagged). Lazy-loaded behind a button on the Sick page.
+	// month so far. EVERY non-pending user is listed via a LEFT JOIN so users with no
+	// sick this month still appear (with zeros). Listed in parade-state order
+	// (department, then name). Lazy-loaded behind a button on the Sick page.
+	//   • sick_count = confirmed RSI/RSO events this month — counted whether the case
+	//     is still active OR has since been system-archived, so the month total stays
+	//     stable instead of shrinking as cases age out (the "resets" bug).
+	//   • mc_days = MC days from those cases PLUS Hospital-Leave days: distinct days
+	//     this month whose parade status is 'Leave (Others)' with 'HL' / 'Hospital
+	//     Leave' in the reason (case-insensitive).
 	if (request.method === 'GET' && sub === '/stats') {
 		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id, u.full_name, u.department,
 				        COUNT(s.id) AS sick_count,
-				        COALESCE(SUM(CASE WHEN s.num_of_mc_days > 0 THEN s.num_of_mc_days ELSE 0 END), 0) AS mc_days
+				        COALESCE(SUM(CASE WHEN s.num_of_mc_days > 0 THEN s.num_of_mc_days ELSE 0 END), 0)
+				          + COALESCE((
+				              SELECT COUNT(DISTINCT pe.parade_state_date)
+				              FROM parade_state_entries pe
+				              WHERE pe.user_id = u.id
+				                AND pe.parade_status = 'Leave (Others)'
+				                AND (LOWER(pe.reason) LIKE '%hl%' OR LOWER(pe.reason) LIKE '%hospital leave%')
+				                AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
+				                AND date(pe.parade_state_date) <= date('now','+8 hours')
+				            ), 0) AS mc_days
 				 FROM users u
 				 LEFT JOIN sick_cases s ON s.user_id = u.id
 				   AND s.case_type IN ('RSI','RSO')
-				   AND s.reportsick_status IN ('approved','updated','flagged')
+				   -- Count a case as a real sick event whether it's still active OR was
+				   -- system-archived: runSickExpiry flips approved/updated/flagged →
+				   -- 'cancelled' (cancelled_by NULL) a few days after the sick day / MC
+				   -- end. Without the archived branch the monthly count kept shrinking as
+				   -- cases aged out. Excludes user-cancelled (cancelled_by set), rejected,
+				   -- and never-approved expired-pending (approved_at NULL).
+				   AND (
+				         s.reportsick_status IN ('approved','updated','flagged')
+				         OR (s.reportsick_status = 'cancelled' AND s.cancelled_by IS NULL AND s.approved_at IS NOT NULL)
+				       )
 				   AND date(COALESCE(s.sick_date, s.created_at)) >= date('now','+8 hours','start of month')
 				   AND date(COALESCE(s.sick_date, s.created_at)) <= date('now','+8 hours')
 				 WHERE u.full_name NOT LIKE 'PENDING:%'
@@ -217,9 +240,12 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const today = sgtToday();
 		const tomorrow = sgtDateAddDays(today, 1);
 		const sickDate = isValidDate(body.sick_date) && (body.sick_date === today || body.sick_date === tomorrow) ? body.sick_date : today;
-		// Which half-day the RSI/RSO is for. Drives the flag-timer anchor (PM → 12:00
-		// SGT, AM/FD → 08:00) and which parade half-day(s) get painted. Default FD.
-		const period: 'AM' | 'PM' | 'FD' = body.period === 'AM' || body.period === 'PM' ? body.period : 'FD';
+		// Which half-day the RSI/RSO is for. Only AM/PM exist: an RSI/RSO occupies the
+		// half-day of the visit and any MC fills the rest. (A full-day option was
+		// removed — it left a same-day MC with nowhere to land, since the MC painter
+		// skips RSI/RSO cells.) Drives the flag-timer anchor (PM → 12:00 SGT, AM →
+		// 08:00) and which parade half-day gets painted. Anything but 'PM' → AM.
+		const period: 'AM' | 'PM' = body.period === 'PM' ? 'PM' : 'AM';
 		// Reason / symptoms — compulsory; shown to the approver in the inbox + recent.
 		const reason = body.reason?.trim() || null;
 		if (!reason) return json({ error: 'reason_required' }, { status: 400 });

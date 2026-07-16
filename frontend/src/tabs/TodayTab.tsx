@@ -73,7 +73,8 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	// the units they're the fallback approver for live); appointment-holders → dept.
 	// Default to MY DEPT when the viewer has a department (incl. DHQ holders &
 	// dept-ed superadmins); only a department-less superadmin defaults to All.
-	const [scope, setScope] = useState<InboxScope>(!canSeeOthers ? 'mine' : me.department ? 'dept' : 'all');
+	// Every user may pick a scope now; default to My dept for anyone with a department.
+	const [scope, setScope] = useState<InboxScope>(me.department ? 'dept' : canSeeOthers ? 'all' : 'mine');
 	const [typeFilter, setTypeFilter] = useState<InboxTypeFilter>('all');
 	const [data, setData] = useState<ApprovalsPayload | null>(null);
 	const [busy, setBusy] = useState(false);
@@ -179,13 +180,11 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	return (
 		<div style={{ marginBottom: 18 }}>
 			<h3>{mineView ? `🗂 My pending requests (${total})` : `✅ Pending approvals (${total})`}</h3>
-			{canSeeOthers && (
 				<div className="seg" style={{ marginBottom: 8 }}>
 					<button className={scope === 'mine' ? 'active' : ''} onClick={() => setScope('mine')}>Mine</button>
 					<button className={scope === 'dept' ? 'active' : ''} onClick={() => setScope('dept')}>My dept</button>
 					<button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}>All depts</button>
 				</div>
-			)}
 			{available.length > 1 && (
 				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
 					<button style={chipStyle(typeFilter === 'all')} onClick={() => setTypeFilter('all')}>All ({total})</button>
@@ -398,7 +397,8 @@ function RecentApprovals({ me }: { me: Me }) {
 	// Normal users only ever see their OWN processed requests. Superadmins oversee
 	// every unit (and may have no department of their own) → default all-depts;
 	// appointment-holders default to their department.
-	const [scope, setScope] = useState<RecentScope>(!canSeeOthers ? 'mine' : me.user_role === 'superadmin' ? 'all' : 'dept');
+	// Every user may pick a scope now; default to My dept for anyone with a department.
+	const [scope, setScope] = useState<RecentScope>(me.department ? 'dept' : canSeeOthers ? 'all' : 'mine');
 	const [recentType, setRecentType] = useState<'all' | 'off' | 'grant' | 'leave' | 'ma' | 'sick'>('all');
 	const [data, setData] = useState<RecentPayload | null>(null);
 	const [busy, setBusy] = useState(false);
@@ -544,14 +544,12 @@ function RecentApprovals({ me }: { me: Me }) {
 				<button className={status === 'approved' ? 'active' : ''} onClick={() => setStatus('approved')}>✅ Past approvals</button>
 				<button className={status === 'rejected' ? 'active' : ''} onClick={() => setStatus('rejected')}>❌ Past rejections</button>
 			</div>
-			{canSeeOthers && (
 				<div className="seg" style={{ marginBottom: 8 }}>
 					<button className={scope === 'mine' ? 'active' : ''} onClick={() => setScope('mine')}>Mine</button>
-					<button className={scope === 'self' ? 'active' : ''} onClick={() => setScope('self')}>By me</button>
+					{canSeeOthers && <button className={scope === 'self' ? 'active' : ''} onClick={() => setScope('self')}>By me</button>}
 					<button className={scope === 'dept' ? 'active' : ''} onClick={() => setScope('dept')}>My dept</button>
 					<button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}>All depts</button>
 				</div>
-			)}
 			{rAvailable.length > 1 && (
 				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
 					<button style={chipStyle(recentType === 'all')} onClick={() => setRecentType('all')}>All ({total})</button>

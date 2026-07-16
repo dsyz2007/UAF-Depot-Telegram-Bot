@@ -39,6 +39,12 @@ function sgtPastSickCutoff(): boolean {
 	const d = new Date(Date.now() + 8 * 3_600_000);
 	return d.getUTCHours() * 60 + d.getUTCMinutes() >= 15 * 60;
 }
+// True while it's 09:00 SGT or earlier — a same-day RSI/RSO reported by then is an AM
+// one; reported later in the day it defaults to PM.
+function sgtAtOrBefore9am(): boolean {
+	const d = new Date(Date.now() + 8 * 3_600_000);
+	return d.getUTCHours() * 60 + d.getUTCMinutes() <= 9 * 60;
+}
 
 export function SickTab({
 	me,
@@ -116,8 +122,14 @@ export function SickTab({
 
 // ── The report form (day + half-day + reason + RSI/RSO buttons) ──────────────
 function ReportForm({ initialReason, onReported }: { initialReason?: string; onReported: () => Promise<void> }) {
-	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(sgtPastSickCutoff() ? 'tomorrow' : 'today');
-	const [period, setPeriod] = useState<'FD' | 'AM' | 'PM'>('FD');
+	// Day default (unchanged): tomorrow once it's past 3pm SGT, else today.
+	// Half-day default follows THAT day and is computed once, when the page opens:
+	//   • tomorrow → AM
+	//   • today    → AM while it's still 09:00 SGT or earlier, otherwise PM
+	// After it opens, both toggles are the user's to change (we don't re-default).
+	const initialDay: 'today' | 'tomorrow' = sgtPastSickCutoff() ? 'tomorrow' : 'today';
+	const [sickDay, setSickDay] = useState<'today' | 'tomorrow'>(initialDay);
+	const [period, setPeriod] = useState<'AM' | 'PM'>(initialDay === 'tomorrow' ? 'AM' : sgtAtOrBefore9am() ? 'AM' : 'PM');
 	const [reportReason, setReportReason] = useState(initialReason ?? '');
 	const [busy, setBusy] = useState(false);
 
@@ -138,7 +150,7 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 			});
 			setReportReason('');
 			await onReported();
-			const half = period === 'FD' ? 'day' : `${period} half-day`;
+			const half = `${period} half-day`;
 			alertDialog(
 				res.auto_approved
 					? `${case_type} logged for ${sickDate} (${period}) — no approval needed. Update your status in the card below.`
@@ -169,9 +181,8 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 			</div>
 			<p className="muted" style={{ marginBottom: 6 }}>Which half-day?</p>
 			<div className="seg" style={{ marginBottom: 8 }}>
-				<button className={period === 'FD' ? 'active' : ''} onClick={() => setPeriod('FD')}>Full day</button>
-				<button className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>AM only</button>
-				<button className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM only</button>
+				<button className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>AM</button>
+				<button className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>PM</button>
 			</div>
 			{sickDay === 'tomorrow' && period === 'PM' && (
 				<p className="muted" style={{ marginBottom: 6, fontSize: 12 }}>
@@ -199,7 +210,7 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 				<textarea value={reportReason} onChange={(e) => setReportReason(e.target.value)} placeholder="e.g. Fever and sore throat" />
 			</label>
 			<p className="muted" style={{ marginBottom: 6 }}>
-				Report for <b>{sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}</b> ({period === 'FD' ? 'full day' : `${period} half-day`}):
+				Report for <b>{sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}</b> ({period} half-day):
 			</p>
 			{!reportReason.trim() && <p className="muted danger" style={{ marginBottom: 6 }}>Enter a reason / symptoms to report.</p>}
 			<div className="actions">
