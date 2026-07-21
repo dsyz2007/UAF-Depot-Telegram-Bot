@@ -373,10 +373,10 @@ type RecentScope = 'mine' | 'self' | 'dept' | 'all';
 interface RecentPayload {
 	status: RecentStatus;
 	scope: RecentScope;
-	offs: { id: number; full_name: string; startdate: string; enddate: string; period: string; days: number; reason: string; approved_date: string | null; approved_by_name: string | null; can_undo: boolean }[];
-	sick: { id: number; full_name: string; case_type: string; reportsick_status: string; sick_date: string | null; reason: string | null; approved_at: string | null; updated_status: string | null; approved_by_name: string | null; can_undo: boolean }[];
+	offs: { id: number; user_id: number; full_name: string; startdate: string; enddate: string; period: string; days: number; reason: string; approved_date: string | null; approved_by_name: string | null; can_undo: boolean }[];
+	sick: { id: number; user_id: number; full_name: string; case_type: string; reportsick_status: string; sick_date: string | null; reason: string | null; approved_at: string | null; updated_status: string | null; approved_by_name: string | null; can_undo: boolean }[];
 	grants: { id: number; full_name: string; num_days: number; reason: string; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
-	leave: { id: number; full_name: string; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
+	leave: { id: number; user_id: number; full_name: string; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
 }
 
 // One labelled field per line — keeps each request readable instead of a messy
@@ -486,9 +486,18 @@ function RecentApprovals({ me }: { me: Me }) {
 	// Approver view → Undo/Reopen (gated by can_undo). Mine view → the requester's
 	// own Cancel/Dismiss (a rejected OFF can't be cancelled — its credits were
 	// already refunded on rejection; an off-credit grant has no requester-cancel).
-	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean) => {
+	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean, isOwn: boolean) => {
+		// The requester may Cancel (approved) / Dismiss (rejected) their OWN off/sick/
+		// leave in ANY scope (Mine, My dept, All depts). Grants have no requester-cancel.
+		if (isOwn && kind !== 'grant') {
+			return (
+				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
+					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
+				</button>
+			);
+		}
 		if (mineView) {
-			if (kind === 'grant') return null; // rejected off/sick/leave are dismissible by the requester
+			if (kind === 'grant') return null; // a grant has no requester-side cancel
 			return (
 				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
 					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
@@ -587,7 +596,7 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip off">Off</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{o.full_name}</span>
 								</span>
-								{undoBtn('off', o.id, 'off', o.can_undo)}
+								{undoBtn('off', o.id, 'off', o.can_undo, o.user_id === me.id)}
 							</div>
 							<FieldLine label="Dates" value={`${o.startdate === o.enddate ? o.startdate : `${o.startdate} → ${o.enddate}`}${o.period === 'AM' || o.period === 'PM' ? ` (${o.period} only)` : ''}`} />
 							<FieldLine label="Days" value={`${o.days} day${o.days === 1 ? '' : 's'}`} />
@@ -602,7 +611,7 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip sick">Sick</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{s.full_name}</span>
 								</span>
-								{undoBtn('sick', s.id, `${s.case_type}`, s.can_undo)}
+								{undoBtn('sick', s.id, `${s.case_type}`, s.can_undo, s.user_id === me.id)}
 							</div>
 							<FieldLine label="Type" value={s.case_type} />
 							<FieldLine label="For date" value={s.sick_date} />
@@ -619,7 +628,7 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip grant">Credit</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{g.full_name}</span>
 								</span>
-								{undoBtn('grant', g.id, 'credit grant', g.can_undo)}
+								{undoBtn('grant', g.id, 'credit grant', g.can_undo, false)}
 							</div>
 							<FieldLine label="Credits" value={`+${g.num_days} credit${g.num_days === 1 ? '' : 's'}`} />
 							<FieldLine label="Reason" value={g.reason} />
@@ -633,7 +642,7 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip leave">Leave</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{l.full_name}</span>
 								</span>
-								{undoBtn('leave', l.id, 'leave', l.can_undo)}
+								{undoBtn('leave', l.id, 'leave', l.can_undo, l.user_id === me.id)}
 							</div>
 							<FieldLine label="Type" value={leaveLabel(l.leave_type, l.period)} />
 							<FieldLine label="Dates" value={l.startdate === l.enddate ? l.startdate : `${l.startdate} → ${l.enddate}`} />
@@ -648,7 +657,7 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip leave">MA</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{l.full_name}</span>
 								</span>
-								{undoBtn('leave', l.id, 'MA request', l.can_undo)}
+								{undoBtn('leave', l.id, 'MA request', l.can_undo, l.user_id === me.id)}
 							</div>
 							<FieldLine label="Type" value={l.period && l.period !== 'FD' ? `${l.period} MA` : 'MA'} />
 							<FieldLine label="Dates" value={l.startdate === l.enddate ? l.startdate : `${l.startdate} → ${l.enddate}`} />

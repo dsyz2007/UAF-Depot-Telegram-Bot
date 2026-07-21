@@ -234,7 +234,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const offScope = scopeSql(offActor);
 		const offs = await env.depot_db
 			.prepare(
-				`SELECT o.id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.period, o.reason,
+				`SELECT o.id, o.user_id, u.full_name, u.department, u.sub_department, o.startdate, o.enddate, o.period, o.reason,
 				        ${offAt} AS approved_date, ${offActor} AS actor_id, ab.full_name AS approved_by_name
 				 FROM off_requests o JOIN users u ON u.id = o.user_id
 				 LEFT JOIN users ab ON ab.id = ${offActor}
@@ -244,7 +244,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			)
 			.bind(...offScope.binds)
 			.all<{
-				id: number; full_name: string; department: string | null; sub_department: string | null;
+				id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null;
 				startdate: string; enddate: string; period: string; reason: string;
 				approved_date: string | null; actor_id: number | null; approved_by_name: string | null;
 			}>();
@@ -255,7 +255,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const sickScope = scopeSql(sickActor);
 		const sick = await env.depot_db
 			.prepare(
-				`SELECT s.id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.sick_date, s.reason,
+				`SELECT s.id, s.user_id, u.full_name, u.department, u.sub_department, s.case_type, s.reportsick_status, s.sick_date, s.reason,
 				        ${sickAt} AS approved_at, s.updated_status, ${sickActor} AS actor_id, ab.full_name AS approved_by_name
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id
 				 LEFT JOIN users ab ON ab.id = ${sickActor}
@@ -265,7 +265,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			)
 			.bind(...sickScope.binds)
 			.all<{
-				id: number; full_name: string; department: string | null; sub_department: string | null;
+				id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null;
 				case_type: string; reportsick_status: string; sick_date: string | null; reason: string | null;
 				approved_at: string | null; updated_status: string | null; actor_id: number | null; approved_by_name: string | null;
 			}>();
@@ -296,7 +296,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const leaveScope = scopeSql(leaveActor);
 		const leave = await env.depot_db
 			.prepare(
-				`SELECT l.id, u.full_name, u.department, u.sub_department, l.leave_type, l.period, l.startdate, l.enddate, l.reason,
+				`SELECT l.id, l.user_id, u.full_name, u.department, u.sub_department, l.leave_type, l.period, l.startdate, l.enddate, l.reason,
 				        ${leaveAt} AS approved_at, ${leaveActor} AS actor_id, ab.full_name AS approved_by_name
 				 FROM leave_requests l JOIN users u ON u.id = l.user_id
 				 LEFT JOIN users ab ON ab.id = ${leaveActor}
@@ -306,20 +306,20 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			)
 			.bind(...leaveScope.binds)
 			.all<{
-				id: number; full_name: string; department: string | null; sub_department: string | null;
+				id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null;
 				leave_type: string; period: string; startdate: string; enddate: string; reason: string | null;
 				approved_at: string | null; actor_id: number | null; approved_by_name: string | null;
 			}>();
 
 		// Strip the internal department/actor fields and attach can_undo.
 		const offItems = (offs.results ?? []).map((o) => ({
-			id: o.id, full_name: o.full_name, startdate: o.startdate, enddate: o.enddate, period: o.period,
+			id: o.id, user_id: o.user_id, full_name: o.full_name, startdate: o.startdate, enddate: o.enddate, period: o.period,
 			days: offCreditDays(o.startdate, o.enddate, o.period), reason: o.reason,
 			approved_date: o.approved_date, approved_by_name: o.approved_by_name,
 			can_undo: canUndo(o.department, o.sub_department, o.actor_id),
 		}));
 		const sickItems = (sick.results ?? []).map((s) => ({
-			id: s.id, full_name: s.full_name, case_type: s.case_type, reportsick_status: s.reportsick_status,
+			id: s.id, user_id: s.user_id, full_name: s.full_name, case_type: s.case_type, reportsick_status: s.reportsick_status,
 			sick_date: s.sick_date, reason: s.reason, approved_at: s.approved_at, updated_status: s.updated_status,
 			approved_by_name: s.approved_by_name, can_undo: canUndo(s.department, s.sub_department, s.actor_id),
 		}));
@@ -329,7 +329,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			can_undo: canUndo(g.department, g.sub_department, g.actor_id),
 		}));
 		const leaveItems = (leave.results ?? []).map((l) => ({
-			id: l.id, full_name: l.full_name, leave_type: l.leave_type, period: l.period,
+			id: l.id, user_id: l.user_id, full_name: l.full_name, leave_type: l.leave_type, period: l.period,
 			startdate: l.startdate, enddate: l.enddate, reason: l.reason,
 			approved_at: l.approved_at, approved_by_name: l.approved_by_name,
 			can_undo: canUndo(l.department, l.sub_department, l.actor_id),

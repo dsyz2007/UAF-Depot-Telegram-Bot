@@ -541,7 +541,13 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 	const [staffId, setStaffId] = useState<number | ''>('');
 	const [staffSearch, setStaffSearch] = useState('');
 	const [staffDept, setStaffDept] = useState<string>('all');
-	const [numDays, setNumDays] = useState<number | ''>('');
+	// Raw text so a leading "-" can be typed (or toggled via the ± button) — mobile
+	// numeric keypads often omit the minus key. Validated to an optional sign, digits
+	// and at most ONE decimal place.
+	const [numStr, setNumStr] = useState('');
+	const numVal = Number(numStr);
+	// A COMPLETE valid number (not an intermediate like "" / "-" / "3.").
+	const numValid = /^-?\d+(\.\d)?$/.test(numStr);
 	const [reason, setReason] = useState('');
 	const [busy, setBusy] = useState(false);
 
@@ -578,7 +584,7 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 		try {
 			// Round to 1 decimal place (half-days like 3.5 are allowed) + trimmed
 			// reason. (The server also coerces.) Omit staff_id to default to self.
-			const payload: Record<string, unknown> = { num_days: Math.round(Number(numDays) * 10) / 10, reason: reason.trim() };
+			const payload: Record<string, unknown> = { num_days: Math.round(numVal * 10) / 10, reason: reason.trim() };
 			if (canCreditOthers && staffId !== '') payload.staff_id = staffId;
 			const res = await api.post<{ auto_approved?: boolean; balance?: number; recipient_name?: string }>('/api/off/grant', payload);
 			await onDone();
@@ -586,8 +592,8 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 			const recipientName = res.recipient_name ?? (selfSelected ? me.full_name : selected?.full_name ?? 'the recipient');
 			alertDialog(
 				res.auto_approved
-					? `✅ ${numDays} off credit(s) credited to ${recipientName} (no approval needed)${res.balance != null ? `. Their balance: ${res.balance}` : ''}.`
-					: `Submitted — ${numDays} off credit(s) for ${recipientName}, pending superior approval.`,
+					? `✅ ${numVal} off credit(s) credited to ${recipientName} (no approval needed)${res.balance != null ? `. Their balance: ${res.balance}` : ''}.`
+					: `Submitted — ${numVal} off credit(s) for ${recipientName}, pending superior approval.`,
 			);
 		} catch (e) {
 			setBusy(false);
@@ -596,7 +602,7 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 	}
 
 	// Crediters may go negative (a deduction); a plain self-crediter cannot.
-	const ok = typeof numDays === 'number' && (canCreditOthers ? numDays !== 0 : numDays > 0) && reason.trim().length > 0;
+	const ok = numValid && (canCreditOthers ? numVal !== 0 : numVal > 0) && reason.trim().length > 0;
 	// Immediate (no approval) only when the granter holds an appointment AND is
 	// self-managed AND the recipient is in their own department (incl self).
 	// Everyone else's credit (incl admin/superadmin → others) is a proposal.
@@ -679,15 +685,47 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 						)}
 					</>
 				)}
-				<label>Number of off days (half-days allowed, e.g. 3.5{canCreditOthers ? '; negative to deduct' : ''})
-					<input
-						type="number"
-						min={canCreditOthers ? undefined : 0.5}
-						step={0.5}
-						value={numDays}
-						onChange={(e) => setNumDays(e.target.value === '' ? '' : Number(e.target.value))}
-						placeholder={canCreditOthers ? 'e.g. 3, 3.5 or -2' : 'e.g. 3 or 3.5'}
-					/>
+				<label>Number of off days (one decimal allowed, e.g. 3.5{canCreditOthers ? '; negative to deduct' : ''})
+					<div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+						<input
+							type="text"
+							inputMode="decimal"
+							value={numStr}
+							// Accept only an optional leading "-", digits and at most ONE decimal
+							// place — permitting intermediate states ("", "-", "3.") while typing.
+							onChange={(e) => {
+								const v = e.target.value;
+								if (/^-?\d*(\.\d?)?$/.test(v)) setNumStr(v);
+							}}
+							placeholder={canCreditOthers ? 'e.g. 3, 3.5 or -2' : 'e.g. 3 or 3.5'}
+							style={{ flex: 1, marginBottom: 0 }}
+						/>
+						{canCreditOthers && (
+							<button
+								type="button"
+								onClick={() => setNumStr((s) => (s.startsWith('-') ? s.slice(1) : s === '' ? '-' : `-${s}`))}
+								title="Toggle positive / negative"
+								style={{
+									flexShrink: 0,
+									minWidth: 52,
+									fontWeight: 700,
+									fontSize: 18,
+									borderRadius: 8,
+									border: '1px solid var(--tg-theme-hint-color, #ccc)',
+									background: numStr.startsWith('-') ? 'var(--depot-danger, #d9534f)' : 'var(--tg-theme-secondary-bg-color, #f0f0f0)',
+									color: numStr.startsWith('-') ? '#fff' : 'var(--tg-theme-text-color, inherit)',
+									cursor: 'pointer',
+								}}
+							>
+								±
+							</button>
+						)}
+					</div>
+					{canCreditOthers && (
+						<span className="muted" style={{ fontSize: 12 }}>
+							Tap <b>±</b> to make it negative (a deduction) — handy when your phone keyboard has no “−” key.
+						</span>
+					)}
 				</label>
 				<label>Reason
 					<textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Off in lieu for weekend duty" />
