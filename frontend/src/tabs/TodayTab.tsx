@@ -49,11 +49,11 @@ type InboxScope = 'mine' | 'dept' | 'all';
 interface WithAction { can_action: boolean }
 interface ApprovalsPayload {
 	scope: InboxScope;
-	offs: ({ id: number; full_name: string; department: string | null; sub_department: string | null; startdate: string; enddate: string; period: string; reason: string; days: number } & WithAction)[];
-	sick: ({ id: number; full_name: string; department: string | null; sub_department: string | null; case_type: string; reason: string | null; created_at: string } & WithAction)[];
+	offs: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; startdate: string; enddate: string; period: string; reason: string; days: number } & WithAction)[];
+	sick: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; case_type: string; reason: string | null; created_at: string } & WithAction)[];
 	grants: ({ id: number; full_name: string; department: string | null; sub_department: string | null; num_days: number; reason: string } & WithAction)[];
 	parade: ({ id: number; full_name: string; department: string | null; sub_department: string | null; parade_state_date: string; period: string; new_status: string; new_reason: string | null } & WithAction)[];
-	leave: ({ id: number; full_name: string; department: string | null; sub_department: string | null; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null } & WithAction)[];
+	leave: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null } & WithAction)[];
 }
 type ApprovalType = 'off' | 'sick' | 'grant' | 'parade' | 'leave';
 
@@ -215,7 +215,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: o.reason,
 								onApprove: () => act([{ type: 'off', id: o.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'off', id: o.id, action: 'reject' }], 'Reject'),
-								onCancel: mineView ? () => cancelMine('off', o.id) : undefined,
+								onCancel: o.user_id === me.id ? () => cancelMine('off', o.id) : undefined,
 							}))}
 						/>
 					)}
@@ -233,7 +233,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: s.reason ? `Reason: ${s.reason}` : `Submitted ${sgtDateTime(s.created_at)}`,
 								onApprove: () => act([{ type: 'sick', id: s.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'sick', id: s.id, action: 'reject' }], 'Reject'),
-								onCancel: mineView ? () => cancelMine('sick', s.id) : undefined,
+								onCancel: s.user_id === me.id ? () => cancelMine('sick', s.id) : undefined,
 							}))}
 						/>
 					)}
@@ -285,7 +285,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: l.reason ?? '',
 								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
-								onCancel: mineView ? () => cancelMine('leave', l.id) : undefined,
+								onCancel: l.user_id === me.id ? () => cancelMine('leave', l.id) : undefined,
 							}))}
 						/>
 					)}
@@ -303,7 +303,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 								sub: l.reason ?? '',
 								onApprove: () => act([{ type: 'leave', id: l.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'leave', id: l.id, action: 'reject' }], 'Reject'),
-								onCancel: mineView ? () => cancelMine('leave', l.id) : undefined,
+								onCancel: l.user_id === me.id ? () => cancelMine('leave', l.id) : undefined,
 							}))}
 						/>
 					)}
