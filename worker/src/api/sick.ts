@@ -189,16 +189,26 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	//   • sick_count = confirmed RSI/RSO events this month — counted whether the case
 	//     is still active OR has since been system-archived, so the month total stays
 	//     stable instead of shrinking as cases age out (the "resets" bug).
-	//   • mc_days = MC days from those cases PLUS Hospital-Leave days: distinct days
-	//     this month whose parade status is 'Leave (Others)' with 'HL' / 'Hospital
-	//     Leave' in the reason (case-insensitive).
+	//   • mc_days = WHOLE-DAY MC (a day counts +1 only when BOTH its AM and PM parade
+	//     cells are 'MC' — a half-day MC, e.g. the RSI/RSO visit day, does NOT count)
+	//     PLUS Hospital-Leave days (distinct days this month whose parade status is
+	//     'Leave (Others)' with 'HL' / 'Hospital Leave' in the reason, case-insensitive).
 	if (request.method === 'GET' && sub === '/stats') {
 		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT u.id, u.full_name, u.department,
 				        COUNT(s.id) AS sick_count,
-				        COALESCE(SUM(CASE WHEN s.num_of_mc_days > 0 THEN s.num_of_mc_days ELSE 0 END), 0)
+				        COALESCE((
+					              SELECT COUNT(*) FROM (
+					                  SELECT 1 FROM parade_state_entries pe
+					                  WHERE pe.user_id = u.id AND pe.parade_status = 'MC'
+					                    AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
+					                    AND date(pe.parade_state_date) <= date('now','+8 hours')
+					                  GROUP BY pe.parade_state_date
+					                  HAVING COUNT(DISTINCT pe.period) >= 2
+					              )
+					          ), 0)
 				          + COALESCE((
 				              SELECT COUNT(DISTINCT pe.parade_state_date)
 				              FROM parade_state_entries pe

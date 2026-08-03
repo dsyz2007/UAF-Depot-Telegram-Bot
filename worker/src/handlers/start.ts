@@ -14,20 +14,6 @@ export function registerStartHandler(bot: Bot, env: Env): void {
 			.bind(telegramId)
 			.first<{ id: number; full_name: string }>();
 
-		// Invite gate. An unknown Telegram ID may only create an account if it
-		// arrived through the private share link `t.me/<bot>?start=<INVITE_CODE>`,
-		// whose deep-link payload surfaces as `ctx.match`. Anyone who merely
-		// discovers the bot's @username and presses Start without the code is
-		// turned away WITHOUT a row being written — no PENDING junk, and no hint of
-		// what the bot is for. Existing users (any state) bypass the gate: the code
-		// is only needed to CREATE an account. Fail-closed — if INVITE_CODE is unset
-		// no new user can join, which is loud and self-correcting (existing users
-		// are unaffected) rather than a silent security hole.
-		if (!existing && ctx.match !== env.INVITE_CODE) {
-			await ctx.reply('This bot is private — you need an invite link.');
-			return;
-		}
-
 		// Nuke any leftover reply keyboard from earlier code paths. Reply keyboards
 		// persist in the chat across messages until explicitly removed; without
 		// this, an old stale `Keyboard.webApp().persistent()` button keeps

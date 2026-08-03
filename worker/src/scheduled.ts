@@ -11,6 +11,7 @@
 import { tgSendMessage, sendThrottled } from './tg';
 import { getDayWorkInfo, slotWorking, sgtToday, sgtDateAddDays } from './holidays';
 import { resolveApprovalDms } from './approval-dms';
+import { allSuperadminTids } from './superiors';
 
 // Inline keyboard with a single WebApp button that deep-links to a tab.
 // Optional `date` (YYYY-MM-DD) pre-selects that date on the Parade calendar —
@@ -49,9 +50,19 @@ interface UserRow {
 
 export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
 	switch (event.cron) {
-		case '*/5 * * * *':
+		case '*/5 * * * *': {
 			await drainReminders(env);
+			// 2h before the 08:30 / 13:30 parade cutoffs — 06:30 SGT (22:30 UTC) and
+			// 11:30 SGT (03:30 UTC) — remind appointment-holders of pending requests
+			// whose start date is today or earlier. Fired off the 5-min cron (we're at
+			// the 5-trigger cap); keyed on the SCHEDULED minute so a delayed run still
+			// matches. Those two slots are quiet (no nudge broadcast draining) so it
+			// stays well under the 50-subrequest budget.
+			const st = new Date(event.scheduledTime);
+			if (st.getUTCHours() === 22 && st.getUTCMinutes() === 30) await remindHoldersPending(env, 'AM');
+			else if (st.getUTCHours() === 3 && st.getUTCMinutes() === 30) await remindHoldersPending(env, 'PM');
 			return;
+		}
 		case '0 10 * * *':
 			await paradeNudge(env, 'evening_prev_am');
 			return;
@@ -500,6 +511,99 @@ async function runSickExpiry(env: Env): Promise<void> {
 			 WHERE ${staleResolved}`,
 		),
 	]);
+}
+
+interface PendingRow {
+	kind: string;
+	full_name: string;
+	dept: string | null;
+	sub: string | null;
+	sd: string;
+	ed: string;
+	period: string;
+	extra: string;
+}
+
+// 2h before the 08:30 / 13:30 parade cutoffs, DM each department's appointment-
+// holders a CONSOLIDATED list of the pending requests they can action whose start
+// date is today or earlier (future-dated requests are excluded). Holders with
+// nothing to action get NO message; if nothing qualifies anywhere, nobody is DM'd.
+async function remindHoldersPending(env: Env, slot: 'AM' | 'PM'): Promise<void> {
+	const today = sgtToday();
+	// Pending off / sick / leave whose START date is today or earlier.
+	const { results: rows } = await env.depot_db
+		.prepare(
+			`SELECT 'off' AS kind, u.full_name, u.department AS dept, u.sub_department AS sub,
+			        o.startdate AS sd, o.enddate AS ed, o.period AS period, '' AS extra
+			 FROM off_requests o JOIN users u ON u.id = o.user_id
+			 WHERE o.off_status = 'pending' AND o.startdate <= ?
+			 UNION ALL
+			 SELECT 'sick', u.full_name, u.department, u.sub_department,
+			        s.sick_date, s.sick_date, COALESCE(s.period, ''), s.case_type
+			 FROM sick_cases s JOIN users u ON u.id = s.user_id
+			 WHERE s.reportsick_status = 'pending_superior' AND s.sick_date IS NOT NULL AND s.sick_date <= ?
+			 UNION ALL
+			 SELECT 'leave', u.full_name, u.department, u.sub_department,
+			        l.startdate, l.enddate, l.period, l.leave_type
+			 FROM leave_requests l JOIN users u ON u.id = l.user_id
+			 WHERE l.status = 'pending' AND l.startdate <= ?`,
+		)
+		.bind(today, today, today)
+		.all<PendingRow>();
+	if (!rows?.length) return; // nothing qualifies anywhere → send nothing
+
+	// Route to each request's own-unit appointment-holders, or ALL superadmins as the
+	// fallback for units with no holder / requesters with no department (mirrors
+	// approverTidsFor). DHQ holders are NOT pulled cross-department — they only ever
+	// get their OWN unit's items, per the no-cross-dept-notification rule.
+	const { results: holders } = await env.depot_db
+		.prepare(
+			`SELECT telegram_id, department, sub_department FROM users
+			 WHERE appointment IN ('WOIC','2IC','PC') AND full_name NOT LIKE 'PENDING:%'`,
+		)
+		.all<{ telegram_id: string; department: string | null; sub_department: string | null }>();
+	const superTids = await allSuperadminTids(env);
+	const unitKey = (d: string | null, s: string | null) => `${d ?? ''}||${s ?? ''}`;
+	const holdersByUnit = new Map<string, string[]>();
+	for (const h of holders ?? []) {
+		const k = unitKey(h.department, h.sub_department);
+		const arr = holdersByUnit.get(k);
+		if (arr) arr.push(h.telegram_id);
+		else holdersByUnit.set(k, [h.telegram_id]);
+	}
+
+	const perTid = new Map<string, string[]>();
+	for (const r of rows) {
+		const inUnit = holdersByUnit.get(unitKey(r.dept, r.sub));
+		const targets = inUnit && inUnit.length ? inUnit : superTids;
+		const dept = r.dept ?? 'Unassigned';
+		const range = r.sd === r.ed ? r.sd : `${r.sd} → ${r.ed}`;
+		const half = r.period === 'AM' || r.period === 'PM' ? ` ${r.period}` : '';
+		const text =
+			r.kind === 'off'
+				? `📅 Off · ${r.full_name} (${dept}) · ${range}${half}`
+				: r.kind === 'sick'
+					? `🤒 ${r.extra || 'Sick'} · ${r.full_name} (${dept}) · ${r.sd}`
+					: `🏝 ${r.extra || 'Leave'} · ${r.full_name} (${dept}) · ${range}${half}`;
+		for (const tid of targets) {
+			const arr = perTid.get(tid);
+			if (arr) arr.push(text);
+			else perTid.set(tid, [text]);
+		}
+	}
+
+	const when = slot === 'AM' ? '08:30' : '13:30';
+	for (const [tid, lines] of perTid) {
+		await tgSendMessage(env.BOT_TOKEN, {
+			chat_id: tid,
+			text:
+				`🔔 Pending approvals reminder (before ${when})\n\n` +
+				`These requests have a start date of today or earlier and still need your action:\n\n` +
+				`${lines.join('\n')}\n\n` +
+				`Open Depot App → 🗂 Pending to approve/reject.`,
+			reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
+		});
+	}
 }
 
 async function runParadePrune(env: Env): Promise<void> {
