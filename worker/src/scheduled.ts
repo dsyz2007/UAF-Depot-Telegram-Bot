@@ -601,7 +601,7 @@ async function remindHoldersPending(env: Env, slot: 'AM' | 'PM'): Promise<void> 
 				`These requests have a start date of today or earlier and still need your action:\n\n` +
 				`${lines.join('\n')}\n\n` +
 				`Open Depot App → 🗂 Pending to approve/reject.`,
-			reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending', web_app: { url: `${env.WEBAPP_URL}?tab=today` } }]] },
+			reply_markup: { inline_keyboard: [[{ text: '🗂 Open Pending', web_app: { url: `${env.WEBAPP_URL}?tab=today&scope=dept` } }]] },
 		});
 	}
 }

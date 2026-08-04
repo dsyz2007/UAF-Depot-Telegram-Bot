@@ -611,6 +611,30 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
 
+		// Self-revert: the requester is undoing their OWN approved off (an appointment-
+		// holder / self-managed user who auto-approved it — approver == recipient).
+		// Reopening to 'pending' is meaningless (nobody else approves it), so CANCEL it
+		// instead: it disappears, refunding the reserved credits and blanking OFF cells.
+		if (row.user_id === user.id) {
+			const flipSelf = await env.depot_db
+				.prepare(`UPDATE off_requests SET off_status='cancelled', cancelled_by=?, cancelled_at=datetime('now') WHERE id=? AND off_status='approved'`)
+				.bind(user.id, body.id)
+				.run();
+			if ((flipSelf.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
+			const refundSelf = offDays(row.startdate, row.enddate, row.period);
+			await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(refundSelf, user.id).run();
+			const hdSelf = row.period === 'AM' || row.period === 'PM';
+			await env.depot_db
+				.prepare(
+					hdSelf
+						? `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF' AND period = ?`
+						: `DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'OFF'`,
+				)
+				.bind(...(hdSelf ? [user.id, row.startdate, row.enddate, row.period] : [user.id, row.startdate, row.enddate]))
+				.run();
+			return json({ ok: true, cancelled: true });
+		}
+
 		// Reopen as pending (back to the inbox). Credits were reserved at request
 		// time and stay reserved while pending — no refund here (they're only
 		// returned on reject/cancel).

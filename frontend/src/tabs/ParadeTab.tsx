@@ -18,6 +18,7 @@ interface Entry {
 	period: 'AM' | 'PM' | null;
 	parade_status: string | null;
 	reason: string | null;
+	pending: number;
 }
 
 // Ranking for the Everyone-panel sort: 1st descending rights
@@ -54,12 +55,16 @@ const DEPT_ORDER: readonly string[] = ['DHQ', 'DMSP', 'DCS', 'DSP', 'Others', 'U
 
 // Render a single AM-or-PM cell: coloured status badge stacked above the
 // (truncated) reason. Empty cell when there's no entry for that period.
-function renderStatusCell(entry: { parade_status: string | null; reason: string | null } | undefined) {
+// Label a row, prefixing "Pending " while its backing request still awaits approval.
+const statusLabel = (row?: { parade_status: string | null; pending?: number }): string =>
+	row && row.parade_status ? (row.pending ? `Pending ${row.parade_status}` : row.parade_status) : '—';
+
+function renderStatusCell(entry: { parade_status: string | null; reason: string | null; pending?: number } | undefined) {
 	if (!entry || !entry.parade_status) return <span className="muted">—</span>;
 	return (
 		<div>
 			<span className="badge" style={{ background: COLORS[entry.parade_status] }}>
-				{entry.parade_status}
+				{entry.pending ? `Pending ${entry.parade_status}` : entry.parade_status}
 			</span>
 			{entry.reason && <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{entry.reason}</div>}
 		</div>
@@ -351,6 +356,7 @@ interface MyMonthRow {
 	period: 'AM' | 'PM';
 	parade_status: string;
 	reason: string | null;
+	pending: number;
 }
 
 // ±3 month navigation cap. Computed once on mount; the UI restricts navigation
@@ -534,11 +540,11 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 								<div className="day-chips">
 									<span
 										className="chip-half am"
-										style={{ background: my?.AM ? COLORS[my.AM.parade_status] : 'transparent' }}
+										style={{ background: my?.AM ? COLORS[my.AM.parade_status] : 'transparent', opacity: my?.AM?.pending ? 0.45 : 1 }}
 									/>
 									<span
 										className="chip-half pm"
-										style={{ background: my?.PM ? COLORS[my.PM.parade_status] : 'transparent' }}
+										style={{ background: my?.PM ? COLORS[my.PM.parade_status] : 'transparent', opacity: my?.PM?.pending ? 0.45 : 1 }}
 									/>
 								</div>
 							</button>
@@ -554,9 +560,9 @@ export function ParadeTab({ me, onRoute }: { me: Me; onRoute: (action: RouteActi
 						<div className="muted" style={{ marginTop: 2 }}>
 							{myToday ? (
 								<>
-									My AM: <b>{myToday.AM?.parade_status ?? '—'}</b>
+									My AM: <b>{statusLabel(myToday.AM)}</b>
 									{' · '}
-									My PM: <b>{myToday.PM?.parade_status ?? '—'}</b>
+									My PM: <b>{statusLabel(myToday.PM)}</b>
 								</>
 							) : (
 								<span>You have not submitted for this date.</span>
@@ -943,6 +949,7 @@ function SubmitModal({
 				skipped_past?: number;
 				blocked_off?: boolean;
 				blocked_sick?: 'RSI' | 'RSO' | null;
+				blocked_mc?: boolean;
 				off_period?: 'FD' | 'AM' | 'PM';
 			}>('/api/parade/submit', payload);
 			await onDone();
@@ -971,6 +978,12 @@ function SubmitModal({
 				onRoute({ kind: 'sick', sickType: res.blocked_sick, reason: sickReason ?? undefined });
 				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
 				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar — report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
+				return;
+			}
+			if (!target && res.blocked_mc) {
+				onRoute({ kind: 'sick', sickType: null });
+				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
+				alertDialog(`⚠ You have an active RSI/RSO — record your MC on the Sick page (open your case → Update status), not the calendar. Opening the Sick page.${savedNote}`);
 				return;
 			}
 			// Clean self save — jump the calendar to the saved start date so the new

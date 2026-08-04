@@ -73,8 +73,12 @@ function ApprovalsInbox({ me }: { me: Me }) {
 	// the units they're the fallback approver for live); appointment-holders → dept.
 	// Default to MY DEPT when the viewer has a department (incl. DHQ holders &
 	// dept-ed superadmins); only a department-less superadmin defaults to All.
-	// Every user may pick a scope now; default to My dept for anyone with a department.
-	const [scope, setScope] = useState<InboxScope>(me.department ? 'dept' : canSeeOthers ? 'all' : 'mine');
+	// Every user may pick a scope now; a ?scope= deep-link (e.g. from the holder
+	// reminder button) wins, else default to My dept for anyone with a department.
+	const urlScope = new URLSearchParams(window.location.search).get('scope');
+	const [scope, setScope] = useState<InboxScope>(
+		urlScope === 'mine' || urlScope === 'dept' || urlScope === 'all' ? urlScope : me.department ? 'dept' : canSeeOthers ? 'all' : 'mine',
+	);
 	const [typeFilter, setTypeFilter] = useState<InboxTypeFilter>('all');
 	const [data, setData] = useState<ApprovalsPayload | null>(null);
 	const [busy, setBusy] = useState(false);

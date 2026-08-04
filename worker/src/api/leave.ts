@@ -296,7 +296,7 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
 			.prepare(
-				`SELECT l.id, l.user_id, l.leave_type, l.startdate, l.enddate, l.status, l.approved_by,
+				`SELECT l.id, l.user_id, l.leave_type, l.period, l.startdate, l.enddate, l.status, l.approved_by,
 				        u.telegram_id AS requester_tid, u.full_name AS requester_name,
 				        u.department AS requester_dept, u.sub_department AS requester_sub,
 				        a.telegram_id AS approver_tid
@@ -310,6 +310,7 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 				id: number;
 				user_id: number;
 				leave_type: string;
+				period: LeavePeriod;
 				startdate: string;
 				enddate: string;
 				status: string;
@@ -328,6 +329,19 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub)) ||
 			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
+
+		// Self-revert: the requester is undoing their OWN approved leave/MA (auto-
+		// approved — approver == recipient). Reopening to pending is meaningless, so
+		// CANCEL it instead: it disappears, and its parade cells are blanked.
+		if (row.user_id === user.id) {
+			const flipSelf = await env.depot_db
+				.prepare(`UPDATE leave_requests SET status='cancelled', cancelled_by=?, cancelled_at=datetime('now') WHERE id=? AND status='approved'`)
+				.bind(user.id, body.id)
+				.run();
+			if ((flipSelf.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
+			await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
+			return json({ ok: true, cancelled: true });
+		}
 
 		const flip = await env.depot_db
 			.prepare(`UPDATE leave_requests SET status = 'pending', approved_by = NULL, approved_at = NULL WHERE id = ? AND status = 'approved'`)

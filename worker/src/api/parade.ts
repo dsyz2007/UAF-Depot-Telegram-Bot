@@ -79,12 +79,18 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const start = `${ym}-01`;
 		const { results } = await env.depot_db
 			.prepare(
-				`SELECT parade_state_date, period, parade_status, reason
-				 FROM parade_state_entries
-				 WHERE user_id = ?
-				   AND parade_state_date >= ?
-				   AND parade_state_date < date(?, '+1 month')
-				 ORDER BY parade_state_date, period`,
+				`SELECT pe.parade_state_date, pe.period, pe.parade_status, pe.reason,
+				        CASE
+				          WHEN pe.parade_status = 'OFF' AND EXISTS (SELECT 1 FROM off_requests o WHERE o.user_id = pe.user_id AND o.off_status = 'pending' AND o.startdate <= pe.parade_state_date AND o.enddate >= pe.parade_state_date) THEN 1
+				          WHEN pe.parade_status IN ('RSI','RSO') AND EXISTS (SELECT 1 FROM sick_cases s WHERE s.user_id = pe.user_id AND s.reportsick_status = 'pending_superior' AND s.sick_date = pe.parade_state_date AND s.case_type = pe.parade_status) THEN 1
+				          WHEN pe.parade_status IN ('LL','OL','Leave (Others)','MA') AND EXISTS (SELECT 1 FROM leave_requests l WHERE l.user_id = pe.user_id AND l.status = 'pending' AND l.startdate <= pe.parade_state_date AND l.enddate >= pe.parade_state_date AND l.leave_type = pe.parade_status) THEN 1
+				          ELSE 0
+				        END AS pending
+				 FROM parade_state_entries pe
+				 WHERE pe.user_id = ?
+				   AND pe.parade_state_date >= ?
+				   AND pe.parade_state_date < date(?, '+1 month')
+				 ORDER BY pe.parade_state_date, pe.period`,
 			)
 			.bind(user.id, start, start)
 			.all<{
@@ -92,6 +98,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				period: 'AM' | 'PM';
 				parade_status: string;
 				reason: string | null;
+				pending: number;
 			}>();
 		return json(results ?? []);
 	}
@@ -107,7 +114,13 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			.prepare(
 				`SELECT u.id AS user_id, u.full_name, u.department, u.sub_department,
 				        u.user_role, u.personnel_type,
-				        p.parade_state_date, p.period, p.parade_status, p.reason
+				        p.parade_state_date, p.period, p.parade_status, p.reason,
+				        CASE
+				          WHEN p.parade_status = 'OFF' AND EXISTS (SELECT 1 FROM off_requests o WHERE o.user_id = u.id AND o.off_status = 'pending' AND o.startdate <= p.parade_state_date AND o.enddate >= p.parade_state_date) THEN 1
+				          WHEN p.parade_status IN ('RSI','RSO') AND EXISTS (SELECT 1 FROM sick_cases s WHERE s.user_id = u.id AND s.reportsick_status = 'pending_superior' AND s.sick_date = p.parade_state_date AND s.case_type = p.parade_status) THEN 1
+				          WHEN p.parade_status IN ('LL','OL','Leave (Others)','MA') AND EXISTS (SELECT 1 FROM leave_requests l WHERE l.user_id = u.id AND l.status = 'pending' AND l.startdate <= p.parade_state_date AND l.enddate >= p.parade_state_date AND l.leave_type = p.parade_status) THEN 1
+				          ELSE 0
+				        END AS pending
 				 FROM users u
 				 LEFT JOIN parade_state_entries p
 				   ON p.user_id = u.id AND p.parade_state_date = ?
@@ -126,6 +139,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 				period: 'AM' | 'PM' | null;
 				parade_status: string | null;
 				reason: string | null;
+				pending: number;
 			}>();
 		return json(results ?? []);
 	}
@@ -287,6 +301,28 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const sickType = (clean.find((e) => e.status === 'RSI' || e.status === 'RSO')?.status ?? null) as 'RSI' | 'RSO' | null;
 		const routeSick = editingSelf ? sickType : null;
 		if (routeSick) clean = clean.filter((e) => e.status !== 'RSI' && e.status !== 'RSO');
+
+		// If a self-editing user sets 'MC' on the calendar while they have an ACTIVE
+		// RSI/RSO case, they must record the MC via the Sick page (Update status) — that
+		// flow paints MC correctly AND preserves the RSI/RSO half-day. Strip the MC and
+		// route them there. (A user with NO active RSI/RSO may set MC directly.)
+		let routeMc = false;
+		if (editingSelf && !routeSick && clean.some((e) => e.status === 'MC')) {
+			const activeSick = await env.depot_db
+				.prepare(
+					`SELECT 1 FROM sick_cases
+					 WHERE user_id = ? AND case_type IN ('RSI','RSO')
+					   AND reportsick_status IN ('approved','updated','flagged')
+					   AND sick_date IS NOT NULL AND date(sick_date) >= date('now','+8 hours')
+					 LIMIT 1`,
+				)
+				.bind(user.id)
+				.first();
+			if (activeSick) {
+				routeMc = true;
+				clean = clean.filter((e) => e.status !== 'MC');
+			}
+		}
 
 		const allDates = expandRange(body.startdate, body.enddate);
 		const today = sgtToday();
@@ -495,6 +531,9 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			// saved (see `applied`), and the frontend routes the user to the Sick page
 			// to report the RSI/RSO.
 			blocked_sick: routeSick ?? undefined,
+			// Set when an MC half was stripped because the user has an ACTIVE RSI/RSO —
+			// they must record the MC via the Sick page (Update status), not the calendar.
+			blocked_mc: routeMc || undefined,
 			// Set when an unbacked OFF half was stripped: the rest was saved, and the
 			// frontend routes the user to the Off page to request the off (pre-filled
 			// with off_period — the half-day(s) that actually need backing).

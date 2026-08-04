@@ -204,7 +204,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 					                  SELECT 1 FROM parade_state_entries pe
 					                  WHERE pe.user_id = u.id AND pe.parade_status = 'MC'
 					                    AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
-					                    AND date(pe.parade_state_date) <= date('now','+8 hours')
+					                    AND date(pe.parade_state_date) < date('now','+8 hours','start of month','+1 month')
 					                  GROUP BY pe.parade_state_date
 					                  HAVING COUNT(DISTINCT pe.period) >= 2
 					              )
@@ -496,6 +496,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		const row = await env.depot_db
 			.prepare(
 				`SELECT s.id, s.user_id, s.case_type, s.reportsick_status, s.superior_user_id,
+				        s.sick_date, s.mc_start_date, s.mc_end_date,
 				        u.telegram_id AS requester_tid, u.full_name AS requester_name,
 				        u.department AS requester_dept, u.sub_department AS requester_sub,
 				        sup.telegram_id AS approver_tid, sup.full_name AS approver_name
@@ -511,6 +512,9 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				case_type: string;
 				reportsick_status: string;
 				superior_user_id: number | null;
+				sick_date: string | null;
+				mc_start_date: string | null;
+				mc_end_date: string | null;
 				requester_tid: string;
 				requester_name: string;
 				requester_dept: string | null;
@@ -528,6 +532,26 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 			(!!user.appointment && sameUnit(user, row.requester_dept, row.requester_sub)) ||
 			isHqHolder(user);
 		if (!canRevert) return json({ error: 'not_your_approval' }, { status: 403 });
+
+		// Self-revert: the requester is undoing their OWN approved RSI/RSO (a self-
+		// managed / appointment-holder who auto-approved it — approver == recipient).
+		// Reopening to pending is meaningless, so CANCEL it instead: it disappears.
+		// Blank the RSI/RSO cell and any MC cells painted on update.
+		if (row.user_id === user.id) {
+			const flipSelf = await env.depot_db
+				.prepare(`UPDATE sick_cases SET reportsick_status='cancelled', cancelled_by=?, cancelled_at=datetime('now') WHERE id=? AND reportsick_status IN ('approved','updated','flagged')`)
+				.bind(user.id, body.id)
+				.run();
+			if ((flipSelf.meta.changes ?? 0) === 0) return json({ error: 'bad_state' }, { status: 409 });
+			if (row.sick_date) await clearParadeForSick(env, user.id, row.sick_date, row.case_type);
+			if (row.mc_start_date && row.mc_end_date) {
+				await env.depot_db
+					.prepare(`DELETE FROM parade_state_entries WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ? AND parade_status = 'MC'`)
+					.bind(user.id, row.mc_start_date, row.mc_end_date)
+					.run();
+			}
+			return json({ ok: true, cancelled: true });
+		}
 
 		// Reopen as pending (back to the inbox) and clear the approval fields.
 		const flip = await env.depot_db
