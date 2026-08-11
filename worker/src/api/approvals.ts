@@ -228,6 +228,16 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		// Per-status column config (status value + actor column + timestamp column).
 		const approved = status === 'approved';
 
+		// Approved items are normally limited to approvals in the last 14 days. But an
+		// approved request whose date is TODAY or still upcoming must ALWAYS show (even
+		// if it was approved >14 days ago) — otherwise a leave/off booked well in
+		// advance vanishes from Recent before it even happens. Rejected items keep the
+		// plain 14-day window; off-credit grants have no date so they stay 14-day too.
+		const recentWindow = (at: string, dateCol: string | null): string =>
+			approved && dateCol
+				? `(${at} >= datetime('now','-14 days') OR ${dateCol} >= date('now','+8 hours'))`
+				: `${at} >= datetime('now','-14 days')`;
+
 		const offActor = approved ? 'o.approved_by' : 'o.rejected_by';
 		const offAt = approved ? 'o.approved_date' : 'o.rejected_at';
 		const offSt = approved ? "off_status = 'approved'" : "off_status = 'rejected'";
@@ -239,7 +249,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 				 FROM off_requests o JOIN users u ON u.id = o.user_id
 				 LEFT JOIN users ab ON ab.id = ${offActor}
 				 WHERE o.${offSt}
-				   AND ${offAt} >= datetime('now','-14 days') ${offScope.clause}
+				   AND ${recentWindow(offAt, 'o.enddate')} ${offScope.clause}
 				 ORDER BY ${offAt} DESC LIMIT 50`,
 			)
 			.bind(...offScope.binds)
@@ -260,7 +270,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 				 FROM sick_cases s JOIN users u ON u.id = s.user_id
 				 LEFT JOIN users ab ON ab.id = ${sickActor}
 				 WHERE s.${sickSt}
-				   AND ${sickAt} >= datetime('now','-14 days') ${sickScope.clause}
+				   AND ${recentWindow(sickAt, 's.sick_date')} ${sickScope.clause}
 				 ORDER BY ${sickAt} DESC LIMIT 50`,
 			)
 			.bind(...sickScope.binds)
@@ -281,7 +291,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
 				 LEFT JOIN users ab ON ab.id = ${grantActor}
 				 WHERE g.${grantSt}
-				   AND ${grantAt} >= datetime('now','-14 days') ${grantScope.clause}
+				   AND ${recentWindow(grantAt, null)} ${grantScope.clause}
 				 ORDER BY ${grantAt} DESC LIMIT 50`,
 			)
 			.bind(...grantScope.binds)
@@ -301,7 +311,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 				 FROM leave_requests l JOIN users u ON u.id = l.user_id
 				 LEFT JOIN users ab ON ab.id = ${leaveActor}
 				 WHERE l.${leaveSt}
-				   AND ${leaveAt} >= datetime('now','-14 days') ${leaveScope.clause}
+				   AND ${recentWindow(leaveAt, 'l.enddate')} ${leaveScope.clause}
 				 ORDER BY ${leaveAt} DESC LIMIT 50`,
 			)
 			.bind(...leaveScope.binds)
