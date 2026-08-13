@@ -150,6 +150,7 @@ interface GrantRow {
 	status: string;
 	granted_by_name: string | null;
 	approved_by_name: string | null;
+	approved_by_id: number | null;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -217,6 +218,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status, g.created_at, g.approved_at,
+				        ab.id AS approved_by_id,
 				        gr.full_name AS granted_by_name, ab.full_name AS approved_by_name
 				 FROM off_credit_grants g
 				 LEFT JOIN users gr ON gr.id = g.granted_by

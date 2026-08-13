@@ -60,6 +60,7 @@ interface GrantRow {
 	status: string;
 	granted_by_name: string | null;
 	approved_by_name: string | null;
+	approved_by_id: number | null;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -205,6 +206,20 @@ export function OffTab({
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
+	// Revert an approved off-CREDIT grant: it goes back to pending approval and the
+	// credited day(s) are clawed straight back off the recipient's balance (unlike a
+	// take-off revert, where reserved credits stay put). Same approver/superadmin gate.
+	async function revertGrant(id: number) {
+		const ok = await confirmDialog('Revert this approved off-credit back to pending approval? The credited day(s) will be clawed back from their balance until it is re-approved (or dropped if it is then rejected).');
+		if (!ok) return;
+		try {
+			await api.post('/api/off/grant/revert', { id });
+			await refreshAll();
+			alertDialog('Reverted — credit clawed back, pending approval again.');
+		} catch (e) {
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
 
 	// ----- Detail view -----------------------------------------------------
 	if (detailUser) {
@@ -274,15 +289,23 @@ export function OffTab({
 									<th>Reason</th>
 									<th>Approved by</th>
 									<th>Approved date</th>
+									{isAdminish(me.user_role) && <th></th>}
 								</tr>
 							</thead>
 							<tbody>
 								{(detailShowAllCredits ? detailCredits : detailCredits.slice(0, DETAIL_CAP)).map((g) => (
 									<tr key={g.id}>
-										<td>🪙 +{g.num_days}</td>
+										<td>🪙 {g.num_days >= 0 ? '+' : ''}{g.num_days}</td>
 										<td><span className="muted">{g.reason}</span></td>
 										<td>{g.approved_by_name ?? '—'}</td>
 										<td>{g.approved_at?.slice(0, 10) ?? '—'}</td>
+										{isAdminish(me.user_role) && (
+											<td>
+												{(me.user_role === 'superadmin' || g.approved_by_id === me.id) && (
+													<button className="btn-link danger" onClick={() => revertGrant(g.id)}>↩ Revert</button>
+												)}
+											</td>
+										)}
 									</tr>
 								))}
 							</tbody>
