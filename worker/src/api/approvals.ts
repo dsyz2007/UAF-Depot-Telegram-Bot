@@ -45,6 +45,7 @@ interface SickItem extends Dept {
 }
 interface GrantItem extends Dept {
 	id: number;
+	granted_by: number; // the requester — only they may cancel it (never the recipient)
 	full_name: string;
 	num_days: number;
 	reason: string;
@@ -128,7 +129,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			.all<SickItem>();
 		const grantsRaw = await env.depot_db
 			.prepare(
-				`SELECT g.id, g.user_id, u.full_name, u.department, u.sub_department, g.num_days, g.reason
+				`SELECT g.id, g.user_id, g.granted_by, u.full_name, u.department, u.sub_department, g.num_days, g.reason
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
 				 WHERE g.status = 'pending_superior' ${sc.clause} ORDER BY g.created_at`,
 			)
@@ -286,7 +287,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 		const grantScope = scopeSql(grantActor);
 		const grants = await env.depot_db
 			.prepare(
-				`SELECT g.id, u.full_name, u.department, u.sub_department, g.num_days, g.reason,
+				`SELECT g.id, g.granted_by, u.full_name, u.department, u.sub_department, g.num_days, g.reason,
 				        ${grantAt} AS approved_at, ${grantActor} AS actor_id, ab.full_name AS approved_by_name
 				 FROM off_credit_grants g JOIN users u ON u.id = g.user_id
 				 LEFT JOIN users ab ON ab.id = ${grantActor}
@@ -297,7 +298,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			.bind(...grantScope.binds)
 			.all<{
 				id: number; full_name: string; department: string | null; sub_department: string | null;
-				num_days: number; reason: string; approved_at: string | null; actor_id: number | null; approved_by_name: string | null;
+				granted_by: number; num_days: number; reason: string; approved_at: string | null; actor_id: number | null; approved_by_name: string | null;
 			}>();
 
 		const leaveActor = approved ? 'l.approved_by' : 'l.rejected_by';
@@ -334,7 +335,7 @@ export async function handleApprovals(actx: AuthedContext): Promise<Response> {
 			approved_by_name: s.approved_by_name, can_undo: canUndo(s.department, s.sub_department, s.actor_id),
 		}));
 		const grantItems = (grants.results ?? []).map((g) => ({
-			id: g.id, full_name: g.full_name, num_days: g.num_days, reason: g.reason,
+			id: g.id, granted_by: g.granted_by, full_name: g.full_name, num_days: g.num_days, reason: g.reason,
 			approved_at: g.approved_at, approved_by_name: g.approved_by_name,
 			can_undo: canUndo(g.department, g.sub_department, g.actor_id),
 		}));

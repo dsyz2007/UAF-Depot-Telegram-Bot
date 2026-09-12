@@ -151,6 +151,7 @@ interface GrantRow {
 	granted_by_name: string | null;
 	approved_by_name: string | null;
 	approved_by_id: number | null;
+	granted_by?: number;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -171,6 +172,63 @@ function offDays(start: string, end: string, period: string): number {
 }
 function periodSuffix(period: string): string {
 	return period === 'AM' || period === 'PM' ? ` (${period} only)` : '';
+}
+// "+2" / "-1.5" — credit amounts may be negative (a deduction).
+function signed(n: number): string {
+	return n >= 0 ? `+${n}` : `${n}`;
+}
+
+// An off-credit grant as loaded for a requester-side withdraw (see withdrawGrant).
+interface WithdrawableGrant {
+	id: number;
+	user_id: number;
+	num_days: number;
+	status: string;
+	staff_tid: string;
+	staff_name: string;
+	approver_tid: string | null;
+}
+
+// Withdraw an off-credit grant on behalf of its REQUESTER (granted_by) — the grant
+// analogue of cancelling your own off: it disappears (→ cancelled) rather than
+// reopening. An approved grant's credit change is reversed with a plain
+// subtraction (mirrors /grant/revert, so a negative grant reverses too); a
+// rejected one is just a private dismiss. Returns false if the row moved on first
+// (atomic flip guarded on the observed state, so a race can't double-reverse).
+async function withdrawGrant(env: Env, user: AuthedContext['user'], row: WithdrawableGrant): Promise<boolean> {
+	const flip = await env.depot_db
+		.prepare(`UPDATE off_credit_grants SET status = 'cancelled', cancelled_by = ?, cancelled_at = datetime('now') WHERE id = ? AND status = ?`)
+		.bind(user.id, row.id, row.status)
+		.run();
+	if ((flip.meta.changes ?? 0) === 0) return false;
+	if (row.status === 'rejected') return true; // never touched the balance; DMs already say "rejected"
+
+	const wasApproved = row.status === 'approved';
+	let balance: number | null = null;
+	if (wasApproved) {
+		const b = await env.depot_db
+			.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ? RETURNING off_credits`)
+			.bind(row.num_days, row.user_id)
+			.first<{ off_credits: number }>();
+		balance = b?.off_credits ?? null;
+	}
+	const amt = `${signed(row.num_days)} day(s)`;
+	const forWhom = row.user_id === user.id ? '' : ` for ${row.staff_name}`;
+	// Clears any live Approve/Reject buttons (pending) / rewrites the outcome (approved).
+	await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', row.id, `🚫 ${user.full_name}'s off-credit request${forWhom} (${amt}) — withdrawn by requester.${wasApproved ? ' Credit change reversed.' : ''} No action needed.`);
+	const sent = new Set<string>([user.telegram_id]);
+	const notify = (tid: string | null, text: string) =>
+		!tid || sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text }));
+	await Promise.allSettled([
+		wasApproved ? notify(row.approver_tid, `🚫 ${user.full_name} cancelled the off-credit${forWhom} (${amt}) that you approved — the credit change was reversed.`) : null,
+		notify(
+			row.staff_tid,
+			wasApproved
+				? `🚫 ${user.full_name} cancelled the off-credit (${amt}) they put through for you — it has been reversed.${balance != null ? ` Balance: ${balance}.` : ''}`
+				: `🚫 ${user.full_name} withdrew their pending off-credit proposal for you (${amt}).`,
+		),
+	]);
+	return true;
 }
 
 export async function handleOff(actx: AuthedContext): Promise<Response> {
@@ -240,6 +298,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				 FROM off_requests o
 				 LEFT JOIN users a ON a.id = o.approved_by
 				 WHERE o.user_id = ?
+				 AND o.off_status != 'cancelled' -- a cancel/dismiss removes it from "My recent requests"
 				 ORDER BY o.startdate DESC LIMIT 50`,
 			)
 			.bind(user.id)
@@ -252,7 +311,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		const { results } = await env.depot_db
 			.prepare(
 				`SELECT g.id, g.user_id, g.num_days, g.reason, g.status,
-				        g.created_at, g.approved_at,
+				        g.created_at, g.approved_at, g.granted_by,
 				        gr.full_name AS granted_by_name
 				 FROM off_credit_grants g
 				 LEFT JOIN users gr ON gr.id = g.granted_by
@@ -671,6 +730,34 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, reopened: true });
 	}
 
+	// -------- cancel own off-credit request (pending / approved / rejected) --
+	// Like /cancel for take-offs: the requester may withdraw it in ANY settled
+	// state. Keyed on the REQUESTER (granted_by), never the recipient — so nobody
+	// can cancel a deduction (or any credit) that someone else put through for them.
+	if (request.method === 'POST' && sub === '/grant/cancel') {
+		const body = (await request.json()) as { id?: number };
+		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
+		const row = await env.depot_db
+			.prepare(
+				`SELECT g.id, g.user_id, g.granted_by, g.num_days, g.status,
+				        u.telegram_id AS staff_tid, u.full_name AS staff_name,
+				        ab.telegram_id AS approver_tid
+				 FROM off_credit_grants g
+				 JOIN users u ON u.id = g.user_id
+				 LEFT JOIN users ab ON ab.id = g.superior_user_id
+				 WHERE g.id = ?`,
+			)
+			.bind(body.id)
+			.first<WithdrawableGrant & { granted_by: number }>();
+		if (!row) return json({ error: 'not_found' }, { status: 404 });
+		if (row.granted_by !== user.id) return json({ error: 'not_your_request' }, { status: 403 });
+		if (!['pending_superior', 'approved', 'rejected'].includes(row.status)) {
+			return json({ error: 'not_cancellable', state: row.status }, { status: 409 });
+		}
+		if (!(await withdrawGrant(env, user, row))) return json({ error: 'not_cancellable' }, { status: 409 });
+		return json({ ok: true, dismissed: row.status === 'rejected' });
+	}
+
 	// -------- revert an APPROVED off-credit grant (claw back credits) ------
 	// Allowed for a superadmin (any) or the superior who approved it.
 	if (request.method === 'POST' && sub === '/grant/revert') {
@@ -678,13 +765,14 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });
 		const row = await env.depot_db
 			.prepare(
-				`SELECT g.id, g.user_id, g.num_days, g.status, g.superior_user_id,
+				`SELECT g.id, g.user_id, g.granted_by, g.num_days, g.status, g.superior_user_id,
 				        u.telegram_id AS staff_tid, u.full_name AS staff_name,
 				        u.department AS staff_dept, u.sub_department AS staff_sub,
-				        gr.telegram_id AS granter_tid
+				        gr.telegram_id AS granter_tid, ab.telegram_id AS approver_tid
 				 FROM off_credit_grants g
 				 JOIN users u ON u.id = g.user_id
 				 LEFT JOIN users gr ON gr.id = g.granted_by
+				 LEFT JOIN users ab ON ab.id = g.superior_user_id
 				 WHERE g.id = ?`,
 			)
 			.bind(body.id)
@@ -694,6 +782,8 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 				num_days: number;
 				status: string;
 				superior_user_id: number | null;
+				granted_by: number;
+				approver_tid: string | null;
 				staff_tid: string;
 				staff_name: string;
 				staff_dept: string | null;
@@ -708,6 +798,13 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			(!!user.appointment && sameUnit(user, row.staff_dept, row.staff_sub)) ||
 			isHqHolder(user);
 		if (!canRevertGrant) return json({ error: 'not_your_approval' }, { status: 403 });
+		// Self-revert: the REQUESTER undoing their own credit (e.g. a holder's auto-
+		// approved credit). Reopening it to pending is meaningless — withdraw it
+		// instead, exactly like /grant/cancel: it disappears, credit change reversed.
+		if (row.granted_by === user.id) {
+			if (!(await withdrawGrant(env, user, row))) return json({ error: 'not_approved' }, { status: 409 });
+			return json({ ok: true, cancelled: true, days_clawed: row.num_days });
+		}
 		// Reopen as pending (back to the inbox) and claw the credits back — atomic
 		// flip so a double-revert can't claw twice.
 		const flipClaw = await env.depot_db

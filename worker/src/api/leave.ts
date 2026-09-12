@@ -246,8 +246,8 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, id: ins.id });
 	}
 
-	// Requester cancels their own pending leave — or one-step-undoes their own
-	// already-approved leave when they auto-approve (appointment-holder / self).
+	// Requester cancels their OWN leave/MA — ANY user (normal users included), in
+	// any settled state: pending, approved, or rejected (a private dismiss).
 	if (request.method === 'POST' && sub === '/cancel') {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });

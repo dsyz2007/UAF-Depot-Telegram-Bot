@@ -61,6 +61,7 @@ interface GrantRow {
 	granted_by_name: string | null;
 	approved_by_name: string | null;
 	approved_by_id: number | null;
+	granted_by?: number;
 	created_at: string;
 	approved_at: string | null;
 }
@@ -180,17 +181,31 @@ export function OffTab({
 		void Promise.all([loadMine(), loadGrants(), loadMyCredits()]);
 	});
 
-	async function cancelMine(id: number, approved: boolean) {
+	async function cancelMine(id: number, status: string) {
 		const ok = await confirmDialog(
-			approved
+			status === 'approved'
 				? 'Cancel this approved off? Your credits will be refunded and the superior who approved it will be told.'
-				: 'Cancel this off request? Your reserved credits will be refunded.',
+				: status === 'rejected'
+					? 'Dismiss this rejected off? It will be cleared from your list (its credits were already refunded).'
+					: 'Cancel this off request? Your reserved credits will be refunded.',
 		);
 		if (!ok) return;
 		try {
 			await api.post('/api/off/cancel', { id });
 			await refreshAll();
-			alertDialog('Cancelled.');
+			alertDialog(status === 'rejected' ? 'Dismissed.' : 'Cancelled.');
+		} catch (e) {
+			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+	// Withdraw your OWN pending off-credit request (you're its requester).
+	async function cancelGrant(id: number) {
+		const ok = await confirmDialog('Withdraw this off-credit request? It will be removed from the approval inbox.');
+		if (!ok) return;
+		try {
+			await api.post('/api/off/grant/cancel', { id });
+			await refreshAll();
+			alertDialog('Withdrawn.');
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -199,8 +214,12 @@ export function OffTab({
 		const ok = await confirmDialog('Revert this approval back to pending? Credits stay reserved while it awaits re-approval (refunded only if it is then rejected or cancelled).');
 		if (!ok) return;
 		try {
-			await api.post('/api/off/revert', { id });
+			const res = await api.post<{ cancelled?: boolean }>('/api/off/revert', { id });
 			await refreshAll();
+			if (res.cancelled) {
+				alertDialog('Cancelled — it was your own off, so it was withdrawn and the credits refunded.');
+				return;
+			}
 			alertDialog('Reverted — back to pending approval.');
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -213,8 +232,12 @@ export function OffTab({
 		const ok = await confirmDialog('Revert this approved off-credit back to pending approval? The credited day(s) will be clawed back from their balance until it is re-approved (or dropped if it is then rejected).');
 		if (!ok) return;
 		try {
-			await api.post('/api/off/grant/revert', { id });
+			const res = await api.post<{ cancelled?: boolean }>('/api/off/grant/revert', { id });
 			await refreshAll();
+			if (res.cancelled) {
+				alertDialog('Cancelled — it was your own credit request, so it was withdrawn and the credit change reversed.');
+				return;
+			}
 			alertDialog('Reverted — credit clawed back, pending approval again.');
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -349,11 +372,16 @@ export function OffTab({
 					{pendingGrants.map((g) => (
 						<div key={g.id} className="entry-card acc-pending">
 							<div className="entry-head">
-								<span className="entry-title">🪙 +{g.num_days} credit{g.num_days === 1 ? '' : 's'}</span>
+								<span className="entry-title">🪙 {g.num_days >= 0 ? '+' : ''}{g.num_days} credit{Math.abs(g.num_days) === 1 ? '' : 's'}</span>
 								<span className="badge status-pending_superior">pending</span>
 							</div>
 							<div className="entry-meta"><span>from {g.granted_by_name ?? '?'}</span></div>
 							{g.reason && <div className="entry-reason">{g.reason}</div>}
+							{g.granted_by === me.id && (
+								<div className="entry-actions">
+									<button className="btn-link danger" onClick={() => cancelGrant(g.id)}>🗑 Cancel</button>
+								</div>
+							)}
 						</div>
 					))}
 				</>
@@ -375,9 +403,9 @@ export function OffTab({
 									{m.approved_by_name && <span>✓ {m.approved_by_name}</span>}
 								</div>
 								{m.reason && <div className="entry-reason">{m.reason}</div>}
-								{(m.off_status === 'pending' || m.off_status === 'approved') && (
+								{(m.off_status === 'pending' || m.off_status === 'approved' || m.off_status === 'rejected') && (
 									<div className="entry-actions">
-										<button className="btn-link danger" onClick={() => cancelMine(m.id, m.off_status === 'approved')}>🗑 Cancel</button>
+										<button className="btn-link danger" onClick={() => cancelMine(m.id, m.off_status)}>🗑 {m.off_status === 'rejected' ? 'Dismiss' : 'Cancel'}</button>
 									</div>
 								)}
 							</div>

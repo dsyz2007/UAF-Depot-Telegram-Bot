@@ -424,10 +424,9 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 		return json({ ok: true, mc_dates: mcDates });
 	}
 
-	// Requester cancels/undoes their OWN sick case in one step. Normally only a
-	// still-pending case is cancellable; but an appointment-holder / self-managed
-	// user (who auto-approves their own requests) may also one-step-undo their own
-	// already-approved RSI/RSO — there's no separate superior to ask.
+	// Requester cancels/undoes their OWN sick case in one step — ANY user (normal
+	// users included), in any settled state: pending, approved/updated/flagged, or
+	// rejected (a private dismiss). No role gate: it's their own request.
 	if (request.method === 'POST' && sub === '/cancel') {
 		const body = (await request.json()) as { id?: number };
 		if (!Number.isInteger(body.id)) return json({ error: 'invalid_body' }, { status: 400 });

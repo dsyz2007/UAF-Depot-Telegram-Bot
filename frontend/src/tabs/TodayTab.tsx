@@ -51,7 +51,7 @@ interface ApprovalsPayload {
 	scope: InboxScope;
 	offs: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; startdate: string; enddate: string; period: string; reason: string; days: number } & WithAction)[];
 	sick: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; case_type: string; reason: string | null; created_at: string } & WithAction)[];
-	grants: ({ id: number; full_name: string; department: string | null; sub_department: string | null; num_days: number; reason: string } & WithAction)[];
+	grants: ({ id: number; granted_by: number; full_name: string; department: string | null; sub_department: string | null; num_days: number; reason: string } & WithAction)[];
 	parade: ({ id: number; full_name: string; department: string | null; sub_department: string | null; parade_state_date: string; period: string; new_status: string; new_reason: string | null } & WithAction)[];
 	leave: ({ id: number; user_id: number; full_name: string; department: string | null; sub_department: string | null; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null } & WithAction)[];
 }
@@ -130,14 +130,19 @@ function ApprovalsInbox({ me }: { me: Me }) {
 		}
 	}
 
-	// Requester withdraws their OWN still-pending request (Mine view only). Off,
-	// sick and leave/MA each have their own cancel endpoint.
-	async function cancelMine(kind: 'off' | 'sick' | 'leave', id: number) {
-		const ok = await confirmDialog('Cancel this request? It will be withdrawn and any parade status reverted.');
+	// Requester withdraws their OWN still-pending request (any scope). Off, sick,
+	// leave/MA and off-credit requests each have their own cancel endpoint.
+	async function cancelMine(kind: 'off' | 'sick' | 'leave' | 'grant', id: number) {
+		const ok = await confirmDialog(
+			kind === 'grant'
+				? 'Withdraw this off-credit request? It will be removed from the approval inbox.'
+				: 'Cancel this request? It will be withdrawn and any parade status reverted.',
+		);
 		if (!ok) return;
 		setBusy(true);
 		try {
-			const path = kind === 'off' ? '/api/off/cancel' : kind === 'sick' ? '/api/sick/cancel' : '/api/leave/cancel';
+			const path =
+				kind === 'off' ? '/api/off/cancel' : kind === 'sick' ? '/api/sick/cancel' : kind === 'grant' ? '/api/off/grant/cancel' : '/api/leave/cancel';
 			await api.post(path, { id });
 			await refresh();
 			alertDialog('Cancelled.');
@@ -251,10 +256,11 @@ function ApprovalsInbox({ me }: { me: Me }) {
 							rows={sortByDept(data.grants).map((g) => ({
 								id: g.id,
 								canAct: g.can_action,
-								main: `${deptLabel(g.department, g.sub_department)} · ${g.full_name} · +${g.num_days} credit${g.num_days === 1 ? '' : 's'}`,
+								main: `${deptLabel(g.department, g.sub_department)} · ${g.full_name} · ${g.num_days >= 0 ? '+' : ''}${g.num_days} credit${Math.abs(g.num_days) === 1 ? '' : 's'}`,
 								sub: g.reason,
 								onApprove: () => act([{ type: 'grant', id: g.id, action: 'approve' }], 'Approve'),
 								onReject: () => act([{ type: 'grant', id: g.id, action: 'reject' }], 'Reject'),
+								onCancel: g.granted_by === me.id ? () => cancelMine('grant', g.id) : undefined,
 							}))}
 						/>
 					)}
@@ -379,7 +385,7 @@ interface RecentPayload {
 	scope: RecentScope;
 	offs: { id: number; user_id: number; full_name: string; startdate: string; enddate: string; period: string; days: number; reason: string; approved_date: string | null; approved_by_name: string | null; can_undo: boolean }[];
 	sick: { id: number; user_id: number; full_name: string; case_type: string; reportsick_status: string; sick_date: string | null; reason: string | null; approved_at: string | null; updated_status: string | null; approved_by_name: string | null; can_undo: boolean }[];
-	grants: { id: number; full_name: string; num_days: number; reason: string; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
+	grants: { id: number; granted_by: number; full_name: string; num_days: number; reason: string; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
 	leave: { id: number; user_id: number; full_name: string; leave_type: string; period: string; startdate: string; enddate: string; reason: string | null; approved_at: string | null; approved_by_name: string | null; can_undo: boolean }[];
 }
 
@@ -463,17 +469,20 @@ function RecentApprovals({ me }: { me: Me }) {
 		}
 	}
 
-	// Requester withdraws/dismisses their OWN processed request (Mine view only).
+	// Requester withdraws/dismisses their OWN processed request (any scope).
 	async function cancelMine(kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string) {
 		const ok = await confirmDialog(
 			isRejected
 				? `Dismiss this rejected ${label}? It will be cleared from your list.`
-				: `Cancel this ${label}? It will be withdrawn and your parade status reverted.`,
+				: kind === 'grant'
+					? `Cancel this ${label}? The credit change will be reversed.`
+					: `Cancel this ${label}? It will be withdrawn and your parade status reverted.`,
 		);
 		if (!ok) return;
 		setBusy(true);
 		try {
-			const path = kind === 'sick' ? '/api/sick/cancel' : kind === 'leave' ? '/api/leave/cancel' : '/api/off/cancel';
+			const path =
+				kind === 'sick' ? '/api/sick/cancel' : kind === 'leave' ? '/api/leave/cancel' : kind === 'grant' ? '/api/off/grant/cancel' : '/api/off/cancel';
 			await api.post(path, { id });
 			await refresh();
 			alertDialog(isRejected ? 'Dismissed.' : 'Cancelled.');
@@ -487,13 +496,14 @@ function RecentApprovals({ me }: { me: Me }) {
 	if (!data) return null;
 	const mineView = scope === 'mine';
 
-	// Approver view → Undo/Reopen (gated by can_undo). Mine view → the requester's
-	// own Cancel/Dismiss (a rejected OFF can't be cancelled — its credits were
-	// already refunded on rejection; an off-credit grant has no requester-cancel).
+	// Approver view → Undo/Reopen (gated by can_undo). Your OWN items → Cancel
+	// (approved) / Dismiss (rejected) in every scope — off, sick, leave/MA and
+	// credit requests alike, for normal users too.
 	const undoBtn = (kind: 'off' | 'sick' | 'grant' | 'leave', id: number, label: string, can: boolean, isOwn: boolean) => {
 		// The requester may Cancel (approved) / Dismiss (rejected) their OWN off/sick/
-		// leave in ANY scope (Mine, My dept, All depts). Grants have no requester-cancel.
-		if (isOwn && kind !== 'grant') {
+		// leave/credit request in ANY scope (Mine, My dept, All depts). For credits,
+		// "own" = the requester (granted_by), never merely the recipient.
+		if (isOwn) {
 			return (
 				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
 					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
@@ -501,7 +511,7 @@ function RecentApprovals({ me }: { me: Me }) {
 			);
 		}
 		if (mineView) {
-			if (kind === 'grant') return null; // a grant has no requester-side cancel
+			if (kind === 'grant') return null; // credited to you by someone else (e.g. a deduction) — not yours to cancel
 			return (
 				<button className="btn-link danger" disabled={busy} onClick={() => cancelMine(kind, id, label)}>
 					{isRejected ? '🗑 Dismiss' : '🗑 Cancel'}
@@ -632,9 +642,9 @@ function RecentApprovals({ me }: { me: Me }) {
 									<span className="type-chip grant">Credit</span>
 									<span className="entry-title" style={{ fontSize: 14 }}>{g.full_name}</span>
 								</span>
-								{undoBtn('grant', g.id, 'credit grant', g.can_undo, false)}
+								{undoBtn('grant', g.id, 'credit grant', g.can_undo, g.granted_by === me.id)}
 							</div>
-							<FieldLine label="Credits" value={`+${g.num_days} credit${g.num_days === 1 ? '' : 's'}`} />
+							<FieldLine label="Credits" value={`${g.num_days >= 0 ? '+' : ''}${g.num_days} credit${Math.abs(g.num_days) === 1 ? '' : 's'}`} />
 							<FieldLine label="Reason" value={g.reason} />
 							<FieldLine label={actorLabel} value={g.approved_by_name} />
 						</div>
