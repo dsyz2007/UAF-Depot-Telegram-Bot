@@ -327,12 +327,36 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 		const allDates = expandRange(body.startdate, body.enddate);
 		const today = sgtToday();
 
-		// Past-day lock: once a day has ended, only a superadmin may amend its
-		// parade state. Everyone else (incl. admins / appointment-holders) is
-		// blocked from editing any date before today (SGT).
+		// Past-day lock: once a day has ended its parade state is fixed — EXCEPT that a
+		// still-BLANK past slot may be filled in, by anyone. That's the recovery path for
+		// an accidental undo: cancelling an approved off/leave/sick blanks the cell, and
+		// the day may well have passed before anyone notices. An entry that IS recorded
+		// stays locked (including clearing it back to 'Blank'), so history can only be
+		// filled in, never rewritten. A superadmin may still amend anything.
 		const canEditPast = user.user_role === 'superadmin';
-		const notPast = allDates.filter((d) => canEditPast || d >= today);
-		const skippedPast = allDates.length - notPast.length;
+		const pastDates = allDates.filter((d) => d < today);
+		// Which past slots already hold a status. One range read, so the bound-param
+		// count stays flat however long the submitted range is.
+		const pastFilled = new Set<string>();
+		if (!canEditPast && pastDates.length > 0) {
+			const { results: filledRows } = await env.depot_db
+				.prepare(
+					`SELECT parade_state_date AS d, period FROM parade_state_entries
+					 WHERE user_id = ? AND parade_state_date >= ? AND parade_state_date <= ?`,
+				)
+				.bind(target.id, pastDates[0], pastDates[pastDates.length - 1])
+				.all<{ d: string; period: string }>();
+			for (const r of filledRows ?? []) pastFilled.add(`${r.d}|${r.period}`);
+		}
+		// A past (date, period) is writable only while it's blank, and never to 'Blank'
+		// itself (clearing a past slot would be the very mistake this is here to undo).
+		const pastSlotLocked = (d: string, e: { period: 'AM' | 'PM'; status: string }): boolean =>
+			!canEditPast && d < today && (e.status === CLEAR_STATUS || pastFilled.has(`${d}|${e.period}`));
+		// Drop only past days where EVERY submitted slot is locked. The rest flow into the
+		// working-day filter below and are locked per-slot in the apply loop, so
+		// skipped_past counts just the slots that would otherwise have saved.
+		const notPast = allDates.filter((d) => d >= today || clean.some((e) => !pastSlotLocked(d, e)));
+		let skippedPast = 0;
 
 		// Working-day info covering the range (two queries total). A slot is
 		// skipped when its (department, period) is non-working — weekend / confirmed
@@ -439,6 +463,12 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			for (const e of clean) {
 				// Skip a period whose (department, slot) is non-working.
 				if (!slotWorking(workInfo.get(d)!, targetDept, e.period)) continue;
+				// A past slot only accepts a status while it's still blank (see the
+				// past-day lock above) — never an overwrite, never a clear.
+				if (pastSlotLocked(d, e)) {
+					skippedPast++;
+					continue;
+				}
 				// 'Blank' resets the slot to the original empty state.
 				if (e.status === CLEAR_STATUS) {
 					deleteOps.push(deleteStmt.bind(target.id, d, e.period));

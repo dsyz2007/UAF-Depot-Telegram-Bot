@@ -792,8 +792,9 @@ function SubmitModal({
 	initialDate: string;
 	minIso: string;
 	maxIso: string;
-	// Superadmins may edit days that have already ended; everyone else is capped
-	// at today (past-day parade state is locked).
+	// Superadmins may overwrite days that have already ended. Everyone else may only
+	// FILL IN a blank half-day on a past day (the worker enforces it and reports
+	// anything it skipped) — the recovery path for an accidentally-undone request.
 	canEditPast: boolean;
 	// When set, a superior/superadmin is editing this person's state for the
 	// single `initialDate` (no range, no auto-routing).
@@ -822,7 +823,9 @@ function SubmitModal({
 
 	// Past-day lock: non-superadmins can't pick a date before today.
 	const todayIso = ymdKey(todayLocal());
-	const effMinIso = canEditPast ? minIso : minIso > todayIso ? minIso : todayIso;
+	// Everyone may now PICK a past date (bounded by the calendar's ±2-month window):
+	// the worker accepts a past slot only while it's blank, and reports any it skipped.
+	const effMinIso = minIso;
 
 	const datesValid = !!startdate && !!enddate && startdate <= enddate;
 	const inRange = !!startdate && !!enddate && startdate >= effMinIso && enddate <= maxIso;
@@ -873,10 +876,17 @@ function SubmitModal({
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (!canEditPast && startdate < todayIso) hint = 'Only a superadmin can edit days that have already passed.';
 	else if (!inRange) hint = `Dates must be within ${effMinIso} → ${maxIso}.`;
 	else if (!atLeastOne) hint = mode === 'fd' ? 'Pick a status.' : 'Set at least one of AM / PM status.';
 	else if (!reasonOk) hint = 'A reason is required for that status.';
+
+	// A past day is no longer refused outright: a blank slot can still be filled in
+	// (the fix for an accidentally-undone request), while anything already recorded
+	// stays put. Informational, so it doesn't block Save the way `hint` does.
+	const pastNote =
+		!canEditPast && !!startdate && startdate < todayIso
+			? '🔒 Past day: only half-days that are currently BLANK can be filled in — anything already recorded stays as it is.'
+			: null;
 
 	const dayCount = datesValid
 		? Math.floor(
@@ -1018,10 +1028,10 @@ function SubmitModal({
 				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
 			}
 			if (res.skipped_past && res.skipped_past > 0) {
-				msg += `\n\n🔒 ${res.skipped_past} past day(s) skipped — only a superadmin can edit days that have ended.`;
+				msg += `\n\n🔒 ${res.skipped_past} past half-day(s) skipped — on a day that has ended, only a BLANK half-day can be filled in.`;
 			}
 			if (res.applied === 0 && res.informed === 0) {
-				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved — those days have already passed (locked).';
+				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved — those past half-days already have a status (only blank ones can be filled in).';
 				else msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
 			}
 			alertDialog(msg);
@@ -1133,6 +1143,7 @@ function SubmitModal({
 				)}
 
 				{hint && <div className="muted danger" style={{ marginBottom: 8 }}>{hint}</div>}
+				{pastNote && <div className="muted" style={{ marginBottom: 8 }}>{pastNote}</div>}
 
 				<button className="btn" disabled={busy || !canSave} onClick={submit}>
 					{busy ? 'Saving…' : isLeaveRequest ? (isMaRequest ? '🩺 Request MA (needs approval)' : '🏝️ Take Leave (request approval)') : 'Save'}
