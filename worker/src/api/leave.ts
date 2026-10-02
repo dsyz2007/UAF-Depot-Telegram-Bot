@@ -34,7 +34,7 @@ function rangeLabel(start: string, end: string): string {
 	return start === end ? start : `${start} → ${end}`;
 }
 
-const ONENS_NOTE = '‼️ IMPORTANT: You still need to submit the actual leave application on OneNS yourself — the bot has only forwarded the request to your superior, it cannot file it on OneNS for you.';
+const ONENS_NOTE = '‼️ IMPORTANT: You still need to submit the actual leave application on OneNS yourself. The bot has only forwarded the request to your superior and can’t file it on OneNS for you.';
 
 // MA (medical appointment) rides the same approval pipeline as leave but is not
 // "leave": no OneNS reminder, and worded as an appointment rather than leave.
@@ -280,7 +280,7 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 		if (!wasRejected) {
 			await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
 			// Sync every approver's DM copy → clears live buttons (pending) / shows withdrawn (approved).
-			await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) — withdrawn by requester. No action needed.`);
+			await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) was withdrawn by the requester. No action needed.`);
 			// An edit doesn't push a notification; for an already-approved request ping the approver too.
 			if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
 				await tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `🚫 ${user.full_name} cancelled their ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) that you approved.` });
@@ -349,8 +349,8 @@ export async function handleLeave(actx: AuthedContext): Promise<Response> {
 			.run();
 		if ((flip.meta.changes ?? 0) === 0) return json({ error: 'not_approved' }, { status: 409 });
 		// Re-arm the chat Approve/Reject buttons on every approver's DM.
-		await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `${leaveIcon(row.leave_type)} ${isMa(row.leave_type) ? 'MA' : 'Leave'} request (re-opened for approval): ${row.requester_name} — ${rangeLabel(row.startdate, row.enddate)}`, 'leave');
-		const msg = `↩ ${user.full_name} reverted your approved ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}) — it's pending approval again.`;
+		await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', body.id as number, `${leaveIcon(row.leave_type)} ${isMa(row.leave_type) ? 'MA' : 'Leave'} request (re-opened for approval): ${row.requester_name}, ${rangeLabel(row.startdate, row.enddate)}`, 'leave');
+		const msg = `↩ ${user.full_name} reverted your approved ${row.leave_type}${leaveNoun(row.leave_type)} (${rangeLabel(row.startdate, row.enddate)}). It's pending approval again.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {
 			sends.push(
@@ -399,7 +399,7 @@ export async function approveLeave(
 		// set to this leave type, so it won't clobber a status the user changed).
 		await clearParadeForLeave(env, row.user_id, row.startdate, row.enddate, row.leave_type, row.period);
 		// Resolve every superior's chat copy (covers inbox + chat-button callers).
-		await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `❌ ${what}${noun} (${range}) — rejected by ${approver.full_name}.`);
+		await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `❌ ${what}${noun} (${range}) was rejected by ${approver.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `❌ Your ${what}${noun} (${range}) was rejected by ${approver.full_name}.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -416,7 +416,7 @@ export async function approveLeave(
 	// working slot of the range (idempotent upsert; repairs the cell if the user
 	// changed it between request and approval).
 	await setParadeForLeave(env, row.user_id, row.requester_dept, row.startdate, row.enddate, row.leave_type, row.reason, row.period);
-	await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `✅ ${what}${noun} (${range}) — approved by ${approver.full_name}.`);
+	await resolveApprovalDms(env, 'leave_requests', 'superior_message_id', id, `✅ ${what}${noun} (${range}) was approved by ${approver.full_name}.`);
 	await tgSendMessage(env.BOT_TOKEN, {
 		chat_id: row.requester_tid,
 		text: `✅ Your ${what}${noun} (${range}) was approved by ${approver.full_name}.${isMa(row.leave_type) ? '' : `\n\n${ONENS_NOTE}`}`,

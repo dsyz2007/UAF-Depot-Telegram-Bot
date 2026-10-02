@@ -230,7 +230,7 @@ function ApprovalsInbox({ me }: { me: Me }) {
 					)}
 					{data.sick.length > 0 && show('sick') && (
 						<ApprovalGroup
-							title={`Sick — RSI/RSO (${data.sick.length})`}
+							title={`RSI/RSO requests (${data.sick.length})`}
 							type="sick"
 							chip="Sick"
 							busy={busy}
@@ -587,7 +587,7 @@ function RecentApprovals({ me }: { me: Me }) {
 				{isRejected ? 'Rejections' : 'Approvals'} in the last 14 days{whoText}.
 				{' '}
 				{mineView
-					? 'These are your own requests — use Cancel/Dismiss to withdraw or clear one.'
+					? 'These are your own requests. Use Cancel/Dismiss to withdraw or clear one.'
 					: isRejected
 						? 'Reopening sends the request back to Pending approvals (off credits are re-reserved).'
 						: 'Undoing sends the request back to Pending approvals (an off-credit grant’s credits are clawed back; off-day credits stay reserved).'}
@@ -772,7 +772,7 @@ export function TodayTab({ me }: { me: Me }) {
 					<div className="muted">Loading…</div>
 				) : (
 					<>
-						<h3>📊 Active Today — {data.today}</h3>
+						<h3>📊 Active Today - {data.today}</h3>
 
 						<Section title={`On Off (${data.offs_today.length})`} accent="success">
 							{data.offs_today.length === 0 ? (
@@ -814,7 +814,7 @@ export function TodayTab({ me }: { me: Me }) {
 												{s.reason && <div className="muted">Reason: {s.reason}</div>}
 												{s.num_of_mc_days != null && s.num_of_mc_days >= 1 && (
 													<div className="muted">
-														{s.num_of_mc_days} day(s) MC — {s.mc_start_date} → {s.mc_end_date}
+														{s.num_of_mc_days} day(s) MC ({s.mc_start_date} → {s.mc_end_date})
 													</div>
 												)}
 												{s.location && <div className="muted">Location: {s.location}</div>}

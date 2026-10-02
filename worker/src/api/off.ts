@@ -215,16 +215,16 @@ async function withdrawGrant(env: Env, user: AuthedContext['user'], row: Withdra
 	const amt = `${signed(row.num_days)} day(s)`;
 	const forWhom = row.user_id === user.id ? '' : ` for ${row.staff_name}`;
 	// Clears any live Approve/Reject buttons (pending) / rewrites the outcome (approved).
-	await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', row.id, `🚫 ${user.full_name}'s off-credit request${forWhom} (${amt}) — withdrawn by requester.${wasApproved ? ' Credit change reversed.' : ''} No action needed.`);
+	await resolveApprovalDms(env, 'off_credit_grants', 'approval_message_id', row.id, `🚫 ${user.full_name}'s off-credit request${forWhom} (${amt}) was withdrawn by the requester.${wasApproved ? ' Credit change reversed.' : ''} No action needed.`);
 	const sent = new Set<string>([user.telegram_id]);
 	const notify = (tid: string | null, text: string) =>
 		!tid || sent.has(tid) ? null : (sent.add(tid), tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text }));
 	await Promise.allSettled([
-		wasApproved ? notify(row.approver_tid, `🚫 ${user.full_name} cancelled the off-credit${forWhom} (${amt}) that you approved — the credit change was reversed.`) : null,
+		wasApproved ? notify(row.approver_tid, `🚫 ${user.full_name} cancelled the off-credit${forWhom} (${amt}) that you approved, so the credit change was reversed.`) : null,
 		notify(
 			row.staff_tid,
 			wasApproved
-				? `🚫 ${user.full_name} cancelled the off-credit (${amt}) they put through for you — it has been reversed.${balance != null ? ` Balance: ${balance}.` : ''}`
+				? `🚫 ${user.full_name} cancelled the off-credit (${amt}) they put through for you, so it has been reversed.${balance != null ? ` Balance: ${balance}.` : ''}`
 				: `🚫 ${user.full_name} withdrew their pending off-credit proposal for you (${amt}).`,
 		),
 	]);
@@ -547,7 +547,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		if (staff.telegram_id !== user.telegram_id && !approverTids.includes(staff.telegram_id)) {
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: staff.telegram_id,
-				text: `🪙 ${user.full_name} proposed crediting you ${days} off day(s) — pending superior approval. Reason: ${reason}`,
+				text: `🪙 ${user.full_name} proposed crediting you ${days} off day(s). It's pending superior approval. Reason: ${reason}`,
 			});
 		}
 
@@ -617,7 +617,7 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 		// Sync every appointment-holder's original DM → clears any still-live
 		// Approve/Reject buttons (pending) or rewrites the outcome (approved) to
 		// "withdrawn". Audience-correct: edits exactly who got the request DM.
-		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s off (${range}) — withdrawn by requester. 🪙 ${refundDays} credit(s) refunded. No action needed.`);
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🚫 ${user.full_name}'s off (${range}) was withdrawn by the requester. 🪙 ${refundDays} credit(s) refunded. No action needed.`);
 		// An edit doesn't push a notification, so if it was already approved, also ping
 		// the approver who'll want to know their approval was undone.
 		if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
@@ -719,9 +719,9 @@ export async function handleOff(actx: AuthedContext): Promise<Response> {
 			.run();
 
 		// Re-arm the chat Approve/Reject buttons on every appointment-holder's DM.
-		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🟡 Off request (re-opened for approval): ${row.requester_name} — ${row.startdate} → ${row.enddate}`, 'off');
+		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', body.id as number, `🟡 Off request (re-opened for approval): ${row.requester_name}, ${row.startdate} → ${row.enddate}`, 'off');
 		const revertDays = offDays(row.startdate, row.enddate, row.period);
-		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}) — it's pending approval again. Your parade state for those days is blank until it's re-approved.\n\n🪙 ${revertDays} credit(s) are STILL RESERVED while it's pending. If you no longer want this off, CANCEL it on the Off page to get the credit(s) back.`;
+		const msg = `↩ ${user.full_name} reverted your approved off (${row.startdate} → ${row.enddate}). It's pending approval again. Your parade state for those days is blank until it's re-approved.\n\n🪙 ${revertDays} credit(s) are STILL RESERVED while it's pending. If you no longer want this off, CANCEL it on the Off page to get the credit(s) back.`;
 		const sends: Promise<unknown>[] = [tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg })];
 		if (row.approver_tid && row.approver_tid !== user.telegram_id) {
 			sends.push(tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `↩ Off for ${row.requester_name} (${row.startdate} → ${row.enddate}) reverted to pending by ${user.full_name}.` }));

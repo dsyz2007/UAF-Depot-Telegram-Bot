@@ -356,7 +356,7 @@ function OverridesSection({ me }: { me: Me }) {
 
 	return (
 		<div>
-			<p className="muted">Override the working-day rule for specific dates — optionally just the AM or PM half, and optionally only for selected departments (e.g. weekend exercise → working for DSP only).</p>
+			<p className="muted">Override the working-day rule for specific dates. You can limit it to just the AM or PM half, and to selected departments only (e.g. weekend exercise → working for DSP only).</p>
 			{me.user_role === 'superadmin' && (
 				<button className="btn" onClick={() => setShowAdd(true)}>+ Add override</button>
 			)}
@@ -376,7 +376,7 @@ function OverridesSection({ me }: { me: Me }) {
 					<div key={`${o.override_date}-${o.period}`} className="card">
 						<div className="card-row">
 							<span>
-								<b>{o.override_date}</b> · {periodLabel(o.period)} — {o.is_working_day === 1 ? '✅ Working' : '🚫 Non-working'}
+								<b>{o.override_date}</b> · {periodLabel(o.period)} · {o.is_working_day === 1 ? '✅ Working' : '🚫 Non-working'}
 							</span>
 							{me.user_role === 'superadmin' && (
 								<button className="btn-link danger" onClick={() => remove(o)}>Remove</button>
@@ -555,13 +555,13 @@ function HolidaysSection({ me }: { me: Me }) {
 			await refresh();
 			let msg: string;
 			if (res.fetched === 0) {
-				msg = `⚠ Fetched 0 records from nager.date — the cache is unchanged (${res.cached_total} total). Check the worker logs.`;
+				msg = `⚠ Fetched 0 records from nager.date, so the cache is unchanged (${res.cached_total} total). Check the worker logs.`;
 			} else if (res.bootstrap) {
 				msg = `✅ Bootstrap complete: cached ${res.fetched} holidays (auto-confirmed since this is the first fetch). Total in cache: ${res.cached_total}.`;
 			} else if (res.deltas === 0) {
-				msg = `✅ Already up to date — ${res.cached_total} confirmed holidays cached, no changes from nager.date.`;
+				msg = `✅ Already up to date. ${res.cached_total} confirmed holidays cached, no changes from nager.date.`;
 			} else {
-				msg = `✅ Refreshed. ${res.deltas} change(s) detected — check your Telegram DM to confirm.`;
+				msg = `✅ Refreshed. ${res.deltas} change(s) detected. Check your Telegram DM to confirm.`;
 			}
 			setLastReport(msg);
 			alertDialog(msg);

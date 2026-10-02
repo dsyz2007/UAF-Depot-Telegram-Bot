@@ -464,7 +464,7 @@ async function applyAction(
 				env.depot_db.prepare(`UPDATE users SET off_credits = off_credits + ? WHERE id = ?`).bind(days, row.user_id),
 				clearOff,
 			]);
-			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `❌ ${row.full_name}'s off (${range}) — rejected by ${approver.full_name}.`);
+			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `❌ ${row.full_name}'s off (${range}) was rejected by ${approver.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
 				text: `❌ Your off request (${range}) was rejected by ${approver.full_name}.\n🪙 ${days} credit(s) refunded.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -477,7 +477,7 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipApprove.meta.changes ?? 0) === 0) return false;
-		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `✅ ${row.full_name}'s off (${range}, ${days} day${days === 1 ? '' : 's'}) — approved by ${approver.full_name}.`);
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', id, `✅ ${row.full_name}'s off (${range}, ${days} day${days === 1 ? '' : 's'}) was approved by ${approver.full_name}.`);
 		// Reflect the approved off on the parade calendar (covers offs requested from
 		// the Off page; parade-initiated ones are already painted — re-paint is a
 		// harmless no-op).
@@ -519,7 +519,7 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipSickR.meta.changes ?? 0) === 0) return false;
-			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', id, `❌ ${row.full_name}'s ${row.case_type} request — rejected by ${approver.full_name}.`);
+			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', id, `❌ ${row.full_name}'s ${row.case_type} request was rejected by ${approver.full_name}.`);
 			// Roll back the optimistic parade entry for that day (if still set).
 			if (row.sick_date) {
 				await env.depot_db
@@ -558,7 +558,7 @@ async function applyAction(
 		]);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
-			text: `✅ Your ${row.case_type} request was approved by ${approver.full_name}.\n\nOnce seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.\n\n📎 Got an MC? Just send the photo/PDF here in this chat (no upload in the app) — it auto-forwards to your superior.`,
+			text: `✅ Your ${row.case_type} request was approved by ${approver.full_name}.\n\nOnce seen, update your status (MC days, dates, location, time) in Depot App → 🤒 Sick.\n\n📎 Got an MC? Just send the photo/PDF here in this chat (no upload in the app). It auto-forwards to your superior.`,
 			reply_markup: { inline_keyboard: [[{ text: '🤒 Open Sick page', web_app: { url: `${env.WEBAPP_URL}?tab=sick` } }]] },
 		});
 		return true;
@@ -653,7 +653,7 @@ async function applyAction(
 				.bind(approver.id, id)
 				.run();
 			if ((flipParaR.meta.changes ?? 0) === 0) return false;
-			await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `❌ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) — rejected by ${approver.full_name}.`);
+			await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `❌ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was rejected by ${approver.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.user_tid,
 				text: `❌ Your late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was rejected by ${approver.full_name}.`,
@@ -665,7 +665,7 @@ async function applyAction(
 			.bind(approver.id, id)
 			.run();
 		if ((flipParaA.meta.changes ?? 0) === 0) return false;
-		await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `✅ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) — approved by ${approver.full_name}.`);
+		await resolveApprovalDms(env, 'parade_change_requests', 'approval_message_id', id, `✅ ${row.full_name}'s late ${row.period} change for ${row.parade_state_date} (${row.new_status}) was approved by ${approver.full_name}.`);
 		await env.depot_db
 			.prepare(
 				`INSERT INTO parade_state_entries (user_id, parade_state_date, period, parade_status, reason)
@@ -717,7 +717,7 @@ async function unrejectItem(
 		await env.depot_db.prepare(`UPDATE users SET off_credits = off_credits - ? WHERE id = ?`).bind(days, row.user_id).run();
 		const range = `${row.startdate} → ${row.enddate}`;
 		// Re-arm the chat Approve/Reject buttons on every approver's DM.
-		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', id, `🟡 Off request (re-opened for approval): ${row.requester_name} — ${range}`, 'off');
+		await restoreApprovalDms(env, 'off_requests', 'superior_message_id', id, `🟡 Off request (re-opened for approval): ${row.requester_name}, ${range}`, 'off');
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `↩ Your previously-rejected off request (${range}) was reopened for approval by ${approver.full_name}.\n🪙 ${days} credit(s) re-reserved pending the decision.`,
@@ -796,7 +796,7 @@ async function unrejectItem(
 	await setParadeForLeave(env, row.user_id, row.department, row.startdate, row.enddate, row.leave_type, row.reason, row.period);
 	const noun = row.leave_type === 'MA' ? '' : ' leave';
 	const range = row.startdate === row.enddate ? row.startdate : `${row.startdate} → ${row.enddate}`;
-	await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', id, `${row.leave_type === 'MA' ? '🩺 MA' : '🏖 Leave'} request (re-opened for approval): ${row.requester_name} — ${range}`, 'leave');
+	await restoreApprovalDms(env, 'leave_requests', 'superior_message_id', id, `${row.leave_type === 'MA' ? '🩺 MA' : '🏖 Leave'} request (re-opened for approval): ${row.requester_name}, ${range}`, 'leave');
 	await tgSendMessage(env.BOT_TOKEN, {
 		chat_id: row.requester_tid,
 		text: `↩ Your previously-rejected ${row.leave_type}${noun} (${range}) was reopened for approval by ${approver.full_name}.`,

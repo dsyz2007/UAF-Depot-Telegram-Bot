@@ -506,7 +506,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 						return `• ${p.date} ${p.period} → ${p.status}${p.reason ? ` (${p.reason})` : ''} (after ${cutoff})`;
 					})
 					.join('\n');
-				const text = `🔔 Late parade-state change — applied automatically (FYI, no action needed).\n${user.full_name}:\n${lines}`;
+				const text = `🔔 Late parade-state change, applied automatically (FYI, no action needed).\n${user.full_name}:\n${lines}`;
 				await Promise.allSettled(approverTids.map((tid) => tgSendMessage(env.BOT_TOKEN, { chat_id: tid, text })));
 			}
 		}
@@ -537,7 +537,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 						)
 						.bind(user.id, d)
 						.first<{ am: string | null; pm: string | null }>();
-					const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '— not set —'}\n  PM: ${cur?.pm ?? '— not set —'}`;
+					const text = `✅ Parade state for ${d} updated:\n  AM: ${cur?.am ?? '(not set)'}\n  PM: ${cur?.pm ?? '(not set)'}`;
 					// Keep the "Open Parade page" button so they can re-edit from the DM.
 					await tgEditMessageText(env.BOT_TOKEN, tracked.chat_id, tracked.message_id, text, {
 						inline_keyboard: [[{ text: '🪖 Open Parade page', web_app: { url: `${env.WEBAPP_URL}?tab=parade&date=${d}` } }]],
@@ -717,7 +717,7 @@ export async function handleParade(actx: AuthedContext): Promise<Response> {
 			user.telegram_id,
 			`parade-state_${rangeTag}${deptTag}.xlsx`,
 			workbook,
-			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''} — ${sheets.length} date tab(s), ${users.length} people`,
+			`📊 Parade state ${start === end ? start : `${start} → ${end}`}${dept ? ` · ${dept}` : ''}: ${sheets.length} date tab(s), ${users.length} people`,
 			'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 		);
 		if (!sent) return json({ error: 'send_failed' }, { status: 502 });

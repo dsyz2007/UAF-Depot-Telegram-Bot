@@ -259,7 +259,7 @@ function buildStrengthReport(amUsers: StrengthRow[], pmUsers: StrengthRow[], per
 	// Not-submitted (blank) — listed FIRST and prominently so it's the first thing
 	// seen. "Blank" = no parade entry for this half-day (status is null).
 	const blanks = users.filter((u) => u.status === null).sort((a, b) => a.full_name.localeCompare(b.full_name));
-	lines.push(`⚠️ NOT SUBMITTED — ${period} (${blanks.length})`);
+	lines.push(`⚠️ NOT SUBMITTED - ${period} (${blanks.length})`);
 	if (blanks.length) {
 		for (const u of blanks) lines.push(`• ${u.full_name}`);
 	} else {
@@ -885,7 +885,7 @@ function SubmitModal({
 	// stays put. Informational, so it doesn't block Save the way `hint` does.
 	const pastNote =
 		!canEditPast && !!startdate && startdate < todayIso
-			? '🔒 Past day: only half-days that are currently BLANK can be filled in — anything already recorded stays as it is.'
+			? '🔒 Past day: you can only fill in half-days that are still BLANK. Anything already recorded stays as it is.'
 			: null;
 
 	const dayCount = datesValid
@@ -933,18 +933,18 @@ function SubmitModal({
 				const half = leaveSel.period === 'FD' ? 'full-day' : `${leaveSel.period} half-day`;
 				const otherNote =
 					(savedOther ? '\n\n(Your other half-day status was also saved.)' : '') +
-					(droppedOther ? '\n\n⚠ An OFF / RSI / RSO half can’t be set together with leave — set that half separately on the Off / Sick page.' : '');
+					(droppedOther ? '\n\n⚠ An OFF / RSI / RSO half can’t be set together with leave. Set that half separately on the Off / Sick page.' : '');
 				if (isMaRequest) {
 					alertDialog(
 						(lres.auto_approved
 							? `🩺 ${half} MA applied for ${lrange} (no approval needed).`
-							: `🩺 Your ${half} MA (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.`) + otherNote,
+							: `🩺 Your ${half} MA (${lrange}) has been forwarded to your superior for approval. You'll be notified here and on Telegram.`) + otherNote,
 					);
 				} else {
 					alertDialog(
 						(lres.auto_approved
-							? `✅ ${half} ${leaveSel.type} leave applied for ${lrange} (no approval needed).\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`
-							: `🏝️ Your ${half} ${leaveSel.type} leave (${lrange}) has been forwarded to your superior for approval — you'll be notified here and on Telegram.\n\n‼️ You still need to submit the leave on OneNS yourself — the bot cannot do that for you.`) + otherNote,
+							? `✅ ${half} ${leaveSel.type} leave applied for ${lrange} (no approval needed).\n\n‼️ You still need to submit the leave on OneNS yourself. The bot can't do that for you.`
+							: `🏝️ Your ${half} ${leaveSel.type} leave (${lrange}) has been forwarded to your superior for approval. You'll be notified here and on Telegram.\n\n‼️ You still need to submit the leave on OneNS yourself. The bot can't do that for you.`) + otherNote,
 					);
 				}
 				return;
@@ -978,7 +978,7 @@ function SubmitModal({
 				const offReason = entries.find((e) => e.status === 'OFF')?.reason ?? undefined;
 				onRoute({ kind: 'off', start: startdate, end: enddate, period: offPeriod, reason: offReason });
 				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
-				alertDialog(`⚠ OFF needs an approved Take Off first — opening the Off page (pre-filled). Submit it there; once approved your parade state will show OFF.${savedNote}`);
+				alertDialog(`⚠ OFF needs an approved Take Off first. Opening the Off page for you (already filled in). Submit it there, and once it's approved your parade state will show OFF.${savedNote}`);
 				return;
 			}
 			if (!target && res.blocked_sick) {
@@ -987,13 +987,13 @@ function SubmitModal({
 				const sickReason = entries.find((e) => e.status === res.blocked_sick)?.reason ?? undefined;
 				onRoute({ kind: 'sick', sickType: res.blocked_sick, reason: sickReason ?? undefined });
 				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
-				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar — report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
+				alertDialog(`⚠ ${res.blocked_sick} isn't set from the calendar. Report it on the Sick page, where it's recorded as one half-day (today's current half, or tomorrow's AM if tomorrow is a working day). Opening the Sick page now.${savedNote}`);
 				return;
 			}
 			if (!target && res.blocked_mc) {
 				onRoute({ kind: 'sick', sickType: null });
 				const savedNote = res.applied > 0 ? ' Your other status change(s) were saved.' : '';
-				alertDialog(`⚠ You have an active RSI/RSO — record your MC on the Sick page (open your case → Update status), not the calendar. Opening the Sick page.${savedNote}`);
+				alertDialog(`⚠ You have an active RSI/RSO, so record your MC on the Sick page (open your case → Update status) instead of the calendar. Opening the Sick page.${savedNote}`);
 				return;
 			}
 			// Clean self save — jump the calendar to the saved start date so the new
@@ -1023,16 +1023,16 @@ function SubmitModal({
 					const half = g.periods.size >= 2 ? 'full day' : [...g.periods][0];
 					return `• ${g.date} (${half}): ${g.reason}`;
 				});
-				msg += `\n\n🟦 Not saved — non-working slot(s):\n${lines.join('\n')}`;
+				msg += `\n\n🟦 Not saved (non-working slots):\n${lines.join('\n')}`;
 			} else if (res.skipped_weekends > 0) {
 				msg += `\n\n🟦 ${res.skipped_weekends} non-working day(s) skipped (weekend or force non-working).`;
 			}
 			if (res.skipped_past && res.skipped_past > 0) {
-				msg += `\n\n🔒 ${res.skipped_past} past half-day(s) skipped — on a day that has ended, only a BLANK half-day can be filled in.`;
+				msg += `\n\n🔒 Skipped ${res.skipped_past} past half-day(s). On a day that has ended, you can only fill in a BLANK half-day.`;
 			}
 			if (res.applied === 0 && res.informed === 0) {
-				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved — those past half-days already have a status (only blank ones can be filled in).';
-				else msg = res.skipped_weekends > 0 ? '⚠ Nothing saved — all selected days were non-working.' : '⚠ Nothing saved.';
+				if (res.skipped_past && res.skipped_past > 0) msg = '⚠ Nothing saved. Those past half-days already have a status, and only blank ones can be filled in.';
+				else msg = res.skipped_weekends > 0 ? '⚠ Nothing saved. All the selected days were non-working.' : '⚠ Nothing saved.';
 			}
 			alertDialog(msg);
 		} catch (e) {
@@ -1040,7 +1040,7 @@ function SubmitModal({
 			const emsg = e instanceof Error ? e.message : String(e);
 			alertDialog(
 				emsg.includes('overlapping_request')
-					? '⚠ You already have a pending or approved leave/MA that overlaps those dates — it’s awaiting approval. Manage it from the Pending page instead of re-requesting.'
+					? '⚠ You already have a pending or approved leave/MA on those dates. It’s awaiting approval, so manage it from the Pending page instead of requesting again.'
 					: `Failed: ${emsg}`,
 			);
 		}
@@ -1055,8 +1055,8 @@ function SubmitModal({
 		<>
 			<label>Status
 				<select value={value} onChange={(e) => setValue(e.target.value as Status | 'Blank' | typeof NONE)}>
-					<option value={NONE}>— leave unchanged —</option>
-					<option value="Blank">⬜ Blank — clear this period</option>
+					<option value={NONE}>(leave unchanged)</option>
+					<option value="Blank">⬜ Blank (clear this period)</option>
 					{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
 				</select>
 			</label>
@@ -1076,7 +1076,7 @@ function SubmitModal({
 
 				{target && (
 					<div className="muted" style={{ marginBottom: 8 }}>
-						Editing <b>{target.name}</b>'s state (applies immediately — pick a single day or a date range).
+						Editing <b>{target.name}</b>'s state (applies immediately, pick a single day or a date range).
 					</div>
 				)}
 				<label>Start date<input
@@ -1136,7 +1136,7 @@ function SubmitModal({
 							<>
 								🏝️ This is <b>leave</b>{leaveSel ? ` (${leaveSel.period === 'FD' ? 'full-day' : leaveSel.period + ' half-day'})` : ''}. Pressing <b>Take Leave</b> automatically forwards
 								the request to your superior for approval via the Telegram bot. <b>You still need to SUBMIT the leave on{' '}
-								<u>OneNS</u> yourself after approval via the telegram bot</b> — the bot cannot do that for you.
+								<u>OneNS</u> yourself after approval via the telegram bot</b>. The bot can't do that for you.
 							</>
 						)}
 					</div>
@@ -1198,14 +1198,14 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 				alertDialog(`No parade entries found for ${rangeLabel}${dept === 'all' ? '' : ` (${dept})`}.`);
 			} else {
 				alertDialog(
-					`📊 Excel (.xlsx) sent to your Telegram chat — ${res.sheets} date tab(s). Each date is its own tab; one row per person with AM/PM side-by-side (Present = green, otherwise red; Unfilled = red).`,
+					`📊 Excel (.xlsx) sent to your Telegram chat (${res.sheets} date tab(s)). Each date is its own tab; one row per person with AM/PM side-by-side (Present = green, otherwise red; Unfilled = red).`,
 				);
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			alertDialog(
 				msg.includes('too_many_rows')
-					? '⚠ Too many entries for one file — narrow to a single department, or pick a shorter date range, then try again.'
+					? '⚠ Too many entries for one file. Narrow it to a single department or pick a shorter date range, then try again.'
 					: `Failed: ${msg}`,
 			);
 		} finally {
@@ -1248,7 +1248,7 @@ function ExportButton({ selectedDate, minIso, maxIso }: { selectedDate: string; 
 				</select>
 			</label>
 			{!validRange && <p className="muted danger" style={{ marginBottom: 6 }}>End date must be on or after start date.</p>}
-			{tooLong && <p className="muted danger" style={{ marginBottom: 6 }}>Max {EXPORT_MAX_DAYS} days per export — narrow the range (you picked {dayCount}).</p>}
+			{tooLong && <p className="muted danger" style={{ marginBottom: 6 }}>Max {EXPORT_MAX_DAYS} days per export. Narrow the range (you picked {dayCount}).</p>}
 			<button className="btn" disabled={busy || !validRange || tooLong} onClick={exportXls}>
 				{busy ? 'Sending…' : `📤 Send Excel for ${rangeLabel}`}
 			</button>
@@ -1276,7 +1276,7 @@ function StrengthModal({ amUsers, pmUsers, date, onClose }: { amUsers: StrengthR
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3 style={{ marginBottom: 6 }}>Parade State — {date}</h3>
+				<h3 style={{ marginBottom: 6 }}>Parade State - {date}</h3>
 				<div className="seg" style={{ marginBottom: 8 }}>
 					<button className={period === 'AM' ? 'active' : ''} onClick={() => setPeriod('AM')}>🌅 AM strength</button>
 					<button className={period === 'PM' ? 'active' : ''} onClick={() => setPeriod('PM')}>🌇 PM strength</button>
@@ -1337,7 +1337,7 @@ function ForecastModal({ target, onClose }: { target: { id: number; name: string
 	return (
 		<div className="modal-backdrop" onClick={onClose}>
 			<div className="modal" onClick={(e) => e.stopPropagation()}>
-				<h3 style={{ marginBottom: 4 }}>📅 {target.name} — {label}</h3>
+				<h3 style={{ marginBottom: 4 }}>📅 {target.name} - {label}</h3>
 				<div className="seg" style={{ marginBottom: 8 }}>
 					<button className={range === 'next' ? 'active' : ''} onClick={() => setRange('next')}>Next 30 days</button>
 					<button className={range === 'past' ? 'active' : ''} onClick={() => setRange('past')}>Past 30 days</button>

@@ -60,8 +60,8 @@ export async function informMaMcCombo(env: Env, userId: number, dates: string[])
 				chat_id: u.telegram_id,
 				text:
 					`📋 You have MA (morning) + MC (afternoon) on ${d}.\n\n` +
-					`1️⃣ Submit the MC on OneNS yourself — the bot can't do that for you.\n` +
-					`2️⃣ Send the MC photo/PDF here in this Telegram CHAT (NOT in the depot app) — I'll forward it to your superior.`,
+					`1️⃣ Submit the MC on OneNS yourself. The bot can't do that for you.\n` +
+					`2️⃣ Send the MC photo/PDF here in this Telegram CHAT (NOT in the depot app) and I'll forward it to your superior.`,
 			});
 
 			const tids = await approverTidsFor(env, u);

@@ -28,7 +28,7 @@ export function registerStartHandler(bot: Bot, env: Env): void {
 				.bind(telegramId, `PENDING:${displayName}`, 'user', username)
 				.run();
 			await ctx.reply(
-				'Welcome to the depot bot. Your account is pending — an admin will assign your name and role shortly.',
+				'Welcome to the depot bot. Your account is pending, and an admin will assign your name and role shortly.',
 			);
 			return;
 		}

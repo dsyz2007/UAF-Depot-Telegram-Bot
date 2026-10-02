@@ -153,8 +153,8 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 			const half = `${period} half-day`;
 			alertDialog(
 				res.auto_approved
-					? `${case_type} logged for ${sickDate} (${period}) — no approval needed. Update your status in the card below.`
-					: `${case_type} submitted for ${sickDate} (${period}) — awaiting approval. Your parade state for that ${half} now shows ${case_type}.`,
+					? `${case_type} logged for ${sickDate} (${period}). No approval needed. Update your status in the card below.`
+					: `${case_type} submitted for ${sickDate} (${period}), waiting for approval. Your parade state for that ${half} now shows ${case_type}.`,
 			);
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -168,7 +168,7 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 		<div>
 			<h3>Report Sick</h3>
 			<p className="muted" style={{ marginBottom: 8 }}>
-				You can report RSI/RSO anytime — even if you already have an active case (e.g. multiple doctor visits or several days sick).
+				You can report RSI/RSO anytime, even if you already have an active case (e.g. multiple doctor visits or several days sick).
 			</p>
 			<p className="muted" style={{ marginBottom: 6 }}>Which day is this RSI/RSO for?</p>
 			<div className="seg" style={{ marginBottom: 8 }}>
@@ -201,7 +201,7 @@ function ReportForm({ initialReason, onReported }: { initialReason?: string; onR
 						lineHeight: 1.4,
 					}}
 				>
-					⚠ It's past 3pm — afternoon/evening reports are usually for <b>TOMORROW</b>. You've selected{' '}
+					⚠ It's past 3pm. Afternoon/evening reports are usually for <b>TOMORROW</b>. You've selected{' '}
 					<b>{sickDay === 'today' ? 'TODAY' : 'TOMORROW'}</b> ({sickDay === 'today' ? sgtDateStr(0) : sgtDateStr(1)}). Double-check before submitting.
 				</div>
 			)}
@@ -276,7 +276,7 @@ function CaseCard({ me, c, onChanged }: { me: Me; c: OpenCase; onChanged: () => 
 			if (mc.length > 0) {
 				const range = mc.length === 1 ? mc[0] : `${mc[0]} → ${mc[mc.length - 1]}`;
 				alertDialog(
-					`Update sent.\n\n🗓 The bot set your Parade State to MC for ${range} (${mc.length} working day${mc.length === 1 ? '' : 's'}). Your RSI/RSO half-day is kept as-is.\n\n📎 IMPORTANT: now SEND the MC photo/PDF as a message in your Telegram chat with this bot (there is no upload here)${selfManaged ? '.' : ' — it auto-forwards to your superior.'}`,
+					`Update sent.\n\n🗓 The bot set your Parade State to MC for ${range} (${mc.length} working day${mc.length === 1 ? '' : 's'}). Your RSI/RSO half-day is kept as-is.\n\n📎 IMPORTANT: now SEND the MC photo/PDF as a message in your Telegram chat with this bot (there is no upload here)${selfManaged ? '.' : '. It auto-forwards to your superior.'}`,
 				);
 			} else {
 				alertDialog('Update sent.');
@@ -336,8 +336,7 @@ function CaseCard({ me, c, onChanged }: { me: Me; c: OpenCase; onChanged: () => 
 							lineHeight: 1.45,
 						}}
 					>
-						📄 <b>Got an MC?</b> There is <u>no upload in this app</u>. Open your Telegram chat with this bot and <b>send the MC photo or PDF as a message</b> —{' '}
-						{selfManaged ? 'the bot saves it to your latest RSI/RSO case.' : 'it auto-forwards to your superior and is saved to your latest RSI/RSO case.'} Fill the dates below too.{' '}
+						📄 Pls fill details of update of sick status below. Then, open your Telegram chat with this bot and <b>send the MC photo or PDF as a message</b>. Do remember to upload ur MC to OneNS too (if any).{' '}
 						<span className="muted">(No MC? Just enter 0 below.)</span>
 					</div>
 					<label>
@@ -365,7 +364,7 @@ function CaseCard({ me, c, onChanged }: { me: Me; c: OpenCase; onChanged: () => 
 									lineHeight: 1.45,
 								}}
 							>
-								📎 SEND YOUR MC NOW — not here. ⚠️ This app has <u>no upload</u>.<br />
+								📎 SEND YOUR MC NOW (not here). ⚠️ This app has <u>no upload</u>.<br />
 								Go to your <b>Telegram chat with this bot</b> and send the MC <b>photo or PDF as a normal message</b>. The bot replies “MC received”
 								{selfManaged ? ' and attaches it to your case.' : ' and auto-forwards it to your superior.'}
 							</div>
@@ -411,7 +410,7 @@ function SickStats() {
 	return (
 		<div style={{ marginTop: 40, paddingTop: 20, borderTop: '1px solid var(--tg-theme-hint-color, #ccc)' }}>
 			<button className="btn" onClick={toggle}>
-				{open ? '▲ Hide sick stats' : '📊 Sick stats — this month (superadmin)'}
+				{open ? '▲ Hide sick stats' : '📊 Sick stats for this month (superadmin)'}
 			</button>
 			{open &&
 				(stats === undefined ? (

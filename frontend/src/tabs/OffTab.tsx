@@ -217,10 +217,10 @@ export function OffTab({
 			const res = await api.post<{ cancelled?: boolean }>('/api/off/revert', { id });
 			await refreshAll();
 			if (res.cancelled) {
-				alertDialog('Cancelled — it was your own off, so it was withdrawn and the credits refunded.');
+				alertDialog('Cancelled. It was your own off, so it was withdrawn and the credits refunded.');
 				return;
 			}
-			alertDialog('Reverted — back to pending approval.');
+			alertDialog('Reverted. It’s back to pending approval.');
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -235,10 +235,10 @@ export function OffTab({
 			const res = await api.post<{ cancelled?: boolean }>('/api/off/grant/revert', { id });
 			await refreshAll();
 			if (res.cancelled) {
-				alertDialog('Cancelled — it was your own credit request, so it was withdrawn and the credit change reversed.');
+				alertDialog('Cancelled. It was your own credit request, so it was withdrawn and the credit change reversed.');
 				return;
 			}
-			alertDialog('Reverted — credit clawed back, pending approval again.');
+			alertDialog('Reverted. The credit was clawed back and it’s pending approval again.');
 		} catch (e) {
 			alertDialog(`Failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -255,7 +255,7 @@ export function OffTab({
 			<div>
 				<button className="btn btn-secondary" onClick={() => setDetailUser(null)}>← Back</button>
 				<h3 style={{ marginTop: 12 }}>
-					{detailUser.full_name} — {totalDaysUsed} off day{totalDaysUsed === 1 ? '' : 's'} used
+					{detailUser.full_name}: {totalDaysUsed} off day{totalDaysUsed === 1 ? '' : 's'} used
 					<span className="muted" style={{ fontSize: 13, marginLeft: 8 }}>🪙 {detailUser.off_credits}</span>
 				</h3>
 				{details.length === 0 ? (
@@ -520,7 +520,7 @@ function RequestOffModal({
 	let hint: string | null = null;
 	if (!startdate || !enddate) hint = 'Pick start and end dates.';
 	else if (startdate > enddate) hint = 'End date must be on or after start date.';
-	else if (insufficient) hint = `Not enough credits — this costs ${creditDays} but you have ${balance}.`;
+	else if (insufficient) hint = `Not enough credits. This costs ${creditDays} but you only have ${balance}.`;
 
 	async function submit() {
 		setBusy(true);
@@ -531,14 +531,14 @@ function RequestOffModal({
 			alertDialog(
 				res.auto_approved
 					? `✅ Off applied (no approval needed). ${creditDays} credit${creditDays === 1 ? '' : 's'} used${res.balance_after != null ? `. Balance: ${res.balance_after}` : ''}.`
-					: `Submitted — awaiting approval. ${creditDays} credit${creditDays === 1 ? '' : 's'} reserved now (refunded if rejected or cancelled).`,
+					: `Submitted, waiting for approval. ${creditDays} credit${creditDays === 1 ? ' is' : 's are'} reserved for now (you get ${creditDays === 1 ? 'it' : 'them'} back if it's rejected or cancelled).`,
 			);
 		} catch (e) {
 			setBusy(false);
 			const msg = e instanceof Error ? e.message : String(e);
 			alertDialog(
 				msg.includes('overlapping_request')
-					? '⚠ You already have a pending or approved off that overlaps those dates — manage it in your list below instead of re-requesting.'
+					? '⚠ You already have a pending or approved off on those dates. Manage it in your list below instead of applying again.'
 					: `Failed: ${msg}`,
 			);
 		}
@@ -644,7 +644,7 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 			alertDialog(
 				res.auto_approved
 					? `✅ ${numVal} off credit(s) credited to ${recipientName} (no approval needed)${res.balance != null ? `. Their balance: ${res.balance}` : ''}.`
-					: `Submitted — ${numVal} off credit(s) for ${recipientName}, pending superior approval.`,
+					: `Submitted: ${numVal} off credit(s) for ${recipientName}, waiting for superior approval.`,
 			);
 		} catch (e) {
 			setBusy(false);
@@ -668,8 +668,8 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 				<h3>Credit Off(s)</h3>
 				<p className="muted">
 					{immediate
-						? 'Credits are applied immediately — no approval needed (you hold an appointment, are self-managed, and the recipient is in your department).'
-						: 'This is a proposal — it will be sent to the recipient’s approver(s) for approval before the credits are added.'}
+						? 'Credits are applied immediately, no approval needed (you hold an appointment, are self-managed, and the recipient is in your department).'
+						: 'This is a request. It goes to the recipient’s approver(s), and the credits are only added once it’s approved.'}
 				</p>
 				{canCreditOthers && (
 					<>
@@ -774,7 +774,7 @@ function CreditOffModal({ me, onClose, onDone }: { me: Me; onClose: () => void; 
 					</div>
 					{canCreditOthers && (
 						<span className="muted" style={{ fontSize: 12 }}>
-							Tap <b>±</b> to make it negative (a deduction) — handy when your phone keyboard has no “−” key.
+							Tap <b>±</b> to make it negative (a deduction). Handy when your phone keyboard has no “−” key.
 						</span>
 					)}
 				</label>
@@ -863,8 +863,8 @@ function MassOffModal({ kind, onClose, onDone }: { kind: 'credit' | 'apply'; onC
 				await onDone();
 				onClose();
 				let msg = `✅ Mass apply: ${res.instant} applied now, ${res.routed} sent for approval (of ${res.total} selected).`;
-				if (res.insufficient?.length) msg += `\n\n⚠ Skipped — insufficient off credits: ${res.insufficient.join(', ')}.`;
-				if (res.already_off?.length) msg += `\n\n↩ Skipped — already had an overlapping off: ${res.already_off.join(', ')}.`;
+				if (res.insufficient?.length) msg += `\n\n⚠ Skipped (not enough off credits): ${res.insufficient.join(', ')}.`;
+				if (res.already_off?.length) msg += `\n\n↩ Skipped (already had an overlapping off): ${res.already_off.join(', ')}.`;
 				alertDialog(msg);
 			}
 		} catch (e) {

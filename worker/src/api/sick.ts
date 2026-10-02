@@ -477,7 +477,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				.bind(body.id)
 				.run();
 			// Sync every approver's DM copy → clears live buttons (pending) / shows withdrawn (approved).
-			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.case_type} — withdrawn by requester. No action needed.`);
+			await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', body.id as number, `🚫 ${user.full_name}'s ${row.case_type} was withdrawn by the requester. No action needed.`);
 			// An edit doesn't push a notification; for an already-approved case ping the approver too.
 			if (wasApproved && row.approver_tid && row.approver_tid !== user.telegram_id) {
 				await tgSendMessage(env.BOT_TOKEN, { chat_id: row.approver_tid, text: `🚫 ${user.full_name} cancelled their ${row.case_type} that you approved.` });
@@ -573,7 +573,7 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 
 		// Re-arm the chat Approve/Reject buttons on every approver's DM.
 		await restoreApprovalDms(env, 'sick_cases', 'approval_message_id', body.id as number, `🟡 ${row.case_type} request (re-opened for approval): ${row.requester_name}`, 'sick');
-		const msg = `↩ ${user.full_name} reverted your approved ${row.case_type} — it's pending approval again.`;
+		const msg = `↩ ${user.full_name} reverted your approved ${row.case_type}. It's pending approval again.`;
 		const sends: Promise<unknown>[] = [
 			tgSendMessage(env.BOT_TOKEN, { chat_id: row.requester_tid, text: msg }),
 		];

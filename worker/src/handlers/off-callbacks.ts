@@ -132,7 +132,7 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 				clearOff,
 			]);
 			await ctx.answerCallbackQuery({ text: 'Rejected.' });
-			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `❌ ${row.requester_name}'s off (${range})${periodSuffix} — rejected by ${superior.full_name}.`);
+			await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `❌ ${row.requester_name}'s off (${range})${periodSuffix} was rejected by ${superior.full_name}.`);
 			await tgSendMessage(env.BOT_TOKEN, {
 				chat_id: row.requester_tid,
 				text: `❌ Your off request (${range})${periodSuffix} was rejected by ${superior.full_name}.\n🪙 ${days} credit(s) refunded.\nYour parade status for ${range} is now blank (unfilled).`,
@@ -155,7 +155,7 @@ export function registerOffCallbacks(bot: Bot, env: Env): void {
 		// parade-initiated ones are already painted — re-paint is a harmless no-op).
 		await setParadeForOff(env, row.user_id, row.requester_dept, row.startdate, row.enddate, row.period);
 		await ctx.answerCallbackQuery({ text: 'Approved.' });
-		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'})${periodSuffix} — approved by ${superior.full_name}.`);
+		await resolveApprovalDms(env, 'off_requests', 'superior_message_id', offId, `✅ ${row.requester_name}'s off (${row.startdate} → ${row.enddate}, ${days} day${days === 1 ? '' : 's'})${periodSuffix} was approved by ${superior.full_name}.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: row.requester_tid,
 			text: `✅ Your off (${row.startdate} → ${row.enddate}) was approved by ${superior.full_name}.\nYour parade state for ${row.startdate} → ${row.enddate} now shows OFF.`,

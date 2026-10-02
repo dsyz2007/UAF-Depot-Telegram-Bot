@@ -252,7 +252,7 @@ function renderReminder(r: DueRow): string {
 		case 'sick_update_personnel':
 			return `⏰ Update your ${r.case_type ?? 'sick'} status (MC days, dates, medicine) in Depot App → 🤒 Sick.`;
 		case 'sick_update_personnel_2':
-			return `⏰ Second reminder: your ${r.case_type ?? 'sick'} status is still unset — update in Depot App → 🤒 Sick.`;
+			return `⏰ Second reminder: your ${r.case_type ?? 'sick'} status still hasn't been updated. Update it in Depot App → 🤒 Sick.`;
 		case 'sick_update_superior_flag':
 			return `🚩 ${r.full_name} has not updated their ${r.case_type ?? 'sick'} status after 8h.`;
 		default:
@@ -319,7 +319,7 @@ async function paradeNudge(env: Env, kind: NudgeKind): Promise<void> {
 }
 
 function fmtStatus(s: string | null): string {
-	return s ?? '— not set —';
+	return s ?? '(not set)';
 }
 
 function nudgeText(kind: NudgeKind, targetDate: string, am: string | null, pm: string | null): string {
@@ -479,10 +479,10 @@ async function runSickExpiry(env: Env): Promise<void> {
 			.bind(s.id)
 			.run();
 		// Clear the live Approve/Reject buttons on every approver's DM copy.
-		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', s.id, `⌛ ${s.full_name}'s ${s.case_type} (${s.sick_date}) expired unactioned — no action needed.`);
+		await resolveApprovalDms(env, 'sick_cases', 'approval_message_id', s.id, `⌛ ${s.full_name}'s ${s.case_type} (${s.sick_date}) expired without being actioned. No action needed.`);
 		await tgSendMessage(env.BOT_TOKEN, {
 			chat_id: s.telegram_id,
-			text: `⌛ Your ${s.case_type} for ${s.sick_date} expired — it was never approved and the date has passed. Report again if you still need it.`,
+			text: `⌛ Your ${s.case_type} for ${s.sick_date} has expired. It was never approved and the date has passed, so report again if you still need it.`,
 		});
 	}
 

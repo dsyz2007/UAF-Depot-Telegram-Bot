@@ -321,9 +321,9 @@ export async function refreshHolidays(env: Env): Promise<RefreshReport> {
 	if (superadmins?.length) {
 		const summary = deltas
 			.map((d) => {
-				if (d.kind === 'new') return `🆕 ${d.holiday_date} — ${d.name}`;
-				if (d.kind === 'changed') return `✏ ${d.holiday_date} — ${d.previous_name} → ${d.name}`;
-				return `❌ ${d.holiday_date} — ${d.name} (removed)`;
+				if (d.kind === 'new') return `🆕 ${d.holiday_date}: ${d.name}`;
+				if (d.kind === 'changed') return `✏ ${d.holiday_date}: ${d.previous_name} → ${d.name}`;
+				return `❌ ${d.holiday_date}: ${d.name} (removed)`;
 			})
 			.join('\n');
 		for (const sa of superadmins) {
@@ -333,7 +333,7 @@ export async function refreshHolidays(env: Env): Promise<RefreshReport> {
 				parse_mode: 'HTML',
 			});
 			for (const d of deltas) {
-				const label = d.kind === 'removed' ? `${d.holiday_date} (${d.name})` : `${d.holiday_date} — ${d.name}`;
+				const label = d.kind === 'removed' ? `${d.holiday_date} (${d.name})` : `${d.holiday_date}: ${d.name}`;
 				await tgSendMessage(env.BOT_TOKEN, {
 					chat_id: sa.telegram_id,
 					text: `<b>${kindLabel(d.kind)}</b>\n${label}`,

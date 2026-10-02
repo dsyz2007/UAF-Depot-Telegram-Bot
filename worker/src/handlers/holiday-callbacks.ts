@@ -42,7 +42,7 @@ export function registerHolidayCallbacks(bot: Bot, env: Env): void {
 					.prepare(`UPDATE public_holidays SET confirmed = 1 WHERE holiday_date = ?`)
 					.bind(date)
 					.run();
-				await ctx.editMessageText(`✅ Holiday confirmed: ${date} — ${row.name}\nBy ${actor.full_name}.`);
+				await ctx.editMessageText(`✅ Holiday confirmed: ${date} (${row.name})\nBy ${actor.full_name}.`);
 			}
 			await ctx.answerCallbackQuery({ text: 'Confirmed.' });
 			return;

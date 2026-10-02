@@ -18,7 +18,7 @@ export class ApiError extends Error {
 			body && typeof body === 'object' && 'error' in body
 				? (body as { error: unknown }).error
 				: null;
-		super(detail ? `HTTP ${status} — ${String(detail)}` : `HTTP ${status}`);
+		super(detail ? `HTTP ${status} (${String(detail)})` : `HTTP ${status}`);
 		this.status = status;
 		this.body = body;
 	}
