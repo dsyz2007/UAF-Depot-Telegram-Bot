@@ -189,10 +189,11 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	//   • sick_count = confirmed RSI/RSO events this month — counted whether the case
 	//     is still active OR has since been system-archived, so the month total stays
 	//     stable instead of shrinking as cases age out (the "resets" bug).
-	//   • mc_days = WHOLE-DAY MC (a day counts +1 only when BOTH its AM and PM parade
-	//     cells are 'MC' — a half-day MC, e.g. the RSI/RSO visit day, does NOT count)
-	//     PLUS Hospital-Leave days (distinct days this month whose parade status is
-	//     'Leave (Others)' with 'HL' / 'Hospital Leave' in the reason, case-insensitive).
+	//   • mc_days = distinct days this month with MC in EITHER half (a half-day MC,
+	//     e.g. the PM after an RSI/RSO visit, counts as a full day) PLUS Hospital-Leave
+	//     days up to today ('Leave (Others)' with 'HL' / 'Hospital Leave' in the reason,
+	//     case-insensitive). One combined DISTINCT count, so a day that is MC in one
+	//     half and HL in the other still counts once.
 	if (request.method === 'GET' && sub === '/stats') {
 		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
 		const { results } = await env.depot_db
@@ -200,24 +201,18 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				`SELECT u.id, u.full_name, u.department,
 				        COUNT(s.id) AS sick_count,
 				        COALESCE((
-					              SELECT COUNT(*) FROM (
-					                  SELECT 1 FROM parade_state_entries pe
-					                  WHERE pe.user_id = u.id AND pe.parade_status = 'MC'
-					                    AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
-					                    AND date(pe.parade_state_date) < date('now','+8 hours','start of month','+1 month')
-					                  GROUP BY pe.parade_state_date
-					                  HAVING COUNT(DISTINCT pe.period) >= 2
-					              )
-					          ), 0)
-				          + COALESCE((
-				              SELECT COUNT(DISTINCT pe.parade_state_date)
-				              FROM parade_state_entries pe
-				              WHERE pe.user_id = u.id
-				                AND pe.parade_status = 'Leave (Others)'
-				                AND (LOWER(pe.reason) LIKE '%hl%' OR LOWER(pe.reason) LIKE '%hospital leave%')
-				                AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
-				                AND date(pe.parade_state_date) <= date('now','+8 hours')
-				            ), 0) AS mc_days
+				            SELECT COUNT(DISTINCT pe.parade_state_date)
+				            FROM parade_state_entries pe
+				            WHERE pe.user_id = u.id
+				              AND date(pe.parade_state_date) >= date('now','+8 hours','start of month')
+				              AND (
+				                    (pe.parade_status = 'MC'
+				                       AND date(pe.parade_state_date) < date('now','+8 hours','start of month','+1 month'))
+				                 OR (pe.parade_status = 'Leave (Others)'
+				                       AND (LOWER(pe.reason) LIKE '%hl%' OR LOWER(pe.reason) LIKE '%hospital leave%')
+				                       AND date(pe.parade_state_date) <= date('now','+8 hours'))
+				                  )
+				        ), 0) AS mc_days
 				 FROM users u
 				 LEFT JOIN sick_cases s ON s.user_id = u.id
 				   AND s.case_type IN ('RSI','RSO')
