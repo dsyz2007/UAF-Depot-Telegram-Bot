@@ -191,9 +191,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 	//     stable instead of shrinking as cases age out (the "resets" bug).
 	//   • mc_days = distinct days this month with MC in EITHER half (a half-day MC,
 	//     e.g. the PM after an RSI/RSO visit, counts as a full day) PLUS Hospital-Leave
-	//     days up to today ('Leave (Others)' with 'HL' / 'Hospital Leave' in the reason,
-	//     case-insensitive). One combined DISTINCT count, so a day that is MC in one
-	//     half and HL in the other still counts once.
+	//     days up to today: 'Leave (Others)' or 'Others' whose reason has 'HL' or
+	//     'Hospital Leave' as a whole word, case-insensitive ('HL (2 days)' counts;
+	//     'GHL', 'HLA', 'Ashley' don't). One combined DISTINCT count, so a day that is
+	//     MC in one half and HL in the other still counts once.
 	if (request.method === 'GET' && sub === '/stats') {
 		if (user.user_role !== 'superadmin') return json({ error: 'forbidden' }, { status: 403 });
 		const { results } = await env.depot_db
@@ -208,8 +209,10 @@ export async function handleSick(actx: AuthedContext): Promise<Response> {
 				              AND (
 				                    (pe.parade_status = 'MC'
 				                       AND date(pe.parade_state_date) < date('now','+8 hours','start of month','+1 month'))
-				                 OR (pe.parade_status = 'Leave (Others)'
-				                       AND (LOWER(pe.reason) LIKE '%hl%' OR LOWER(pe.reason) LIKE '%hospital leave%')
+				                 OR (pe.parade_status IN ('Leave (Others)','Others')
+				                       -- whole word only: pad with spaces, then require a non-letter/digit on both sides
+				                       AND ((' ' || LOWER(pe.reason) || ' ') GLOB '*[^a-z0-9]hl[^a-z0-9]*'
+				                            OR (' ' || LOWER(pe.reason) || ' ') GLOB '*[^a-z0-9]hospital leave[^a-z0-9]*')
 				                       AND date(pe.parade_state_date) <= date('now','+8 hours'))
 				                  )
 				        ), 0) AS mc_days
